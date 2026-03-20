@@ -1550,6 +1550,37 @@ static void *worker_thread(void *arg)
         (unsigned long long)w->accepted,
         (unsigned long long)w->completed,
         (unsigned long long)w->errors);
+
+    /* ---- Graceful ring drain ----
+     * io_uring_unregister_buffers() (inside uring_destroy) blocks until all
+     * in-flight fixed-buffer ops complete.  Close every live fd first so the
+     * kernel auto-cancels their pending SQEs, then drain the CQ so the ring
+     * is empty before we call uring_destroy.  This makes shutdown O(1)
+     * instead of waiting for the last client or tarpit timeout to fire. */
+
+    /* 1. Close active proxy connection fds */
+    for (uint32_t i = 0; i < w->pool.capacity; i++) {
+        struct conn_hot *h = &w->pool.hot[i];
+        if (h->state == CONN_STATE_FREE) continue;
+        if (h->client_fd  >= 0) { close(h->client_fd);  h->client_fd  = -1; }
+        if (h->backend_fd >= 0) { close(h->backend_fd); h->backend_fd = -1; }
+    }
+
+    /* 2. Close tarpit fds */
+    for (uint32_t i = 0; i < w->tarpit_count; i++) {
+        int idx = (int)((w->tarpit_head + i) % WORKER_TARPIT_MAX);
+        if (w->tarpit_fds[idx] >= 0) { close(w->tarpit_fds[idx]); w->tarpit_fds[idx] = -1; }
+    }
+
+    /* 3. Drain any cancellation CQEs the kernel posts after fd close */
+    {
+        struct io_uring_cqe *cqe;
+        struct __kernel_timespec drain_ts = { .tv_sec = 0, .tv_nsec = 100000000L }; /* 100ms */
+        while (io_uring_wait_cqe_timeout(&w->uring.ring, &cqe, &drain_ts) == 0) {
+            io_uring_cqe_seen(&w->uring.ring, cqe);
+        }
+    }
+
     uring_destroy(&w->uring);
     return NULL;
 }
