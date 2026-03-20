@@ -561,3 +561,39 @@ it in `main.c` alongside the existing static/ACME providers.
 
 Implement `struct dns_provider_ops` from `cert/dns_provider.h` and add a
 selection branch in `cert_manager_init()` in `main.c`.
+
+---
+
+## Acknowledgements
+
+Vortex is original software but is built on the shoulders of several excellent open-source libraries. Their authors deserve full credit.
+
+### Libraries used
+
+| Project | Version | License | Role in Vortex |
+|---------|---------|---------|----------------|
+| **[libbpf](https://github.com/libbpf/libbpf)** | system | LGPL-2.1 / BSD-2-Clause | Loads and manages the XDP/eBPF kernel programs; provides BPF map accessors and the skeleton API |
+| **[liburing](https://github.com/axboe/liburing)** | system | LGPL-2.1 | All async I/O: multishot accept, send/recv, async backend connect, timeouts |
+| **[libyaml](https://github.com/yaml/libyaml)** | system | MIT | Parses `vortex.yaml` configuration files |
+| **[OpenSSL 4.0](https://github.com/openssl/openssl)** | 4.0 | Apache 2.0 | TLS 1.2/1.3 handshake, kTLS kernel offload, ACME HTTPS requests, ECDSA key generation |
+| **[ngtcp2](https://github.com/ngtcp2/ngtcp2)** | 1.16.0 | MIT | QUIC transport protocol (HTTP/3) |
+| **[nghttp3](https://github.com/ngtcp2/nghttp3)** | 1.8.0 | MIT | HTTP/3 application layer over QUIC |
+
+### Kernel interfaces
+
+- **XDP (eXpress Data Path)** — in-kernel packet processing framework, part of the Linux kernel (GPL-2.0).  
+  The BPF program at `bpf/vortex_xdp.bpf.c` runs inside the kernel and is licensed GPL-2.0 as required.
+- **io_uring** — Linux kernel async I/O subsystem (GPL-2.0). Vortex uses the userspace `liburing` wrapper.
+- **kTLS** — Kernel TLS offload (Linux 4.13+, GPL-2.0). After TLS handshake, the kernel handles symmetric crypto.
+- **`bpf/vmlinux.h`** — auto-generated from the running kernel's BTF type information via `bpftool btf dump`. Reflects the kernel's own type definitions and is covered by the kernel's GPL-2.0 license.
+
+### License compatibility
+
+Vortex itself is released under the **GNU General Public License v3.0 (GPLv3)**. All dependencies are compatible:
+
+- MIT, BSD-2-Clause — permissive, compatible with GPLv3.
+- LGPL-2.1 — compatible with GPLv3 when linked dynamically (libbpf, liburing, libyaml are system shared libraries).
+- Apache 2.0 (OpenSSL 4.0) — compatible with GPLv3 per the FSF's clarification.
+- GPL-2.0 (kernel BPF program, vmlinux.h) — the XDP program is a separate kernel-space component; it is explicitly GPL-2.0 as required by the kernel's module ABI.
+
+Commercial entities wishing to use Vortex without complying with the GPLv3 (for example, in a proprietary product) must obtain a separate commercial licence from the author.
