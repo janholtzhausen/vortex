@@ -44,6 +44,8 @@ void config_set_defaults(struct vortex_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->workers        = 0; /* auto */
+    cfg->sqpoll         = false;
+    cfg->hugepages      = false;
     strncpy(cfg->bind_address, "0.0.0.0", sizeof(cfg->bind_address) - 1);
     cfg->bind_port      = 443;
     cfg->http_port      = 80;
@@ -152,6 +154,8 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
     switch (ctx->state) {
     case P_GLOBAL:
         if      (!strcmp(k, "workers"))      c->workers        = atoi(val);
+        else if (!strcmp(k, "sqpoll"))       c->sqpoll         = !strcmp(val,"true") || !strcmp(val,"yes");
+        else if (!strcmp(k, "hugepages"))    c->hugepages      = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "bind_address")) strncpy(c->bind_address, val, sizeof(c->bind_address)-1);
         else if (!strcmp(k, "bind_port"))    c->bind_port      = (uint16_t)atoi(val);
         else if (!strcmp(k, "http_port"))    c->http_port      = (uint16_t)atoi(val);

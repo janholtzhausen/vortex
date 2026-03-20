@@ -113,6 +113,8 @@ struct metrics_config {
 struct vortex_config {
     /* global */
     int      workers;        /* 0 = auto (nproc) */
+    bool     sqpoll;         /* io_uring SQPOLL: kernel thread polls SQ, zero-syscall submit */
+    bool     hugepages;      /* use 2MB huge pages for conn buffer slabs (requires vm.nr_hugepages) */
     char     bind_address[64];
     uint16_t bind_port;
     uint16_t http_port;

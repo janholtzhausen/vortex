@@ -75,10 +75,12 @@ struct conn_cold {
 
 /* Per-worker connection pool */
 struct conn_pool {
-    struct conn_hot  *hot;      /* Cache-line aligned array */
-    struct conn_cold *cold;     /* Separate allocation */
-    uint8_t         **recv_bufs; /* Per-connection receive buffers */
-    uint8_t         **send_bufs; /* Per-connection send buffers */
+    struct conn_hot  *hot;       /* Cache-line aligned array */
+    struct conn_cold *cold;      /* Separate allocation */
+    uint8_t         **recv_bufs; /* Per-connection pointers into recv_slab */
+    uint8_t         **send_bufs; /* Per-connection pointers into send_slab */
+    uint8_t          *recv_slab; /* Single contiguous recv buffer allocation */
+    uint8_t          *send_slab; /* Single contiguous send buffer allocation */
     uint32_t          capacity;
     uint32_t          active;
     uint32_t         *free_list;
@@ -86,7 +88,8 @@ struct conn_pool {
     size_t            buf_size;
 };
 
-int   conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size);
+int   conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size,
+                     bool hugepages);
 void  conn_pool_destroy(struct conn_pool *pool);
 
 uint32_t conn_alloc(struct conn_pool *pool);

@@ -5,6 +5,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/uio.h>
 
 int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
 {
@@ -14,14 +15,25 @@ int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
     ctx->sqpoll     = sqpoll;
 
     struct io_uring_params params = { 0 };
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
     params.cq_entries = ctx->cq_entries;
-    params.flags |= IORING_SETUP_CQSIZE;
+    params.flags = IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER;
 
     if (sqpoll) {
+        /* SQPOLL: kernel thread polls the SQ ring so io_uring_submit() never
+         * needs to call io_uring_enter() while the thread is awake — zero
+         * syscalls on the hot submit path.
+         *
+         * COOP_TASKRUN is intentionally omitted: it defers async task-work
+         * until the application re-enters the kernel, which conflicts with
+         * SQPOLL where the kernel thread drives submissions independently and
+         * may not trigger a re-entry, causing CQEs to stall. */
         params.flags |= IORING_SETUP_SQPOLL;
-        params.sq_thread_idle = 2000; /* ms */
-        log_info("uring_init", "SQPOLL mode enabled");
+        params.sq_thread_idle = 10; /* ms before kernel thread sleeps when idle */
+        log_info("uring_init", "SQPOLL mode enabled (idle_ms=10)");
+    } else {
+        /* Non-SQPOLL: cooperative task-run defers async work to the
+         * application thread, reducing unnecessary context switches. */
+        params.flags |= IORING_SETUP_COOP_TASKRUN;
     }
 
     int ret = io_uring_queue_init_params(entries, &ctx->ring, &params);
@@ -43,13 +55,41 @@ int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
 
 void uring_destroy(struct uring_ctx *ctx)
 {
+    if (ctx->bufs_registered)
+        io_uring_unregister_buffers(&ctx->ring);
     io_uring_queue_exit(&ctx->ring);
+}
+
+int uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n)
+{
+    int ret = io_uring_register_buffers(&ctx->ring, iovecs, n);
+    if (ret < 0) {
+        log_error("uring_register_bufs",
+            "io_uring_register_buffers(%u bufs) failed: %s — falling back to unregistered I/O",
+            n, strerror(-ret));
+        return ret;
+    }
+    ctx->bufs_registered = true;
+    log_info("uring_register_bufs", "registered %u fixed buffers (%.1f MB pinned)",
+        n, (double)n * 65536 / (1024 * 1024));
+    return 0;
 }
 
 int uring_submit(struct uring_ctx *ctx)
 {
-    int ret = io_uring_submit(&ctx->ring);
-    if (ret < 0) {
+    int ret;
+    if (ctx->sqpoll) {
+        /* In SQPOLL mode the kernel thread picks up SQEs without a syscall.
+         * io_uring_submit() checks IORING_SQ_NEED_WAKEUP and only calls
+         * io_uring_enter(IORING_ENTER_SQ_WAKEUP) when the thread has gone
+         * idle — so this is usually a pure ring-write with zero syscalls. */
+        ret = io_uring_submit(&ctx->ring);
+    } else {
+        /* Non-SQPOLL: submit and flush any pending COOP_TASKRUN work so CQEs
+         * are delivered promptly without an extra wait_cqe round-trip. */
+        ret = io_uring_submit(&ctx->ring);
+    }
+    if (ret < 0 && ret != -EBUSY) {
         log_error("uring_submit", "failed: %s", strerror(-ret));
         return ret;
     }

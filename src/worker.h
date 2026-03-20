@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <time.h>
 
-#define WORKER_MAX_CONNS   4096
+#define WORKER_MAX_CONNS   4096  /* hard cap — actual capacity set at runtime */
 #define WORKER_BUF_SIZE    65536
 #define WORKER_URING_DEPTH 4096
 #define WORKER_TARPIT_MAX  512
@@ -90,9 +90,15 @@ struct worker {
 int worker_create_listener(const char *addr, uint16_t port, int backlog);
 
 /* Initialize worker (call before starting thread).
+ * capacity = connection pool size (use worker_pool_capacity() to auto-size).
  * tls may be NULL for plain HTTP mode. */
-int worker_init(struct worker *w, int id, int listen_fd,
+int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
                 struct vortex_config *cfg, struct tls_ctx *tls);
+
+/* Compute connection pool capacity for one worker from available system memory.
+ * budget_pct: fraction of MemAvailable to use across all workers (e.g. 0.5).
+ * Result is clamped to [1, WORKER_MAX_CONNS]. */
+uint32_t worker_pool_capacity(int num_workers, double budget_pct);
 
 /* Start worker thread */
 int worker_start(struct worker *w);
