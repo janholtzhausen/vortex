@@ -12,7 +12,8 @@
 #include <time.h>
 
 #define WORKER_MAX_CONNS   4096  /* hard cap — actual capacity set at runtime */
-#define WORKER_BUF_SIZE    65536
+#define WORKER_BUF_SIZE    16384 /* per-connection buffer (16 KB); recv_window starts at WORKER_BUF_INIT */
+#define WORKER_BUF_INIT    4096  /* initial dynamic recv window (4 KB); doubles on full read up to BUF_SIZE */
 #define WORKER_URING_DEPTH 4096
 #define WORKER_TARPIT_MAX  512
 
