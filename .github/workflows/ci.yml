@@ -40,7 +40,7 @@ jobs:
           git clone --depth 1 --branch $OPENSSL_TAG https://github.com/openssl/openssl.git /tmp/openssl-src
           cd /tmp/openssl-src
           ./Configure --prefix=$OPENSSL_PREFIX --openssldir=$OPENSSL_PREFIX/etc/ssl \
-            enable-ktls no-docs no-tests -j$(nproc)
+            enable-ktls no-docs no-tests
           make -j$(nproc)
           sudo make install_sw
 
