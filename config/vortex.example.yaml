@@ -20,6 +20,14 @@ global:
   # Falls back to THP (MADV_HUGEPAGE) if explicit huge pages are unavailable,
   # then plain mmap. Set to false to skip huge page allocation entirely.
   hugepages: false
+
+  # cpu_affinity: pin worker N to CPU N.
+  # Keeps each worker's io_uring ring, TLS state, and connection pool hot in
+  # one core's L1/L2 cache. Falls back gracefully if the target CPU doesn't
+  # exist (worker_id % nproc is used, so it always maps to a valid CPU).
+  # Disable if you have other latency-sensitive processes that need specific
+  # core placement and don't want vortex claiming whole cores.
+  cpu_affinity: true
   bind_address: "0.0.0.0"
   bind_port: 443
   http_port: 80
