@@ -1,5 +1,25 @@
 global:
+  # Number of worker threads. Each worker gets its own SO_REUSEPORT listen
+  # socket; the kernel distributes connections across them by 4-tuple hash.
+  # "auto" = one worker per logical CPU. For best performance set this to
+  # match the number of RSS queues on your NIC:
+  #   ethtool -L eth0 combined <workers>
   workers: auto
+
+  # io_uring SQPOLL: spawn a kernel thread per worker that continuously polls
+  # the submission ring, eliminating the io_uring_enter() syscall on the hot
+  # submit path. Requires CAP_SYS_ADMIN (already granted in the service unit).
+  # Recommended for servers handling >50K req/s. The kernel thread sleeps
+  # after 10ms of inactivity and wakes on the next submission (one syscall).
+  sqpoll: false
+
+  # hugepages: use 2MB huge pages for the per-connection I/O buffer slabs.
+  # Reduces TLB pressure for the buffer pool (~370 MB/worker on a 2 GB VPS).
+  # Requires vm.nr_hugepages to be set before starting vortex:
+  #   echo 400 | sudo tee /proc/sys/vm/nr_hugepages   (400 × 2MB = 800 MB)
+  # Falls back to THP (MADV_HUGEPAGE) if explicit huge pages are unavailable,
+  # then plain mmap. Set to false to skip huge page allocation entirely.
+  hugepages: false
   bind_address: "0.0.0.0"
   bind_port: 443
   http_port: 80

@@ -437,21 +437,25 @@ int main(int argc, char *argv[])
     }
     if (num_workers > MAX_WORKERS) num_workers = MAX_WORKERS;
 
-    /* Create listening socket */
-    int listen_fd = worker_create_listener(g_cfg.bind_address,
-        g_cfg.bind_port, 1024);
-    if (listen_fd < 0) {
-        log_error("main", "failed to create listener on %s:%d",
-            g_cfg.bind_address, g_cfg.bind_port);
-        if (xdp_loaded) bpf_loader_detach();
-        return 1;
-    }
+    /* Connection pool capacity: 50% of available RAM split across workers */
+    uint32_t pool_cap = worker_pool_capacity(num_workers, 0.50);
 
-    /* Start workers */
+    /* Create one SO_REUSEPORT listen socket per worker.
+     * The kernel distributes incoming connections across them by hashing the
+     * 4-tuple, eliminating accept-queue contention and thundering herd. */
     g_num_workers = num_workers;
     for (int i = 0; i < num_workers; i++) {
-        if (worker_init(&g_workers[i], i, listen_fd, &g_cfg, tls_ptr) != 0) {
+        int lfd = worker_create_listener(g_cfg.bind_address,
+                                         g_cfg.bind_port, 1024);
+        if (lfd < 0) {
+            log_error("main", "failed to create listener %d on %s:%d",
+                i, g_cfg.bind_address, g_cfg.bind_port);
+            num_workers = i;
+            break;
+        }
+        if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr) != 0) {
             log_error("main", "worker_init failed for worker %d", i);
+            close(lfd);
             num_workers = i;
             break;
         }
@@ -460,6 +464,11 @@ int main(int argc, char *argv[])
             num_workers = i;
             break;
         }
+    }
+    if (num_workers == 0) {
+        log_error("main", "no workers started");
+        if (xdp_loaded) bpf_loader_detach();
+        return 1;
     }
 
     /* Start metrics server */
@@ -558,7 +567,6 @@ int main(int argc, char *argv[])
     }
 #endif
     for (int i = 0; i < num_workers; i++) worker_stop(&g_workers[i]);
-    close(listen_fd);
     for (int i = 0; i < num_workers; i++) {
         worker_join(&g_workers[i]);
         worker_destroy(&g_workers[i]);

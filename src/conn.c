@@ -4,8 +4,52 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/mman.h>
 
-int conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size)
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+
+/* Allocate a contiguous anonymous slab.  If try_hugepages is set, attempt:
+ *   1. MAP_HUGETLB | MAP_HUGE_2MB  — explicit 2MB huge pages (requires
+ *      vm.nr_hugepages pre-allocated on the host)
+ *   2. Regular mmap + MADV_HUGEPAGE — THP (Transparent Huge Pages), kernel
+ *      promotes 4KB pages to 2MB on first touch if khugepaged is enabled
+ *   3. Plain mmap — always succeeds (within address-space limits)
+ */
+static uint8_t *alloc_slab(size_t size, bool try_hugepages)
+{
+    if (try_hugepages) {
+        uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
+                          -1, 0);
+        if (p != MAP_FAILED) {
+            log_info("conn_pool", "slab %zu MB: explicit 2MB huge pages",
+                     size / (1024 * 1024));
+            return p;
+        }
+        p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) {
+            madvise(p, size, MADV_HUGEPAGE);
+            log_info("conn_pool", "slab %zu MB: THP hint (MADV_HUGEPAGE)",
+                     size / (1024 * 1024));
+            return p;
+        }
+    }
+    uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+
+int conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size,
+                   bool hugepages)
 {
     memset(pool, 0, sizeof(*pool));
     pool->capacity = capacity;
@@ -20,15 +64,23 @@ int conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size)
     pool->cold = calloc(capacity, sizeof(struct conn_cold));
     if (!pool->cold) goto oom;
 
-    /* Per-connection buffers */
+    /* Contiguous buffer slabs — one mmap per direction.
+     * Contiguous layout is required for io_uring fixed-buffer registration:
+     * each connection's buffer is a fixed-size slice of the slab, so the
+     * kernel pins the whole range once and per-op page-pinning is skipped. */
+    size_t slab_size = (size_t)capacity * buf_size;
+    pool->recv_slab = alloc_slab(slab_size, hugepages);
+    pool->send_slab = alloc_slab(slab_size, hugepages);
+    if (!pool->recv_slab || !pool->send_slab) goto oom;
+
+    /* Per-connection pointer arrays — slices into the slabs */
     pool->recv_bufs = calloc(capacity, sizeof(uint8_t *));
     pool->send_bufs = calloc(capacity, sizeof(uint8_t *));
     if (!pool->recv_bufs || !pool->send_bufs) goto oom;
 
     for (uint32_t i = 0; i < capacity; i++) {
-        pool->recv_bufs[i] = malloc(buf_size);
-        pool->send_bufs[i] = malloc(buf_size);
-        if (!pool->recv_bufs[i] || !pool->send_bufs[i]) goto oom;
+        pool->recv_bufs[i] = pool->recv_slab + (size_t)i * buf_size;
+        pool->send_bufs[i] = pool->send_slab + (size_t)i * buf_size;
     }
 
     /* Free list — initially all slots are free, pushed in reverse */
@@ -54,14 +106,13 @@ oom:
 
 void conn_pool_destroy(struct conn_pool *pool)
 {
-    if (pool->recv_bufs) {
-        for (uint32_t i = 0; i < pool->capacity; i++) free(pool->recv_bufs[i]);
-        free(pool->recv_bufs);
-    }
-    if (pool->send_bufs) {
-        for (uint32_t i = 0; i < pool->capacity; i++) free(pool->send_bufs[i]);
-        free(pool->send_bufs);
-    }
+    size_t slab_size = (size_t)pool->capacity * pool->buf_size;
+    if (pool->recv_slab)
+        munmap(pool->recv_slab, slab_size);
+    if (pool->send_slab)
+        munmap(pool->send_slab, slab_size);
+    free(pool->recv_bufs);
+    free(pool->send_bufs);
     free(pool->hot);
     free(pool->cold);
     free(pool->free_list);

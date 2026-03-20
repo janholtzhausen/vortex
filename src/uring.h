@@ -28,11 +28,17 @@ struct uring_ctx {
     struct io_uring  ring;
     unsigned int     sq_entries;
     unsigned int     cq_entries;
-    bool             sqpoll;   /* SQPOLL mode — only for multi-core */
+    bool             sqpoll;          /* SQPOLL mode */
+    bool             bufs_registered; /* io_uring fixed buffers registered */
 };
 
 int  uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll);
 void uring_destroy(struct uring_ctx *ctx);
+
+/* Register fixed buffers for zero-copy pinned I/O.
+ * iovecs[0..n-1] describe the buffers; must remain valid for the ring's lifetime.
+ * On success, sets ctx->bufs_registered = true and returns 0. */
+int  uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n);
 
 /* Submit all pending SQEs */
 int uring_submit(struct uring_ctx *ctx);
