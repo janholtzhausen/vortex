@@ -31,6 +31,7 @@ typedef enum {
 #define CONN_FLAG_BACKEND_POOLED     (1 << 9)  /* backend fd is keep-alive, return to pool after response */
 #define CONN_FLAG_BACKEND_CONNECTING (1 << 10) /* async io_uring CONNECT in flight */
 #define CONN_FLAG_CLIENT_GZIP        (1 << 11) /* client sent Accept-Encoding: gzip */
+#define CONN_FLAG_CLIENT_BR          (1 << 12) /* client sent Accept-Encoding: br (brotli) */
 
 /* Hot connection data — 2 cache lines (128 bytes), accessed per-packet */
 struct __attribute__((aligned(64))) conn_hot {
