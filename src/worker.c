@@ -35,6 +35,45 @@
 #include <arpa/inet.h>
 #include <linux/time_types.h>
 #include <sys/uio.h>
+#include <zlib.h>
+
+/* Minimum body size (bytes) for gzip compression to be worthwhile */
+#define GZIP_MIN_BODY 512
+
+/*
+ * Compress src into dst using gzip framing.
+ * Returns compressed length, or 0 on failure / expansion.
+ */
+static size_t gzip_compress(const uint8_t *src, size_t src_len,
+                             uint8_t *dst, size_t dst_max)
+{
+    z_stream zs = {0};
+    /* windowBits = 15+16 selects gzip wrapper instead of zlib/deflate */
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        return 0;
+    zs.next_in   = (Bytef *)src;
+    zs.avail_in  = (uInt)src_len;
+    zs.next_out  = dst;
+    zs.avail_out = (uInt)dst_max;
+    int ret = deflate(&zs, Z_FINISH);
+    deflateEnd(&zs);
+    return (ret == Z_STREAM_END) ? (size_t)zs.total_out : 0;
+}
+
+/*
+ * Returns true if Content-Type header value indicates compressible content.
+ * ct_val points to the value after "Content-Type: ", ct_len is remaining bytes.
+ */
+static bool is_compressible_type(const uint8_t *ct_val, size_t ct_len)
+{
+    return (ct_len >= 5  && memcmp(ct_val, "text/",                5) == 0) ||
+           (ct_len >= 16 && memcmp(ct_val, "application/json",     16) == 0) ||
+           (ct_len >= 22 && memcmp(ct_val, "application/javascript",22) == 0) ||
+           (ct_len >= 24 && memcmp(ct_val, "application/x-javascript",24) == 0) ||
+           (ct_len >= 15 && memcmp(ct_val, "application/xml", 15) == 0) ||
+           (ct_len >= 13 && memcmp(ct_val, "image/svg+xml", 13) == 0);
+}
 
 #ifdef VORTEX_PHASE_TLS
 #include "tls.h"
@@ -697,6 +736,20 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
         }
 
+        /* Detect client gzip acceptance — cleared each request for keepalive correctness */
+        h->flags &= ~CONN_FLAG_CLIENT_GZIP;
+        {
+            const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+            const uint8_t *ae = (const uint8_t *)memmem(rbuf, (size_t)n, "Accept-Encoding:", 16);
+            if (!ae) ae = (const uint8_t *)memmem(rbuf, (size_t)n, "accept-encoding:", 16);
+            if (ae) {
+                const uint8_t *eol = (const uint8_t *)FIND_CRLF(ae + 16,
+                    (size_t)n - (size_t)(ae + 16 - rbuf));
+                if (eol && memmem(ae + 16, (size_t)(eol - ae - 16), "gzip", 4))
+                    h->flags |= CONN_FLAG_CLIENT_GZIP;
+            }
+        }
+
         /* Cache check: only for GET requests */
         if (w->cache.index) {
             char method[16], url[512];
@@ -803,6 +856,26 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         {
             uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
             bool is_ws = (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) != 0;
+
+            /* ---- Strip Accept-Encoding ----
+             * We handle compression ourselves; tell the backend to send plain
+             * so we can inspect, cache, and compress on the way out. */
+            {
+                uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
+                if (!ae)
+                    ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
+                if (ae) {
+                    uint8_t *line_end = (uint8_t *)FIND_CRLF(ae + 2,
+                        (size_t)(rbuf + fwd_n - ae - 2));
+                    if (line_end) {
+                        line_end += 2;
+                        size_t remove = (size_t)(line_end - ae - 2);
+                        memmove(ae + 2, ae + 2 + remove,
+                            (size_t)(rbuf + fwd_n - (ae + 2 + remove)));
+                        fwd_n -= (int)remove;
+                    }
+                }
+            }
 
             /* ---- Strip Authorization header ----
              * The proxy consumed it for its own auth check; never forward
@@ -1275,6 +1348,101 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                     log_debug("cache_store",
                                         "conn=%u url=%s ttl=%u body=%zu",
                                         cid, cc_url2, ttl2, bl2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ---- Gzip compression ----
+         * Only on complete single-chunk responses (Content-Length present and
+         * matching) with a compressible Content-Type, for clients that
+         * advertised gzip support.  recv_buf is free at this point (client
+         * request already forwarded) and is used as scratch for the compressed
+         * output.  Cache store above already saved the uncompressed copy. */
+        if ((h->flags & CONN_FLAG_CLIENT_GZIP) && n > 0) {
+            uint8_t *sbuf_gz = conn_send_buf(&w->pool, cid);
+            const uint8_t *hend_gz = (const uint8_t *)FIND_HDR_END(sbuf_gz, (size_t)n);
+            if (hend_gz) {
+                size_t hdr_end_off = (size_t)(hend_gz - sbuf_gz);
+                size_t body_off    = hdr_end_off + 4; /* past \r\n\r\n */
+                size_t body_len    = (size_t)n - body_off;
+
+                /* Verify Content-Length matches body in buffer (complete response) */
+                bool cl_match = false;
+                if (body_len >= GZIP_MIN_BODY) {
+                    const char *clh2 = (const char *)memmem(
+                        sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
+                    if (!clh2) clh2 = (const char *)memmem(
+                        sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
+                    if (clh2) {
+                        const char *cv2 = clh2 + 17;
+                        while (*cv2 == ' ') cv2++;
+                        cl_match = ((size_t)atol(cv2) == body_len);
+                    }
+                }
+
+                /* Check Content-Type is compressible and not already encoded */
+                if (cl_match) {
+                    const uint8_t *cth = (const uint8_t *)memmem(
+                        sbuf_gz, hdr_end_off + 4, "\r\nContent-Type:", 15);
+                    if (!cth) cth = (const uint8_t *)memmem(
+                        sbuf_gz, hdr_end_off + 4, "\r\ncontent-type:", 15);
+                    bool already_encoded =
+                        memmem(sbuf_gz, hdr_end_off + 4, "\r\nContent-Encoding:", 19) ||
+                        memmem(sbuf_gz, hdr_end_off + 4, "\r\ncontent-encoding:", 19);
+
+                    if (cth && !already_encoded) {
+                        const uint8_t *ct_val = cth + 15;
+                        while (*ct_val == ' ') ct_val++;
+                        size_t ct_remaining = (size_t)(sbuf_gz + hdr_end_off + 4 - ct_val);
+
+                        if (is_compressible_type(ct_val, ct_remaining)) {
+                            /* Compress body into recv_buf (free scratch space) */
+                            uint8_t *scratch = conn_recv_buf(&w->pool, cid);
+                            size_t clen = gzip_compress(
+                                sbuf_gz + body_off, body_len,
+                                scratch, w->pool.buf_size);
+
+                            /* Only proceed if compression reduced size */
+                            if (clen > 0 && clen < body_len) {
+                                /* 1. Update Content-Length in-place */
+                                uint8_t *clh3 = (uint8_t *)memmem(
+                                    sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
+                                if (!clh3) clh3 = (uint8_t *)memmem(
+                                    sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
+                                if (clh3) {
+                                    uint8_t *vs = clh3 + 17;
+                                    while (*vs == ' ') vs++;
+                                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                                        (size_t)(sbuf_gz + hdr_end_off - vs));
+                                    if (ve) {
+                                        char new_cl[20];
+                                        int ncl = snprintf(new_cl, sizeof(new_cl), "%zu", clen);
+                                        int delta = ncl - (int)(ve - vs);
+                                        memmove(vs + ncl, ve,
+                                            (size_t)(sbuf_gz + hdr_end_off + 4 - ve));
+                                        memcpy(vs, new_cl, (size_t)ncl);
+                                        hdr_end_off = (size_t)((int)hdr_end_off + delta);
+                                    }
+                                }
+
+                                /* 2. Insert Content-Encoding: gzip before \r\n\r\n */
+                                const char ce_hdr[] = "\r\nContent-Encoding: gzip";
+                                const int   ce_len  = (int)(sizeof(ce_hdr) - 1);
+                                /* Move the trailing \r\n\r\n only; body will be overwritten */
+                                memmove(sbuf_gz + hdr_end_off + ce_len,
+                                        sbuf_gz + hdr_end_off, 4);
+                                memcpy(sbuf_gz + hdr_end_off, ce_hdr, (size_t)ce_len);
+                                size_t new_body_off = hdr_end_off + (size_t)ce_len + 4;
+
+                                /* 3. Copy compressed body after headers */
+                                if (new_body_off + clen <= w->pool.buf_size) {
+                                    memcpy(sbuf_gz + new_body_off, scratch, clen);
+                                    n = (int)(new_body_off + clen);
+                                    log_debug("gzip", "conn=%u %zu→%zu bytes", cid, body_len, clen);
                                 }
                             }
                         }
