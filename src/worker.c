@@ -1464,7 +1464,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                 const char *ce_hdr = use_br
                                     ? "\r\nContent-Encoding: br"
                                     : "\r\nContent-Encoding: gzip";
-                                int ce_len = use_br ? 21 : 24;
+                                int ce_len = use_br ? 22 : 24;
                                 memmove(sbuf_gz + hdr_end_off + ce_len,
                                         sbuf_gz + hdr_end_off, 4);
                                 memcpy(sbuf_gz + hdr_end_off, ce_hdr, (size_t)ce_len);
