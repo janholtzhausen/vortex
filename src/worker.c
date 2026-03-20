@@ -729,15 +729,22 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                     "Content-Length: 0\r\n"
                     "Connection: keep-alive\r\n\r\n";
                 struct io_uring_sqe *sqe401 = io_uring_get_sqe(&w->uring.ring);
-                if (!sqe401) { conn_close(w, cid, false); break; }
+                struct io_uring_sqe *sqe401r = io_uring_get_sqe(&w->uring.ring);
+                if (!sqe401 || !sqe401r) { conn_close(w, cid, false); break; }
                 /* Copy 401 to send buf */
                 uint8_t *sbuf = conn_send_buf(&w->pool, cid);
                 size_t r401_len = sizeof(r401) - 1;
                 memcpy(sbuf, r401, r401_len);
-                PREP_SEND(w, sqe401, h->client_fd, sbuf, r401_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                sqe401->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-                /* Clear streaming flag so SEND_CLIENT goes back to RECV_CLIENT */
+                h->send_buf_off = 0;
+                h->send_buf_len = (uint32_t)r401_len;
                 h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                PREP_SEND(w, sqe401, h->client_fd, sbuf, r401_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                sqe401->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+                sqe401->flags |= IOSQE_IO_LINK;
+                /* Pre-arm RECV_CLIENT as linked SQE — kernel starts it immediately after send */
+                PREP_RECV(w, sqe401r, h->client_fd, conn_recv_buf(&w->pool, cid),
+                    h->recv_window, 0, cid);
+                sqe401r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
                 uring_submit(&w->uring);
                 break;
             }
@@ -813,15 +820,20 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                             "Connection: keep-alive\r\n\r\n", etag_str);
                         uint8_t *sbuf = conn_send_buf(&w->pool, cid);
                         memcpy(sbuf, r304, (size_t)r304_len);
-                        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-                        if (sqe) {
+                        struct io_uring_sqe *sqe  = io_uring_get_sqe(&w->uring.ring);
+                        struct io_uring_sqe *sqer = io_uring_get_sqe(&w->uring.ring);
+                        if (sqe && sqer) {
                             h->send_buf_off = 0;
                             h->send_buf_len = (uint32_t)r304_len;
+                            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
                             PREP_SEND(w, sqe, h->client_fd, sbuf,
                                 (size_t)r304_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-                            /* Clear streaming so SEND_CLIENT goes back to RECV_CLIENT */
-                            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+                            sqe->flags |= IOSQE_IO_LINK;
+                            /* Pre-arm RECV_CLIENT — kernel queues it right after send */
+                            PREP_RECV(w, sqer, h->client_fd, conn_recv_buf(&w->pool, cid),
+                                h->recv_window, 0, cid);
+                            sqer->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
                             uring_submit(&w->uring);
                             log_debug("cache_304", "conn=%u url=%s", cid, url);
                             break;
@@ -1549,6 +1561,37 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
         }
         uring_submit(&w->uring);
+        break;
+    }
+
+    case VORTEX_OP_SEND_CLIENT_LINKED: {
+        /* SEND completed; RECV_CLIENT was pre-armed as a linked SQE.
+         * On success the kernel has already queued the recv — nothing more to do.
+         * On partial send the client won't pipeline the next request until it
+         * receives the full response, so the pre-armed recv is still safe; just
+         * flush the remaining bytes via a regular (non-linked) SEND_CLIENT. */
+        int sent = cqe->res;
+        log_debug("send_client_linked", "conn=%u sent=%d", cid, sent);
+        if (sent < 0) {
+            /* Send error — linked recv will arrive with -ECANCELED; conn_close
+             * is idempotent so the RECV_CLIENT handler can call it again safely. */
+            conn_close(w, cid, true);
+            break;
+        }
+        h->send_buf_off += (uint32_t)sent;
+        if (h->send_buf_off < h->send_buf_len) {
+            /* Partial send — flush remainder; pre-armed recv is still in flight */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); break; }
+            PREP_SEND(w, sqe, h->client_fd,
+                conn_send_buf(&w->pool, cid) + h->send_buf_off,
+                h->send_buf_len - h->send_buf_off, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+            uring_submit(&w->uring);
+        }
+        /* Full send: recv already queued by kernel — nothing else to submit */
+        h->send_buf_off = 0;
+        h->send_buf_len = 0;
         break;
     }
 
