@@ -264,6 +264,50 @@ cmake -B build \
 
 ---
 
+## Deployment
+
+### Building a .deb package
+
+`tools/build_deb.sh` produces a self-contained Debian package that bundles the
+OpenSSL 4.0 shared libraries so the target machine does not need them pre-installed.
+
+```sh
+tools/build_deb.sh 0.2.0        # produces vortex_0.2.0_amd64.deb
+```
+
+### Installing on a fresh machine
+
+```sh
+# Install runtime dependencies (all available in standard Debian/Ubuntu repos)
+sudo apt-get install -y libbpf1 liburing2 libyaml-0-2
+
+# Install the package
+sudo dpkg -i vortex_0.2.0_amd64.deb
+```
+
+The postinst script will:
+- Create `/var/log/vortex` and `/etc/vortex`
+- Copy `vortex.example.yaml` to `/etc/vortex/vortex.yaml` if no config exists yet
+- Run `ldconfig` and `systemctl daemon-reload`
+
+Edit `/etc/vortex/vortex.yaml`, then:
+
+```sh
+sudo systemctl enable --now vortex
+```
+
+### Upgrading
+
+```sh
+sudo dpkg -i vortex_<new-version>_amd64.deb
+sudo systemctl restart vortex
+```
+
+`dpkg -i` over an existing install is safe — it will not overwrite
+`/etc/vortex/vortex.yaml` if it already exists.
+
+---
+
 ## Running
 
 ```sh
