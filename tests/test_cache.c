@@ -17,7 +17,7 @@ static int g_failed = 0;
 static void test_init_destroy(void)
 {
     struct cache c;
-    int r = cache_init(&c, 64, 1024 * 1024, false);
+    int r = cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
     CHECK(r == 0, "cache_init succeeds");
     CHECK(c.index != NULL, "index allocated");
     CHECK(c.slab != NULL, "slab allocated");
@@ -30,7 +30,7 @@ static void test_power_of_two(void)
 {
     struct cache c;
     /* Non-power-of-two should be rounded up */
-    int r = cache_init(&c, 100, 1024 * 1024, false);
+    int r = cache_init(&c, 100, 1024 * 1024, false, NULL, 0);
     CHECK(r == 0, "init with 100 entries");
     CHECK(c.index_capacity == 128, "rounded up to 128");
     cache_destroy(&c);
@@ -39,7 +39,7 @@ static void test_power_of_two(void)
 static void test_miss(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
 
     struct cache_index_entry *e = cache_lookup(&c, "/notfound", 9);
     CHECK(e == NULL, "lookup miss returns NULL");
@@ -52,7 +52,7 @@ static void test_miss(void)
 static void test_store_and_hit(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
 
     const char *url  = "/api/v1/data";
     const char *body = "hello world";
@@ -80,7 +80,7 @@ static void test_store_and_hit(void)
 static void test_valid_expired(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
 
     const char *url  = "/short";
     const char *body = "data";
@@ -103,7 +103,7 @@ static void test_valid_expired(void)
 static void test_multiple_entries(void)
 {
     struct cache c;
-    cache_init(&c, 64, 2 * 1024 * 1024, false);
+    cache_init(&c, 64, 2 * 1024 * 1024, false, NULL, 0);
 
     /* Store 10 entries */
     char url[64], body[64];
@@ -134,7 +134,7 @@ static void test_multiple_entries(void)
 static void test_update_existing(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
 
     const char *url = "/update";
     cache_store(&c, url, strlen(url), 200, 60,
@@ -153,7 +153,7 @@ static void test_update_existing(void)
 static void test_evict(void)
 {
     struct cache c;
-    cache_init(&c, 8, 1024 * 1024, false);
+    cache_init(&c, 8, 1024 * 1024, false, NULL, 0);
 
     /* Fill to capacity (8 slots with RH probing) */
     char url[32], body[32];
@@ -180,7 +180,7 @@ static void test_slab_wrap(void)
 {
     struct cache c;
     /* Very small slab to force wrap */
-    cache_init(&c, 64, 4096, false);
+    cache_init(&c, 64, 4096, false, NULL, 0);
 
     /* Store entries until slab wraps */
     char url[32];
