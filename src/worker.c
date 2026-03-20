@@ -12,6 +12,15 @@
 #define FIND_CRLF(buf,len)    vx_find_crlf((const uint8_t *)(buf),(size_t)(len))
 #define FIND_HDR_END(buf,len) vx_find_hdr_end((const uint8_t *)(buf),(size_t)(len))
 
+/* Dynamic recv window: double on full read, cap at buf_size.
+ * Called after every RECV_CLIENT / RECV_BACKEND completion. */
+#define RECV_WINDOW_GROW(h, n, buf_size) do { \
+    if ((size_t)(n) >= (h)->recv_window && (h)->recv_window < (uint16_t)(buf_size)) { \
+        uint32_t next = (uint32_t)(h)->recv_window * 2; \
+        (h)->recv_window = (uint16_t)(next < (buf_size) ? next : (buf_size)); \
+    } \
+} while (0)
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -450,6 +459,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
         struct conn_hot *nh = conn_hot(&w->pool, new_cid);
         nh->client_fd = client_fd;
+        nh->recv_window = WORKER_BUF_INIT;
 
         int tls_route_idx = 0;
 #ifdef VORTEX_PHASE_TLS
@@ -567,7 +577,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         struct io_uring_sqe *s1 = io_uring_get_sqe(&w->uring.ring);
         if (!s1) { conn_close(w, new_cid, true); return; }
         PREP_RECV(w, s1, client_fd,
-            conn_recv_buf(&w->pool, new_cid), w->pool.buf_size, 0, new_cid);
+            conn_recv_buf(&w->pool, new_cid), nh->recv_window, 0, new_cid);
         s1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, new_cid);
         log_debug("accept_arm", "conn=%u client_fd=%d backend_fd=%d (pooled)",
             (unsigned)new_cid, client_fd, nh->backend_fd);
@@ -599,6 +609,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         int n = cqe->res;
         log_debug("recv_client", "conn=%u n=%d", cid, n);
         if (n == 0) { conn_close(w, cid, false); break; } /* Client EOF */
+        RECV_WINDOW_GROW(h, n, w->pool.buf_size);
         h->bytes_in += (uint32_t)n;
 
         /* Reconnect to backend if previous response consumed the connection */
@@ -923,7 +934,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
         if (!sqe) { conn_close(w, cid, true); break; }
         PREP_RECV(w, sqe, h->backend_fd, conn_send_buf(&w->pool, cid),
-            w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+            h->recv_window, 0, SEND_IDX_SEND(w, cid));
         sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
         uring_submit(&w->uring);
         break;
@@ -932,6 +943,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     case VORTEX_OP_RECV_BACKEND: {
         int n = cqe->res;
         log_debug("recv_backend", "conn=%u n=%d", cid, n);
+        if (n > 0) RECV_WINDOW_GROW(h, n, w->pool.buf_size);
         if (n == 0) {
             /* Backend EOF — done streaming this response */
             h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
@@ -942,7 +954,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
             if (!sqe) { conn_close(w, cid, false); break; }
             PREP_RECV(w, sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
-                w->pool.buf_size, 0, cid);
+                h->recv_window, 0, cid);
             sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
             uring_submit(&w->uring);
             break;
@@ -1311,12 +1323,12 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
             /* Still reading backend response — get next chunk */
             PREP_RECV(w, sqe, h->backend_fd, conn_send_buf(&w->pool, cid),
-                w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+                h->recv_window, 0, SEND_IDX_SEND(w, cid));
             sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
         } else {
             /* Response complete (cache hit, single chunk, or pool return) — next request */
             PREP_RECV(w, sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
-                w->pool.buf_size, 0, cid);
+                h->recv_window, 0, cid);
             sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
         }
         uring_submit(&w->uring);
@@ -1405,7 +1417,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
             if (!sqe_c) { conn_close(w, cid, true); break; }
             PREP_RECV(w, sqe_c, h->client_fd,
-                conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, cid);
+                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
             sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
         }
         uring_submit(&w->uring);
