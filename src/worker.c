@@ -319,6 +319,13 @@ static int begin_async_connect(struct worker *w, const char *addr_str,
 
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* ACK backend data immediately — backend is LAN/loopback so delayed ACK
+     * (40 ms) would needlessly throttle throughput on short responses. */
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+    /* Same NOTSENT_LOWAT as the client side — keeps per-connection kernel
+     * send buffer pressure at one chunk rather than growing unbounded. */
+    int lowat = WORKER_BUF_SIZE;
+    setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 
     /* Store resolved address in conn_cold for the CONNECT completion handler */
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
@@ -447,6 +454,10 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
          * can grow the receive window progressively to its configured maximum. */
         int zero_clamp = 0;
         setsockopt(client_fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &zero_clamp, sizeof(zero_clamp));
+        /* Don't queue more unsent data than one buffer — prevents slow clients
+         * from accumulating a backlog of 16KB chunks in the kernel send buffer. */
+        int lowat = WORKER_BUF_SIZE;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 
         uint32_t new_cid = conn_alloc(&w->pool);
         if (new_cid != CONN_INVALID) {
@@ -943,7 +954,12 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     case VORTEX_OP_RECV_BACKEND: {
         int n = cqe->res;
         log_debug("recv_backend", "conn=%u n=%d", cid, n);
-        if (n > 0) RECV_WINDOW_GROW(h, n, w->pool.buf_size);
+        if (n > 0) {
+            RECV_WINDOW_GROW(h, n, w->pool.buf_size);
+            /* Re-arm TCP_QUICKACK — kernel clears it after each ACK */
+            int one = 1;
+            setsockopt(h->backend_fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+        }
         if (n == 0) {
             /* Backend EOF — done streaming this response */
             h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
@@ -1616,6 +1632,11 @@ int worker_create_listener(const char *addr, uint16_t port, int backlog)
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+
+    /* Don't wake accept until the client has sent data — saves a round-trip
+     * on every new connection.  Kernel falls back gracefully if unsupported. */
+    int defer_sec = 5;
+    setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_sec, sizeof(defer_sec));
 
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         log_error("create_listener", "bind %s:%d: %s", addr, port, strerror(errno));
