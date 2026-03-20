@@ -701,11 +701,13 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         uint8_t *sbuf = conn_send_buf(&w->pool, cid);
 
                         if (serve_len <= w->pool.buf_size && ce->header_len >= 4) {
-                            /* Copy headers minus trailing \r\n\r\n */
-                            size_t hdr_body = ce->header_len - 4;
+                            /* Copy headers minus the blank-line terminator (\r\n).
+                             * The last header's own \r\n stays so extra headers
+                             * splice in cleanly without merging onto the same line. */
+                            size_t hdr_body = ce->header_len - 2;
                             memcpy(sbuf, resp, hdr_body);
                             memcpy(sbuf + hdr_body, extra, (size_t)extra_len);
-                            memcpy(sbuf + hdr_body + extra_len, "\r\n\r\n", 4);
+                            memcpy(sbuf + hdr_body + extra_len, "\r\n", 2);
                             memcpy(sbuf + ce->header_len + extra_len,
                                    resp + ce->header_len, ce->body_len);
 

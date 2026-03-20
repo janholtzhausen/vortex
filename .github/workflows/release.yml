@@ -58,6 +58,18 @@ jobs:
           install -Dm644 contrib/vortex.service \
             "${STAGING}/lib/systemd/system/vortex.service" 2>/dev/null || true
 
+          # Bundle OpenSSL 4.0 (not yet in distro repos)
+          install -Dm755 /opt/openssl-4.0/lib64/libssl.so.4 \
+            "${STAGING}/usr/lib/vortex/libssl.so.4"
+          install -Dm755 /opt/openssl-4.0/lib64/libcrypto.so.4 \
+            "${STAGING}/usr/lib/vortex/libcrypto.so.4"
+
+          # ldconfig drop-in so the system linker finds bundled libs
+          install -Dm644 /dev/stdin \
+            "${STAGING}/etc/ld.so.conf.d/vortex.conf" <<'LDEOF'
+/usr/lib/vortex
+LDEOF
+
           # debian control
           mkdir -p "${STAGING}/DEBIAN"
           cat > "${STAGING}/DEBIAN/control" <<EOF
@@ -85,6 +97,7 @@ jobs:
           if [ ! -f /etc/vortex/vortex.yaml ]; then
               cp /etc/vortex/vortex.example.yaml /etc/vortex/vortex.yaml
           fi
+          ldconfig || true
           if command -v systemctl >/dev/null 2>&1; then
               systemctl daemon-reload || true
           fi

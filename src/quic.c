@@ -867,6 +867,9 @@ static struct quic_conn *conn_new(struct quic_server *qs,
     params.initial_max_streams_uni             = 3;
     params.max_idle_timeout                    = 30 * NGTCP2_SECONDS;
     params.active_connection_id_limit          = 7;
+    /* Required by ngtcp2: server must echo the client's Initial DCID */
+    params.original_dcid                       = hd.dcid;
+    params.original_dcid_present               = 1;
 
     ngtcp2_path path;
     ngtcp2_addr_init(&path.local,
