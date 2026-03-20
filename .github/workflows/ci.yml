@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  OPENSSL_TAG: openssl-4.0.0-alpha1
+  OPENSSL_PREFIX: /opt/openssl-4.0
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -23,8 +27,27 @@ jobs:
             pkg-config \
             dpkg-dev debhelper
 
-      - name: Configure (debug build with sanitizers)
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - name: Cache OpenSSL 4.0
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OPENSSL_PREFIX }}
+          key: openssl-${{ env.OPENSSL_TAG }}-ubuntu-24.04
+
+      - name: Build OpenSSL 4.0 (if not cached)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch $OPENSSL_TAG https://github.com/openssl/openssl.git /tmp/openssl-src
+          cd /tmp/openssl-src
+          ./Configure --prefix=$OPENSSL_PREFIX --openssldir=$OPENSSL_PREFIX/etc/ssl \
+            enable-ktls no-docs no-tests -j$(nproc)
+          make -j$(nproc)
+          sudo make install_sw
+
+      - name: Configure (debug build)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DOPENSSL_ROOT_DIR=$OPENSSL_PREFIX
 
       - name: Build
         run: cmake --build build -j$(nproc)
