@@ -3,6 +3,13 @@
 #include "util.h"
 #include "auth.h"
 #include "bpf_loader.h"
+#include "simd.h"
+
+/* Route all memmem calls through the AVX2-accelerated vx_memmem */
+#define memmem(h,hl,n,nl) vx_memmem((h),(hl),(n),(nl))
+/* Specialized finders — faster than memmem for the two hottest patterns */
+#define FIND_CRLF(buf,len)    vx_find_crlf((const uint8_t *)(buf),(size_t)(len))
+#define FIND_HDR_END(buf,len) vx_find_hdr_end((const uint8_t *)(buf),(size_t)(len))
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -782,8 +789,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 if (!ah)
                     ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
                 if (ah) {
-                    uint8_t *line_end = (uint8_t *)memmem(ah + 2,
-                        (size_t)(rbuf + fwd_n - ah - 2), "\r\n", 2);
+                    uint8_t *line_end = (uint8_t *)FIND_CRLF(ah + 2,
+                        (size_t)(rbuf + fwd_n - ah - 2));
                     if (line_end) {
                         line_end += 2; /* include the \r\n */
                         size_t remove = (size_t)(line_end - ah - 2); /* bytes between \r\n's */
@@ -814,7 +821,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 if (ch) {
                     uint8_t *vs = ch + 13;
                     while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)memmem(vs, (size_t)(rbuf + fwd_n - vs), "\r\n", 2);
+                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
                     if (ve && ve > vs) {
                         size_t old_len = (size_t)(ve - vs);
                         int delta = (int)conn_val_len - (int)old_len;
@@ -826,7 +833,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                     }
                 } else {
                     /* No Connection header — inject one */
-                    const char *eol0 = (const char *)memmem(rbuf, (size_t)fwd_n, "\r\n", 2);
+                    const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
                     if (eol0) {
                         size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
                         char inj0[32];
@@ -850,7 +857,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
             /* ---- Inject proxy headers after request line ----
              * X-Forwarded-Proto, X-Forwarded-For, X-Real-IP, X-Api-Key */
-            const char *eol = (const char *)memmem(rbuf, (size_t)fwd_n, "\r\n", 2);
+            const char *eol = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
             if (eol) {
                 size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
 
@@ -961,7 +968,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             /* Count body bytes (after \r\n\r\n header terminator) */
             if (cold->backend_content_length > 0) {
                 const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
-                const char *hend = (const char *)memmem(sbuf2, (size_t)n, "\r\n\r\n", 4);
+                const char *hend = (const char *)FIND_HDR_END(sbuf2, (size_t)n);
                 if (hend) {
                     size_t body_in_chunk = (size_t)n - (size_t)(hend + 4 - (const char *)sbuf2);
                     cold->backend_body_recv += (uint32_t)body_in_chunk;
@@ -1000,7 +1007,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             uint8_t *sbuf = conn_send_buf(&w->pool, cid);
 
             /* Locate end of headers */
-            uint8_t *hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+            uint8_t *hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
             size_t hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
 
             /* ---- Replace Server header with CSWS/OpenVMS identity ----
@@ -1013,8 +1020,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 if (sh) {
                     uint8_t *vs = sh + 9;
                     while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)memmem(vs,
-                        (size_t)(sbuf + hdr_len - vs), "\r\n", 2);
+                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                        (size_t)(sbuf + hdr_len - vs));
                     if (ve) {
                         size_t old_len = (size_t)(ve - vs);
                         int delta = (int)new_srv_len - (int)old_len;
@@ -1022,7 +1029,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                             memmove(vs + new_srv_len, ve, (size_t)(sbuf + n - ve));
                             memcpy(vs, new_srv, new_srv_len);
                             n += delta;
-                            hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                             hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
                     }
@@ -1037,7 +1044,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                 (size_t)(n - (int)hle));
                         memcpy(sbuf + hle, inj_srv, (size_t)inj_srv_len);
                         n += inj_srv_len;
-                        hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                         hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                     }
                 }
@@ -1079,8 +1086,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                             /* Replace value in-place */
                             uint8_t *vs = cch + 16;
                             while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
-                            uint8_t *ve = (uint8_t *)memmem(vs,
-                                (size_t)(sbuf + hdr_len - vs), "\r\n", 2);
+                            uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                                (size_t)(sbuf + hdr_len - vs));
                             if (ve) {
                                 size_t old_len = (size_t)(ve - vs);
                                 int delta = cc_val_len - (int)old_len;
@@ -1088,7 +1095,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                     memmove(vs + cc_val_len, ve, (size_t)(sbuf + n - ve));
                                     memcpy(vs, cc_val, (size_t)cc_val_len);
                                     n += delta;
-                                    hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                                     hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                                 }
                             }
@@ -1104,7 +1111,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                             memmove(sbuf + hle + cc_len, sbuf + hle, (size_t)(n - (int)hle));
                             memcpy(sbuf + hle, cc_hdr, (size_t)cc_len);
                             n += cc_len;
-                            hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                             hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
                     }
@@ -1115,15 +1122,15 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         if (!ph)
                             ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\npragma:", 9);
                         if (ph) {
-                            uint8_t *pe = (uint8_t *)memmem(ph + 2,
-                                (size_t)(sbuf + n - ph - 2), "\r\n", 2);
+                            uint8_t *pe = (uint8_t *)FIND_CRLF(ph + 2,
+                                (size_t)(sbuf + n - ph - 2));
                             if (pe) {
                                 pe += 2; /* point past the line's \r\n */
                                 size_t remove = (size_t)(pe - (ph + 2));
                                 memmove(ph + 2, ph + 2 + remove,
                                     (size_t)(sbuf + n - (ph + 2 + remove)));
                                 n -= (int)remove;
-                                hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                                hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                                 hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                             }
                         }
@@ -1141,7 +1148,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                     memmove(sbuf + hle + as_len, sbuf + hle, (size_t)(n - (int)hle));
                     memcpy(sbuf + hle, altsvc, (size_t)as_len);
                     n += as_len;
-                    hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                     hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                 }
             }
@@ -1154,8 +1161,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 if (ch) {
                     uint8_t *vs = ch + 13;
                     while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)memmem(vs,
-                        (size_t)(sbuf + hdr_len - vs), "\r\n", 2);
+                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                        (size_t)(sbuf + hdr_len - vs));
                     if (ve && ve > vs) {
                         const char *kl = "keep-alive";
                         size_t kl_len = 10;
@@ -1165,7 +1172,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                             memmove(vs + kl_len, ve, (size_t)(sbuf + n - ve));
                             memcpy(vs, kl, kl_len);
                             n += delta;
-                            hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                             hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
                     }
@@ -1177,7 +1184,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         memmove(sbuf + hle + ka_len, sbuf + hle, (size_t)(n - (int)hle));
                         memcpy(sbuf + hle, "\r\nConnection: keep-alive", (size_t)ka_len);
                         n += ka_len;
-                        hdr_end = (uint8_t *)memmem(sbuf, (size_t)n, "\r\n\r\n", 4);
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                         hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                     }
                 }
@@ -1204,8 +1211,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
                         uint32_t ttl2 = cache_ttl_for_url(cc_url2);
                         if (ttl2 > 0) {
-                            const char *he2 = (const char *)memmem(
-                                resp2, (size_t)n, "\r\n\r\n", 4);
+                            const char *he2 = (const char *)FIND_HDR_END(
+                                resp2, (size_t)n);
                             if (he2) {
                                 size_t hl2 = (size_t)(he2 + 4 - (const char *)resp2);
                                 size_t bl2 = (size_t)n - hl2;
@@ -1345,8 +1352,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             if (!ah)
                 ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
             if (ah) {
-                uint8_t *le = (uint8_t *)memmem(ah + 2,
-                    (size_t)(rbuf + fwd_n - ah - 2), "\r\n", 2);
+                uint8_t *le = (uint8_t *)FIND_CRLF(ah + 2,
+                    (size_t)(rbuf + fwd_n - ah - 2));
                 if (le) {
                     le += 2;
                     size_t rm = (size_t)(le - ah - 2);
@@ -1365,8 +1372,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 if (ch) {
                     uint8_t *vs = ch + 13;
                     while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)memmem(vs,
-                        (size_t)(rbuf + fwd_n - vs), "\r\n", 2);
+                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                        (size_t)(rbuf + fwd_n - vs));
                     if (ve && ve > vs) {
                         size_t old_len = (size_t)(ve - vs);
                         int delta = 5 - (int)old_len; /* "close" = 5 bytes */
@@ -1378,7 +1385,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                     }
                 } else {
                     /* No Connection header — inject one after the request line */
-                    const char *eol0 = (const char *)memmem(rbuf, (size_t)fwd_n, "\r\n", 2);
+                    const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
                     if (eol0 && fwd_n + 19 <= (int)w->pool.buf_size) {
                         size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
                         memmove(rbuf + le + 19, rbuf + le, (size_t)fwd_n - le);

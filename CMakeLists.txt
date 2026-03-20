@@ -110,6 +110,7 @@ set(VORTEX_SRCS
     src/worker.c
     src/cache.c
     src/metrics.c
+    src/simd.c
 )
 
 if(OPENSSL_AVAILABLE)
