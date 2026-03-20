@@ -59,7 +59,7 @@ Package: vortex
 Version: ${VERSION}
 Architecture: amd64
 Maintainer: Jan Holtzhausen <janholtzhausen@users.noreply.github.com>
-Depends: libc6 (>= 2.38), libbpf1, liburing2, libyaml-0-2
+Depends: libc6 (>= 2.38), libbpf1, liburing2, libyaml-0-2, libbrotli1
 Section: net
 Priority: optional
 Description: High-performance kernel-assisted reverse proxy

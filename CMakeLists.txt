@@ -169,6 +169,7 @@ target_link_libraries(vortex
     pthread
     elf
     z
+    brotlienc
 )
 
 target_link_directories(vortex PRIVATE

@@ -36,9 +36,10 @@
 #include <linux/time_types.h>
 #include <sys/uio.h>
 #include <zlib.h>
+#include <brotli/encode.h>
 
-/* Minimum body size (bytes) for gzip compression to be worthwhile */
-#define GZIP_MIN_BODY 512
+/* Minimum body size (bytes) for compression to be worthwhile */
+#define COMPRESS_MIN_BODY 512
 
 /*
  * Compress src into dst using gzip framing.
@@ -59,6 +60,21 @@ static size_t gzip_compress(const uint8_t *src, size_t src_len,
     int ret = deflate(&zs, Z_FINISH);
     deflateEnd(&zs);
     return (ret == Z_STREAM_END) ? (size_t)zs.total_out : 0;
+}
+
+/*
+ * Compress src into dst using brotli.
+ * Quality 6: nginx default — good ratio, ~2× faster than quality 11.
+ * Returns compressed length, or 0 on failure / expansion.
+ */
+static size_t brotli_compress(const uint8_t *src, size_t src_len,
+                               uint8_t *dst, size_t dst_max)
+{
+    size_t out_len = dst_max;
+    if (!BrotliEncoderCompress(6, BROTLI_DEFAULT_WINDOW, BROTLI_MODE_TEXT,
+                               src_len, src, &out_len, dst))
+        return 0;
+    return out_len;
 }
 
 /*
@@ -736,8 +752,9 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
         }
 
-        /* Detect client gzip acceptance — cleared each request for keepalive correctness */
-        h->flags &= ~CONN_FLAG_CLIENT_GZIP;
+        /* Detect client compression acceptance — cleared each request for keepalive correctness.
+         * Prefer brotli (br) over gzip when both are advertised. */
+        h->flags &= ~(CONN_FLAG_CLIENT_GZIP | CONN_FLAG_CLIENT_BR);
         {
             const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
             const uint8_t *ae = (const uint8_t *)memmem(rbuf, (size_t)n, "Accept-Encoding:", 16);
@@ -745,8 +762,13 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             if (ae) {
                 const uint8_t *eol = (const uint8_t *)FIND_CRLF(ae + 16,
                     (size_t)n - (size_t)(ae + 16 - rbuf));
-                if (eol && memmem(ae + 16, (size_t)(eol - ae - 16), "gzip", 4))
-                    h->flags |= CONN_FLAG_CLIENT_GZIP;
+                if (eol) {
+                    size_t ae_val_len = (size_t)(eol - ae - 16);
+                    if (memmem(ae + 16, ae_val_len, "br", 2))
+                        h->flags |= CONN_FLAG_CLIENT_BR;
+                    if (memmem(ae + 16, ae_val_len, "gzip", 4))
+                        h->flags |= CONN_FLAG_CLIENT_GZIP;
+                }
             }
         }
 
@@ -1356,13 +1378,13 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
         }
 
-        /* ---- Gzip compression ----
+        /* ---- Brotli / gzip compression ----
          * Only on complete single-chunk responses (Content-Length present and
-         * matching) with a compressible Content-Type, for clients that
-         * advertised gzip support.  recv_buf is free at this point (client
-         * request already forwarded) and is used as scratch for the compressed
-         * output.  Cache store above already saved the uncompressed copy. */
-        if ((h->flags & CONN_FLAG_CLIENT_GZIP) && n > 0) {
+         * matching) with a compressible Content-Type.  Prefer brotli (br) when
+         * the client supports it — typically 15-25% smaller than gzip at the
+         * same CPU cost.  recv_buf is free at this point (client request already
+         * forwarded) and used as scratch.  Cache store above saved uncompressed. */
+        if ((h->flags & (CONN_FLAG_CLIENT_BR | CONN_FLAG_CLIENT_GZIP)) && n > 0) {
             uint8_t *sbuf_gz = conn_send_buf(&w->pool, cid);
             const uint8_t *hend_gz = (const uint8_t *)FIND_HDR_END(sbuf_gz, (size_t)n);
             if (hend_gz) {
@@ -1372,7 +1394,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
                 /* Verify Content-Length matches body in buffer (complete response) */
                 bool cl_match = false;
-                if (body_len >= GZIP_MIN_BODY) {
+                if (body_len >= COMPRESS_MIN_BODY) {
                     const char *clh2 = (const char *)memmem(
                         sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
                     if (!clh2) clh2 = (const char *)memmem(
@@ -1400,11 +1422,20 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         size_t ct_remaining = (size_t)(sbuf_gz + hdr_end_off + 4 - ct_val);
 
                         if (is_compressible_type(ct_val, ct_remaining)) {
-                            /* Compress body into recv_buf (free scratch space) */
+                            /* Pick algorithm: prefer brotli, fall back to gzip */
+                            bool use_br = (h->flags & CONN_FLAG_CLIENT_BR) != 0;
                             uint8_t *scratch = conn_recv_buf(&w->pool, cid);
-                            size_t clen = gzip_compress(
-                                sbuf_gz + body_off, body_len,
-                                scratch, w->pool.buf_size);
+                            size_t clen = use_br
+                                ? brotli_compress(sbuf_gz + body_off, body_len,
+                                                  scratch, w->pool.buf_size)
+                                : gzip_compress(sbuf_gz + body_off, body_len,
+                                                scratch, w->pool.buf_size);
+                            /* Fall back to gzip if brotli failed or didn't shrink */
+                            if (use_br && (clen == 0 || clen >= body_len)) {
+                                use_br = false;
+                                clen = gzip_compress(sbuf_gz + body_off, body_len,
+                                                     scratch, w->pool.buf_size);
+                            }
 
                             /* Only proceed if compression reduced size */
                             if (clen > 0 && clen < body_len) {
@@ -1429,10 +1460,11 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                     }
                                 }
 
-                                /* 2. Insert Content-Encoding: gzip before \r\n\r\n */
-                                const char ce_hdr[] = "\r\nContent-Encoding: gzip";
-                                const int   ce_len  = (int)(sizeof(ce_hdr) - 1);
-                                /* Move the trailing \r\n\r\n only; body will be overwritten */
+                                /* 2. Insert Content-Encoding header before \r\n\r\n */
+                                const char *ce_hdr = use_br
+                                    ? "\r\nContent-Encoding: br"
+                                    : "\r\nContent-Encoding: gzip";
+                                int ce_len = use_br ? 21 : 24;
                                 memmove(sbuf_gz + hdr_end_off + ce_len,
                                         sbuf_gz + hdr_end_off, 4);
                                 memcpy(sbuf_gz + hdr_end_off, ce_hdr, (size_t)ce_len);
@@ -1442,7 +1474,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                 if (new_body_off + clen <= w->pool.buf_size) {
                                     memcpy(sbuf_gz + new_body_off, scratch, clen);
                                     n = (int)(new_body_off + clen);
-                                    log_debug("gzip", "conn=%u %zu→%zu bytes", cid, body_len, clen);
+                                    log_debug("compress", "conn=%u %s %zu→%zu bytes",
+                                              cid, use_br ? "br" : "gzip", body_len, clen);
                                 }
                             }
                         }
