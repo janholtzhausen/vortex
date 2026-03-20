@@ -52,5 +52,8 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
+      - name: Build tests
+        run: cmake --build build --target test_config test_log test_cache -j$(nproc)
+
       - name: Run unit tests
         run: ctest --test-dir build/tests --output-on-failure
