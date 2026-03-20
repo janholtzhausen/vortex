@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "worker.h"
 #include "log.h"
 #include "util.h"
@@ -1689,7 +1690,29 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
 
 int worker_start(struct worker *w)
 {
-    return pthread_create(&w->thread, NULL, worker_thread, w);
+    int ret = pthread_create(&w->thread, NULL, worker_thread, w);
+    if (ret != 0) return ret;
+
+    /* Pin the worker thread to CPU worker_id (if that CPU is online).
+     * This keeps the io_uring ring, TLS state, and connection pool hot in
+     * the L1/L2 cache of one core, eliminating cross-CPU cache misses on
+     * the hot accept/recv/send path.
+     * If the CPU doesn't exist (e.g. fewer CPUs than workers) we skip
+     * silently — the scheduler will place it wherever it fits. */
+    if (w->cfg && w->cfg->cpu_affinity) {
+        int ncpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        int cpu   = w->worker_id % ncpus;
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu, &cpuset);
+        ret = pthread_setaffinity_np(w->thread, sizeof(cpuset), &cpuset);
+        if (ret != 0)
+            log_warn("worker_start", "id=%d cpu_affinity=%d failed: %s",
+                     w->worker_id, cpu, strerror(ret));
+        else
+            log_info("worker_start", "id=%d pinned to CPU %d", w->worker_id, cpu);
+    }
+    return 0;
 }
 
 void worker_stop(struct worker *w)
