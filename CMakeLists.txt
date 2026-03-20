@@ -182,10 +182,12 @@ if(OPENSSL_AVAILABLE)
     target_include_directories(vortex PRIVATE ${OPENSSL_INCLUDE_DIR})
     target_link_libraries(vortex ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
     target_link_directories(vortex PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
-    # Embed rpath so the binary finds the right libssl at runtime
+    # Embed rpath so the binary finds the right libssl at runtime.
+    # BUILD_RPATH points to the local build tree; INSTALL_RPATH points to
+    # the location used in the installed .deb package (/usr/lib/vortex).
     set_target_properties(vortex PROPERTIES
         BUILD_RPATH "${OPENSSL_ROOT_DIR}/lib64"
-        INSTALL_RPATH "${OPENSSL_ROOT_DIR}/lib64"
+        INSTALL_RPATH "/usr/lib/vortex"
     )
 endif()
 
