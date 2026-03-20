@@ -77,7 +77,7 @@ int main(void)
         ASSERT(cfg.http_port == 80,   "default http_port=80");
         ASSERT(cfg.tls.ktls == true,  "default ktls=true");
         ASSERT(cfg.cache.enabled == true, "default cache.enabled=true");
-        ASSERT(cfg.cache.index_entries == 4096, "default index_entries=4096");
+        ASSERT(cfg.cache.index_entries == 16384, "default index_entries=16384");
         ASSERT(cfg.metrics.port == 9090, "default metrics.port=9090");
     }
 
