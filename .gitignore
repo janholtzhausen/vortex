@@ -1,0 +1,14 @@
+build/
+build-release/
+build-*/
+*.o
+*.a
+*.so
+*.so.*
+vortex
+*.deb
+*.dsc
+*.changes
+*.buildinfo
+.DS_Store
+compile_commands.json

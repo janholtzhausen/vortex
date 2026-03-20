@@ -1,0 +1,73 @@
+global:
+  workers: auto
+  bind_address: "0.0.0.0"
+  bind_port: 443
+  http_port: 80
+  interface: "eth0"
+  log_level: "info"
+  log_format: "json"
+  pid_file: "/run/vortex.pid"
+
+tls:
+  min_version: "1.2"
+  max_version: "1.3"
+  ciphersuites: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+  session_timeout: 3600
+  session_ticket_rotation: 3600
+  ktls: true
+
+xdp:
+  mode: "auto"
+  rate_limit:
+    enabled: true
+    requests_per_second: 1000
+    burst: 2000
+  blocklist_file: "/etc/vortex/blocklist.txt"
+
+cache:
+  enabled: true
+  index_entries: 4096
+  slab_size_mb: 64
+  default_ttl: 300
+  use_hugepages: true
+
+acme:
+  enabled: false
+  email: "admin@example.com"
+  directory_url: "https://acme-v02.api.letsencrypt.org/directory"
+  account_key_path: "/etc/vortex/acme-account.key"
+  storage_path: "/etc/vortex/certs/"
+  renewal_days_before_expiry: 30
+  preferred_challenge: "http-01"
+
+metrics:
+  enabled: true
+  bind_address: "127.0.0.1"
+  port: 9090
+  path: "/metrics"
+
+routes:
+  - hostname: "api.example.com"
+    backends:
+      - address: "10.0.0.1:8080"
+        weight: 3
+      - address: "10.0.0.2:8080"
+        weight: 1
+    load_balancing: "weighted_round_robin"
+    cert_provider: "static_file"
+    cert_path: "/etc/vortex/certs/api.example.com/fullchain.pem"
+    key_path: "/etc/vortex/certs/api.example.com/privkey.pem"
+    cache:
+      enabled: true
+      ttl: 60
+      key: "$host$uri"
+
+  - hostname: "static.example.com"
+    backends:
+      - address: "10.0.0.3:8080"
+    cert_provider: "static_file"
+    cert_path: "/etc/vortex/certs/static.example.com/fullchain.pem"
+    key_path: "/etc/vortex/certs/static.example.com/privkey.pem"
+    cache:
+      enabled: true
+      ttl: 86400

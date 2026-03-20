@@ -1,0 +1,50 @@
+#pragma once
+
+#include <liburing.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* Operation types — stored in sqe->user_data (upper bits) */
+#define VORTEX_OP_ACCEPT         1
+#define VORTEX_OP_RECV_CLIENT    2   /* recv from client → forward to backend */
+#define VORTEX_OP_SEND_BACKEND   3   /* send to backend (client data) */
+#define VORTEX_OP_RECV_BACKEND   4   /* recv from backend → forward to client */
+#define VORTEX_OP_SEND_CLIENT    5   /* send to client (backend data) */
+#define VORTEX_OP_CONNECT        6
+#define VORTEX_OP_CLOSE          7
+#define VORTEX_OP_TIMEOUT        8
+#define VORTEX_OP_RECV_CLIENT_WS   9   /* websocket passthrough recv from client */
+#define VORTEX_OP_RECV_BACKEND_WS  10  /* websocket passthrough recv from backend */
+/* Legacy aliases */
+#define VORTEX_OP_RECV  VORTEX_OP_RECV_CLIENT
+#define VORTEX_OP_SEND  VORTEX_OP_SEND_BACKEND
+
+/* Encode op + conn_id into user_data */
+#define URING_UD_ENCODE(op, id)   (((uint64_t)(op) << 32) | (uint32_t)(id))
+#define URING_UD_OP(ud)           ((uint32_t)((ud) >> 32))
+#define URING_UD_ID(ud)           ((uint32_t)((ud) & 0xFFFFFFFF))
+
+struct uring_ctx {
+    struct io_uring  ring;
+    unsigned int     sq_entries;
+    unsigned int     cq_entries;
+    bool             sqpoll;   /* SQPOLL mode — only for multi-core */
+};
+
+int  uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll);
+void uring_destroy(struct uring_ctx *ctx);
+
+/* Submit all pending SQEs */
+int uring_submit(struct uring_ctx *ctx);
+
+/* Wait for at least min_events completions, process up to max_events.
+ * Returns number processed, or -1 on error. */
+int uring_wait(struct uring_ctx *ctx, unsigned int min_events);
+
+/* SQE helpers — return 0 on success, -EBUSY if SQ full */
+int uring_prep_accept(struct uring_ctx *ctx, int server_fd, uint32_t conn_id);
+int uring_prep_recv(struct uring_ctx *ctx, int fd, void *buf, size_t len, uint32_t conn_id);
+int uring_prep_send(struct uring_ctx *ctx, int fd, const void *buf, size_t len, uint32_t conn_id);
+int uring_prep_connect(struct uring_ctx *ctx, int fd, struct sockaddr *addr, socklen_t addrlen, uint32_t conn_id);
+int uring_prep_close(struct uring_ctx *ctx, int fd, uint32_t conn_id);
+int uring_prep_timeout(struct uring_ctx *ctx, struct __kernel_timespec *ts, uint32_t conn_id);

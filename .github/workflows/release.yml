@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build clang llvm \
+            libbpf-dev liburing-dev libyaml-dev \
+            linux-tools-common linux-tools-generic \
+            bpftool \
+            pkg-config \
+            dpkg-dev debhelper fakeroot
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Configure release build
+        run: |
+          cmake -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: cmake --build build-release -j$(nproc)
+
+      - name: Assemble .deb package
+        run: |
+          PKG=vortex_${{ steps.version.outputs.VERSION }}_amd64
+          STAGING="${{ runner.temp }}/${PKG}"
+
+          # Binary
+          install -Dm755 build-release/vortex "${STAGING}/usr/bin/vortex"
+
+          # BPF object
+          install -Dm644 build-release/vortex_xdp.bpf.o \
+            "${STAGING}/usr/share/vortex/vortex_xdp.bpf.o"
+
+          # Example config
+          install -Dm644 config/vortex.example.yaml \
+            "${STAGING}/etc/vortex/vortex.example.yaml"
+
+          # systemd unit
+          install -Dm644 contrib/vortex.service \
+            "${STAGING}/lib/systemd/system/vortex.service" 2>/dev/null || true
+
+          # debian control
+          mkdir -p "${STAGING}/DEBIAN"
+          cat > "${STAGING}/DEBIAN/control" <<EOF
+          Package: vortex
+          Version: ${{ steps.version.outputs.VERSION }}
+          Architecture: amd64
+          Maintainer: Jan Holtzhausen <janholtzhausen@users.noreply.github.com>
+          Depends: libc6 (>= 2.38), libbpf1, liburing2, libyaml-0-2
+          Section: net
+          Priority: optional
+          Description: High-performance kernel-assisted reverse proxy
+           Vortex is a TLS-terminating reverse proxy using XDP/eBPF for sub-microsecond
+           packet filtering, io_uring for async I/O, kTLS for kernel-offloaded TLS
+           crypto, and HTTP/3 via QUIC. Includes stateful L4 connection tracking,
+           per-IP rate limiting, automatic ACME certificate management, response
+           caching, and WebSocket passthrough.
+          EOF
+
+          # post-install script
+          cat > "${STAGING}/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          mkdir -p /var/log/vortex
+          mkdir -p /etc/vortex
+          if [ ! -f /etc/vortex/vortex.yaml ]; then
+              cp /etc/vortex/vortex.example.yaml /etc/vortex/vortex.yaml
+          fi
+          if command -v systemctl >/dev/null 2>&1; then
+              systemctl daemon-reload || true
+          fi
+          EOF
+          chmod 755 "${STAGING}/DEBIAN/postinst"
+
+          fakeroot dpkg-deb --build "${STAGING}" "${PKG}.deb"
+
+      - name: Upload .deb as release artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "vortex_${{ steps.version.outputs.VERSION }}_amd64.deb"
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            ```sh
+            # Install dependencies
+            sudo apt-get install -y libbpf1 liburing2 libyaml-0-2
+
+            # Install vortex
+            sudo dpkg -i vortex_${{ steps.version.outputs.VERSION }}_amd64.deb
+
+            # Edit config, then run
+            sudo vortex -f -c /etc/vortex/vortex.yaml \
+              -b /usr/share/vortex/vortex_xdp.bpf.o
+            ```
+
+            See [README.md](README.md) for full documentation.
+
+            > **Note:** XDP attachment requires root and a kernel with eBPF support
+            > (Linux 5.10+). TLS requires OpenSSL 4.0 built separately (see README).
+            > The .deb links against the distro OpenSSL for everything else.
