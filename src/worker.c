@@ -1296,12 +1296,43 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         log_debug("connect_cqe", "conn=%u backend_fd=%d connected", cid, h->backend_fd);
 
         h->state = CONN_STATE_PROXYING;
-        /* Now arm RECV_CLIENT to wait for the HTTP request */
-        struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe_c) { conn_close(w, cid, true); break; }
-        io_uring_prep_recv(sqe_c, h->client_fd,
-            conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0);
-        sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+
+        if (h->send_buf_len > 0) {
+            /* Reconnect case: request already buffered in recv_buf.
+             * Strip the Authorization header (security) then forward. */
+            uint32_t saved_n = h->send_buf_len;
+            h->send_buf_len = 0;
+            uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+            int fwd_n = (int)saved_n;
+
+            /* Strip Authorization so proxy credentials don't reach backend */
+            uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
+            if (!ah)
+                ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
+            if (ah) {
+                uint8_t *le = (uint8_t *)memmem(ah + 2,
+                    (size_t)(rbuf + fwd_n - ah - 2), "\r\n", 2);
+                if (le) {
+                    le += 2;
+                    size_t rm = (size_t)(le - ah - 2);
+                    memmove(ah + 2, ah + 2 + rm,
+                        (size_t)(rbuf + fwd_n - (ah + 2 + rm)));
+                    fwd_n -= (int)rm;
+                }
+            }
+
+            struct io_uring_sqe *sqe_s = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe_s) { conn_close(w, cid, true); break; }
+            io_uring_prep_send(sqe_s, h->backend_fd, rbuf, (size_t)fwd_n, MSG_NOSIGNAL);
+            sqe_s->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
+        } else {
+            /* Initial connect: arm RECV_CLIENT to get the first request */
+            struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe_c) { conn_close(w, cid, true); break; }
+            io_uring_prep_recv(sqe_c, h->client_fd,
+                conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0);
+            sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        }
         uring_submit(&w->uring);
         break;
     }
