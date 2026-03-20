@@ -19,7 +19,7 @@ jobs:
             cmake ninja-build clang llvm \
             libbpf-dev liburing-dev libyaml-dev \
             linux-tools-common linux-tools-generic \
-            bpftool \
+            patchelf \
             pkg-config \
             dpkg-dev debhelper
 
@@ -31,4 +31,3 @@ jobs:
 
       - name: Run unit tests
         run: ctest --test-dir build/tests --output-on-failure
-
