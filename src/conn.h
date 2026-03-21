@@ -32,6 +32,7 @@ typedef enum {
 #define CONN_FLAG_BACKEND_CONNECTING (1 << 10) /* async io_uring CONNECT in flight */
 #define CONN_FLAG_CLIENT_GZIP        (1 << 11) /* client sent Accept-Encoding: gzip */
 #define CONN_FLAG_CLIENT_BR          (1 << 12) /* client sent Accept-Encoding: br (brotli) */
+#define CONN_FLAG_SPLICE_MODE        (1 << 13) /* streaming body via zero-copy splice */
 
 /* Hot connection data — 2 cache lines (128 bytes), accessed per-packet */
 struct __attribute__((aligned(64))) conn_hot {
@@ -74,6 +75,9 @@ struct conn_cold {
     uint32_t       backend_content_length; /* expected response body bytes (0 = unknown) */
     uint32_t       backend_body_recv;      /* body bytes received so far */
     uint8_t        backend_pooled;         /* 1 = this backend fd came from the pool */
+
+    /* Zero-copy splice pipe — [0]=read end, [1]=write end; -1 when unused */
+    int            splice_pipe[2];
 };
 
 /* Per-worker connection pool */

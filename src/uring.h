@@ -16,6 +16,8 @@
 #define VORTEX_OP_RECV_CLIENT_WS   9   /* websocket passthrough recv from client */
 #define VORTEX_OP_RECV_BACKEND_WS  10  /* websocket passthrough recv from backend */
 #define VORTEX_OP_SEND_CLIENT_LINKED 11 /* send to client + pre-armed RECV_CLIENT linked */
+#define VORTEX_OP_SPLICE_BACKEND     12 /* splice backend_fd → pipe (zero-copy recv) */
+#define VORTEX_OP_SPLICE_CLIENT      13 /* splice pipe → client_fd (zero-copy send) */
 /* Legacy aliases */
 #define VORTEX_OP_RECV  VORTEX_OP_RECV_CLIENT
 #define VORTEX_OP_SEND  VORTEX_OP_SEND_BACKEND

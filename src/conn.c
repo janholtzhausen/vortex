@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 #include <sys/mman.h>
 
 #ifndef MAP_HUGETLB
@@ -137,6 +138,8 @@ uint32_t conn_alloc(struct conn_pool *pool)
     h->state      = CONN_STATE_ACCEPTING;
 
     memset(&pool->cold[id], 0, sizeof(pool->cold[id]));
+    pool->cold[id].splice_pipe[0] = -1;
+    pool->cold[id].splice_pipe[1] = -1;
 
     return id;
 }
@@ -151,6 +154,10 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     h->backend_fd = -1;
     h->ssl        = NULL;
     h->flags      = 0;
+
+    struct conn_cold *cold = &pool->cold[id];
+    if (cold->splice_pipe[0] >= 0) { close(cold->splice_pipe[0]); cold->splice_pipe[0] = -1; }
+    if (cold->splice_pipe[1] >= 0) { close(cold->splice_pipe[1]); cold->splice_pipe[1] = -1; }
 
     pool->free_list[pool->free_top++] = id;
     if (pool->active > 0) pool->active--;

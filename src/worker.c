@@ -456,6 +456,43 @@ static void conn_close(struct worker *w, uint32_t cid, bool is_error)
     if (is_error) w->errors++; else w->completed++;
 }
 
+/*
+ * Switch a streaming connection into zero-copy splice mode.
+ * Creates a pipe (if not already open), increases its buffer to 512 KB,
+ * then submits a SPLICE_BACKEND SQE: backend_fd → pipe[1].
+ * Falls back to the normal RECV_BACKEND path if pipe creation fails.
+ */
+static void begin_splice(struct worker *w, uint32_t cid, struct conn_hot *h)
+{
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+
+    if (cold->splice_pipe[0] < 0) {
+        if (pipe2(cold->splice_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+            /* Fallback: normal recv/send */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); return; }
+            PREP_RECV(w, sqe, h->backend_fd, conn_send_buf(&w->pool, cid),
+                h->recv_window, 0, SEND_IDX_SEND(w, cid));
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+            uring_submit(&w->uring);
+            return;
+        }
+        /* 512 KB pipe buffer — reduces kernel round-trips for large bodies */
+        fcntl(cold->splice_pipe[1], F_SETPIPE_SZ, 512 * 1024);
+    }
+
+    h->flags |= CONN_FLAG_SPLICE_MODE;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe) { conn_close(w, cid, true); return; }
+    /* Splice up to 1 MB at a time from backend socket into pipe.
+     * SPLICE_F_MOVE: hint kernel to avoid data copies where possible. */
+    io_uring_prep_splice(sqe, h->backend_fd, -1,
+                         cold->splice_pipe[1], -1,
+                         (unsigned int)(1u << 20), SPLICE_F_MOVE);
+    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_BACKEND, cid);
+    uring_submit(&w->uring);
+}
+
 /* Extract method and URL from HTTP/1.x request line.
  * Returns 0 on success, -1 if not a parseable HTTP request. */
 static int parse_http_request_line(const uint8_t *buf, int len,
@@ -1547,20 +1584,30 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
         }
 
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); break; }
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-            /* Still reading backend response — get next chunk */
+            /* Still reading backend response — more body chunks to come.
+             * Use zero-copy splice for non-pooled backends (pooled backends
+             * reuse their fd and need byte-counting, not splice). */
+            if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
+                !(h->flags & CONN_FLAG_WEBSOCKET_ACTIVE)) {
+                begin_splice(w, cid, h);
+                break;
+            }
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); break; }
             PREP_RECV(w, sqe, h->backend_fd, conn_send_buf(&w->pool, cid),
                 h->recv_window, 0, SEND_IDX_SEND(w, cid));
             sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+            uring_submit(&w->uring);
         } else {
             /* Response complete (cache hit, single chunk, or pool return) — next request */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); break; }
             PREP_RECV(w, sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
                 h->recv_window, 0, cid);
             sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            uring_submit(&w->uring);
         }
-        uring_submit(&w->uring);
         break;
     }
 
@@ -1592,6 +1639,64 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         /* Full send: recv already queued by kernel — nothing else to submit */
         h->send_buf_off = 0;
         h->send_buf_len = 0;
+        break;
+    }
+
+    case VORTEX_OP_SPLICE_BACKEND: {
+        /* Kernel spliced n bytes from backend_fd into splice_pipe[1] */
+        int n = cqe->res;
+        log_debug("splice_backend", "conn=%u n=%d", cid, n);
+        if (n < 0) { conn_close(w, cid, true); break; }
+        if (n == 0) {
+            /* Backend EOF — done streaming */
+            h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_SPLICE_MODE);
+            if (h->backend_fd >= 0) { close(h->backend_fd); h->backend_fd = -1; }
+            h->flags &= ~CONN_FLAG_BACKEND_POOLED;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, false); break; }
+            PREP_RECV(w, sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
+                h->recv_window, 0, cid);
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            uring_submit(&w->uring);
+            break;
+        }
+        /* Bytes are in the pipe — splice pipe[0] → client_fd */
+        h->bytes_out += (uint32_t)n;
+        struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); break; }
+        io_uring_prep_splice(sqe, cold->splice_pipe[0], -1,
+                             h->client_fd, -1,
+                             (unsigned int)n, SPLICE_F_MOVE);
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_CLIENT, cid);
+        uring_submit(&w->uring);
+        break;
+    }
+
+    case VORTEX_OP_SPLICE_CLIENT: {
+        /* Kernel spliced bytes from pipe → client_fd */
+        int sent = cqe->res;
+        log_debug("splice_client", "conn=%u sent=%d", cid, sent);
+        if (sent < 0) { conn_close(w, cid, true); break; }
+        /* Loop: splice next chunk from backend into pipe */
+        if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+            struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); break; }
+            io_uring_prep_splice(sqe, h->backend_fd, -1,
+                                 cold->splice_pipe[1], -1,
+                                 (unsigned int)(1u << 20), SPLICE_F_MOVE);
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_BACKEND, cid);
+            uring_submit(&w->uring);
+        } else {
+            /* Streaming flag cleared elsewhere (shouldn't normally reach here) */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, false); break; }
+            PREP_RECV(w, sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
+                h->recv_window, 0, cid);
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            uring_submit(&w->uring);
+        }
         break;
     }
 
