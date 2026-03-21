@@ -905,9 +905,17 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                 h->send_buf_off = 0;
                                 h->send_buf_len = (uint32_t)serve_len;
                                 h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                                PREP_SEND(w, sqe, h->client_fd, sbuf,
-                                    serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+                                if (w->uring.bufs_registered) {
+                                    h->zc_notif_count++;
+                                    io_uring_prep_send_zc_fixed(sqe, h->client_fd,
+                                        sbuf, serve_len, MSG_NOSIGNAL, 0,
+                                        (unsigned)SEND_IDX_SEND(w, cid));
+                                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
+                                } else {
+                                    PREP_SEND(w, sqe, h->client_fd, sbuf,
+                                        serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+                                }
                                 uring_submit(&w->uring);
                                 log_debug("cache_hit", "conn=%u url=%s", cid, url);
                                 break;
@@ -1533,14 +1541,30 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
         }
 
-        /* Forward backend data to client */
+        /* Forward backend data to client.
+         * send_zc_fixed (zero-copy): kernel reads directly from the pinned
+         * registered buffer instead of copying into the socket send buffer.
+         * Two CQEs are generated: completion (bytes sent) + notification (buffer free).
+         * We arm the next recv only after the notification to avoid reusing the
+         * buffer while the kernel is still reading it for encryption. */
         h->send_buf_off = 0;
         h->send_buf_len = (uint32_t)n;
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); break; }
-        PREP_SEND(w, sqe, h->client_fd, conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-        uring_submit(&w->uring);
+        {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); break; }
+            if (w->uring.bufs_registered) {
+                h->zc_notif_count++;
+                io_uring_prep_send_zc_fixed(sqe, h->client_fd,
+                    conn_send_buf(&w->pool, cid), (size_t)n,
+                    MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
+                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
+            } else {
+                PREP_SEND(w, sqe, h->client_fd, conn_send_buf(&w->pool, cid),
+                    (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+            }
+            uring_submit(&w->uring);
+        }
         break;
     }
 
@@ -1632,6 +1656,79 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         /* Full send: recv already queued by kernel — nothing else to submit */
         h->send_buf_off = 0;
         h->send_buf_len = 0;
+        break;
+    }
+
+    case VORTEX_OP_SEND_CLIENT_ZC: {
+        /* Two CQEs per send_zc:
+         *  1. Completion (IORING_CQE_F_MORE set): bytes sent, buffer still pinned.
+         *  2. Notification (IORING_CQE_F_NOTIF set): kernel done reading buffer.
+         * We arm the next recv only after the notification so we don't overwrite
+         * send_buf while the kernel's kTLS layer is still encrypting from it. */
+        if (cqe->flags & IORING_CQE_F_NOTIF) {
+            /* Buffer released — may now arm the next recv */
+            if (h->zc_notif_count > 0) h->zc_notif_count--;
+            if (h->zc_notif_count == 0 && h->send_buf_len == 0) {
+                if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+                    if (!sqe) { conn_close(w, cid, true); break; }
+                    PREP_RECV(w, sqe, h->backend_fd, conn_send_buf(&w->pool, cid),
+                        h->recv_window, 0, SEND_IDX_SEND(w, cid));
+                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+                    uring_submit(&w->uring);
+                } else {
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+                    if (!sqe) { conn_close(w, cid, false); break; }
+                    PREP_RECV(w, sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
+                        h->recv_window, 0, cid);
+                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+                    uring_submit(&w->uring);
+                }
+            }
+            /* else: more sends in flight — their NOTIFs will arm the recv */
+            break;
+        }
+
+        /* Completion CQE */
+        int sent = cqe->res;
+        log_debug("send_client_zc", "conn=%u sent=%d", cid, sent);
+        if (sent < 0) { conn_close(w, cid, true); break; }
+        h->send_buf_off += (uint32_t)sent;
+
+        if (h->send_buf_off < h->send_buf_len) {
+            /* Partial send — flush remaining bytes (still ZC, same registered buffer) */
+            h->zc_notif_count++;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); break; }
+            io_uring_prep_send_zc_fixed(sqe, h->client_fd,
+                conn_send_buf(&w->pool, cid) + h->send_buf_off,
+                h->send_buf_len - h->send_buf_off,
+                MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
+            uring_submit(&w->uring);
+            break;
+        }
+
+        /* Full send complete — update accounting and pool return if needed */
+        h->send_buf_off = 0;
+        h->send_buf_len = 0;
+
+        if ((h->flags & CONN_FLAG_BACKEND_POOLED) &&
+            (h->flags & CONN_FLAG_STREAMING_BACKEND)) {
+            struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+            if (cold->backend_content_length > 0 &&
+                cold->backend_body_recv >= cold->backend_content_length) {
+                int ri = h->route_idx, bi = h->backend_idx;
+                int ps = w->cfg->routes[ri].backends[bi].pool_size;
+                backend_pool_put(w, ri, bi, h->backend_fd, ps);
+                h->backend_fd = -1;
+                h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_BACKEND_POOLED);
+                cold->backend_content_length = 0;
+                cold->backend_body_recv      = 0;
+                log_debug("pool_return_zc", "conn=%u route=%d backend=%d", cid, ri, bi);
+            }
+        }
+        /* Buffer still pinned — NOTIF CQE will arm the next recv */
         break;
     }
 

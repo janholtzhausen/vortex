@@ -47,7 +47,8 @@ struct __attribute__((aligned(64))) conn_hot {
     uint16_t      backend_idx;
     uint32_t      conn_id;         /* Pool slot index */
     uint16_t      recv_window;     /* Dynamic recv size: starts at buf_init, doubles on full read */
-    uint8_t       _pad[14];
+    uint8_t       zc_notif_count;  /* In-flight send_zc ops awaiting NOTIF CQE */
+    uint8_t       _pad[13];
     /* --- cache line boundary --- */
     void         *ssl;             /* SSL* — NULL after kTLS install */
     void         *uring_data;
