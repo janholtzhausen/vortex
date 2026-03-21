@@ -149,14 +149,11 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     if (id >= pool->capacity) return;
 
     struct conn_hot *h = &pool->hot[id];
-    h->state          = CONN_STATE_FREE;
-    h->client_fd      = -1;
-    h->backend_fd     = -1;
-    h->ssl            = NULL;
-    h->flags          = 0;
-    h->zc_notif_count = 0;
-    h->send_buf_off   = 0;
-    h->send_buf_len   = 0;
+    h->state      = CONN_STATE_FREE;
+    h->client_fd  = -1;
+    h->backend_fd = -1;
+    h->ssl        = NULL;
+    h->flags      = 0;
 
     struct conn_cold *cold = &pool->cold[id];
     if (cold->splice_pipe[0] >= 0) { close(cold->splice_pipe[0]); cold->splice_pipe[0] = -1; }
