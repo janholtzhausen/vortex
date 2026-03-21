@@ -1585,14 +1585,7 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         }
 
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-            /* Still reading backend response — more body chunks to come.
-             * Use zero-copy splice for non-pooled backends (pooled backends
-             * reuse their fd and need byte-counting, not splice). */
-            if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
-                !(h->flags & CONN_FLAG_WEBSOCKET_ACTIVE)) {
-                begin_splice(w, cid, h);
-                break;
-            }
+            /* Still reading backend response — get next chunk */
             struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
             if (!sqe) { conn_close(w, cid, true); break; }
             PREP_RECV(w, sqe, h->backend_fd, conn_send_buf(&w->pool, cid),
