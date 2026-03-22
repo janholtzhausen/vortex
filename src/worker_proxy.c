@@ -778,8 +778,10 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
             /* ---- Strip Accept-Encoding ----
              * We handle compression ourselves; tell the backend to send plain
-             * so we can inspect, cache, and compress on the way out. */
-            {
+             * so we can inspect, cache, and compress on the way out.
+             * Skipped when pass_accept_encoding is set — non-cached routes
+             * can let the backend compress directly and save proxy CPU. */
+            if (!rc_fwd->pass_accept_encoding) {
                 uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
                 if (!ae)
                     ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);

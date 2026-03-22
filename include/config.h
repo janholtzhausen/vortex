@@ -91,6 +91,18 @@ struct route_config {
 
     /* Per-route Server header override.  Empty = use global server_header. */
     char server_header[128];
+
+    /* When true, pass the client's Accept-Encoding header to the backend
+     * unchanged instead of stripping it.  Useful for non-cached routes where
+     * the proxy does not inspect the body and the backend can compress
+     * responses itself, saving proxy CPU. */
+    bool pass_accept_encoding;
+
+    /* TCP congestion control algorithm for backend connections on this route.
+     * Empty = use the kernel default (typically cubic).  Per-route override of
+     * the global congestion_control setting.  Only effective if the algorithm
+     * is loaded on the host (check /proc/sys/net/ipv4/tcp_allowed_congestion_control). */
+    char congestion_control[16];
 };
 
 struct xdp_config {
@@ -160,6 +172,10 @@ struct vortex_config {
     /* Server header sent to clients (replaces backend's Server header).
      * Empty string = pass backend's Server header through unchanged. */
     char     server_header[128];
+
+    /* Global TCP congestion control algorithm for backend connections.
+     * Per-route congestion_control overrides this.  Empty = kernel default. */
+    char congestion_control[16];
 
     struct tls_config     tls;
     struct xdp_config     xdp;

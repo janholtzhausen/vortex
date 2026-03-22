@@ -146,6 +146,33 @@ int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
     int lowat = WORKER_BUF_SIZE;
     setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 
+    /* TCP_USER_TIMEOUT — kernel drops connection when data is unACKed for
+     * longer than backend_timeout_ms.  Without this the default retransmit
+     * window is ~15 min, turning a dead backend into a silent hang. */
+    struct conn_hot *_ch = conn_hot(&w->pool, cid);
+    int ri = _ch->route_idx;
+    uint32_t tmo_ms = w->cfg->routes[ri].backend_timeout_ms;
+    if (tmo_ms == 0) tmo_ms = 30000; /* match default deadline */
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &tmo_ms, sizeof(tmo_ms));
+
+    /* SO_KEEPALIVE — detect silently-dead backends on pooled connections.
+     * Keepalive probes start after 5 s idle, repeat every 5 s, abandon
+     * after 3 missed probes (total ~20 s to declare a pooled conn dead). */
+    if (bcfg->pool_size > 0) {
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+        int idle = 5, intvl = 5, cnt = 3;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+    }
+
+    /* TCP congestion control — per-route override, then global, then kernel default */
+    const char *cc = w->cfg->routes[ri].congestion_control[0]
+                     ? w->cfg->routes[ri].congestion_control
+                     : w->cfg->congestion_control;
+    if (cc[0])
+        setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, (socklen_t)strlen(cc));
+
     /* Issue async CONNECT — returns EINPROGRESS immediately */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
     if (!sqe) { close(fd); return -1; }

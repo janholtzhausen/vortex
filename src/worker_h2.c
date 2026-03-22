@@ -691,6 +691,13 @@ static int on_header_cb(nghttp2_session *ngh2,
         (namelen == 7  && memcmp(name, "upgrade", 7) == 0))
         return 0;
 
+    /* Strip Accept-Encoding unless pass_accept_encoding is set for this route */
+    if (namelen == 15 && memcmp(name, "accept-encoding", 15) == 0) {
+        struct conn_hot *_ch = conn_hot(&sess->w->pool, sess->cid);
+        if (!sess->w->cfg->routes[_ch->route_idx].pass_accept_encoding)
+            return 0;
+    }
+
     /* Accumulate in req_hdr_buf as "name: value\r\n" */
     size_t needed = namelen + 2 + valuelen + 2; /* "name: value\r\n" */
     if (st->req_hdr_len + needed < sizeof(st->req_hdr_buf)) {
