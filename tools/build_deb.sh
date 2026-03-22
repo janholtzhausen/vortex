@@ -10,11 +10,24 @@ BUILD_DIR="$REPO_ROOT/build-release"
 VERSION="${1:-$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")}"
 PKG="vortex_${VERSION}_amd64"
 STAGING="/tmp/${PKG}"
+OPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR:-/opt/openssl-4.0}"
+NGTCP2_BUILD_DIR="${NGTCP2_BUILD_DIR:-/opt/ngtcp2/build}"
+NGHTTP3_BUILD_DIR="${NGHTTP3_BUILD_DIR:-/opt/nghttp3/build}"
+NGTCP2_SRC_DIR="${NGTCP2_SRC_DIR:-/tmp/ngtcp2-1.16.0}"
+NGHTTP3_SRC_DIR="${NGHTTP3_SRC_DIR:-/tmp/nghttp3-1.8.0}"
 
 echo "==> Building vortex .deb  version=${VERSION}"
 
 # ---- 1. Compile ----
-cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DFORCE_OPENSSL_BUNDLED=ON -Wno-dev -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF 2>/dev/null
+cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DFORCE_OPENSSL_BUNDLED=ON \
+    -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+    -DNGTCP2_BUILD_DIR="$NGTCP2_BUILD_DIR" \
+    -DNGHTTP3_BUILD_DIR="$NGHTTP3_BUILD_DIR" \
+    -DNGTCP2_SRC_DIR="$NGTCP2_SRC_DIR" \
+    -DNGHTTP3_SRC_DIR="$NGHTTP3_SRC_DIR" \
+    -Wno-dev -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF 2>/dev/null
 make -C "$BUILD_DIR" -j"$(nproc)"
 
 # ---- 2. Stage package tree ----
@@ -59,7 +72,7 @@ Package: vortex
 Version: ${VERSION}
 Architecture: amd64
 Maintainer: Jan Holtzhausen <janholtzhausen@users.noreply.github.com>
-Depends: libc6 (>= 2.38), libbpf1, liburing2, libyaml-0-2, libbrotli1
+Depends: libc6 (>= 2.38), libbpf1, liburing2, libyaml-0-2, libbrotli1, libnghttp2-14
 Section: net
 Priority: optional
 Description: High-performance kernel-assisted reverse proxy

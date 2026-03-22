@@ -9,6 +9,9 @@
  * that are called from within the cases here.
  */
 #include "worker_internal.h"
+#ifdef VORTEX_H2
+#include "h2.h"
+#endif
 
 /* Extract method and URL from HTTP/1.x request line.
  * Returns 0 on success, -1 if not a parseable HTTP request. */
@@ -297,6 +300,32 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             th->ssl = res.ssl;
         }
 
+#ifdef VORTEX_H2
+        /* If client negotiated h2 via ALPN, hand off to the H2 session */
+        if (res.h2_negotiated) {
+            th->flags |= CONN_FLAG_HTTP2;
+            th->state  = CONN_STATE_PROXYING;
+            th->route_idx = (uint16_t)(res.tls_route_idx >= 0 ? res.tls_route_idx : 0);
+            th->last_active_tsc = rdtsc();
+            w->accepted++;
+
+            if (h2_session_init(w, hcid) != 0) {
+                close(res.client_fd);
+                conn_free(&w->pool, hcid);
+                return;
+            }
+
+            /* Arm first RECV_CLIENT for H2 frame data */
+            struct io_uring_sqe *h2sq = io_uring_get_sqe(&w->uring.ring);
+            if (!h2sq) { conn_close(w, hcid, true); return; }
+            io_uring_prep_recv(h2sq, res.client_fd,
+                conn_recv_buf(&w->pool, hcid), w->pool.buf_size, 0);
+            h2sq->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_CLIENT, 0, hcid);
+            uring_submit(&w->uring);
+            return;
+        }
+#endif
+
         /* Route selection (same logic as post-TLS in handle_accept) */
         int tls_route_idx = res.tls_route_idx;
         int route_idx = tls_route_idx;
@@ -369,6 +398,26 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             conn_recv_buf(&w->pool, hcid), th->recv_window, 0, hcid);
         ts1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, hcid);
         uring_submit(&w->uring);
+        return;
+    }
+#endif
+
+#ifdef VORTEX_H2
+    /* H2 backend ops encode (slot << 12) | cid in the lower 32 bits —
+     * extract the real cid with URING_UD_H2_CID before the pool capacity check. */
+    if (op == VORTEX_OP_H2_CONNECT || op == VORTEX_OP_H2_SEND_BACKEND ||
+        op == VORTEX_OP_H2_RECV_BACKEND) {
+        uint32_t h2_cid  = URING_UD_H2_CID(cqe->user_data);
+        uint32_t h2_slot = URING_UD_H2_SLOT(cqe->user_data);
+        if (h2_cid >= w->pool.capacity) return;
+        struct conn_hot *hh = conn_hot(&w->pool, h2_cid);
+        if (hh->state == CONN_STATE_FREE) return;
+        if (op == VORTEX_OP_H2_CONNECT)
+            h2_on_backend_connect(w, h2_cid, h2_slot, cqe->res);
+        else if (op == VORTEX_OP_H2_SEND_BACKEND)
+            h2_on_backend_send(w, h2_cid, h2_slot, cqe->res);
+        else
+            h2_on_backend_recv(w, h2_cid, h2_slot, cqe->res);
         return;
     }
 #endif
@@ -1841,6 +1890,17 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         /* Note: do NOT arm next recv here — wait for the NOTIF CQE */
         break;
     }
+
+#ifdef VORTEX_H2
+    case VORTEX_OP_H2_RECV_CLIENT: {
+        h2_on_recv(w, cid, cqe->res);
+        break;
+    }
+    case VORTEX_OP_H2_SEND_CLIENT: {
+        h2_on_send_client(w, cid, cqe->res);
+        break;
+    }
+#endif
 
     default: break;
     }

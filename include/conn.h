@@ -5,6 +5,9 @@
 #include <netinet/in.h>
 #include "util.h"
 
+/* Forward declaration — full type in h2.h */
+struct h2_session;
+
 /* Connection states */
 typedef enum {
     CONN_STATE_FREE = 0,
@@ -98,6 +101,9 @@ struct conn_cold {
     bool           chunk_skip_crlf; /* true: must skip \r\n before next chunk size */
     uint32_t       chunk_ttl;        /* TTL seconds for this URL */
     char           chunk_url[512];   /* URL to cache under */
+
+    /* HTTP/2 session — non-NULL for H2 client connections */
+    struct h2_session *h2;
 };
 
 /* Per-worker connection pool */

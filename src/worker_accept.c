@@ -8,6 +8,9 @@
  * every error path throughout the worker subsystem.
  */
 #include "worker_internal.h"
+#ifdef VORTEX_H2
+#include "h2.h"
+#endif
 
 /*
  * Peek at the raw TLS ClientHello and extract the SNI hostname.
@@ -170,6 +173,12 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
     if (h->state == CONN_STATE_FREE) return;
 #ifdef VORTEX_PHASE_TLS
     if (h->ssl) { tls_ssl_free((SSL *)h->ssl); h->ssl = NULL; }
+#endif
+#ifdef VORTEX_H2
+    {
+        struct conn_cold *cc = conn_cold_ptr(&w->pool, cid);
+        if (cc->h2) { h2_session_free(cc->h2); cc->h2 = NULL; }
+    }
 #endif
     if (h->client_fd  >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_CLIENT(w, cid));

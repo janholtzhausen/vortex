@@ -35,6 +35,13 @@ if(NOT YAML_FOUND)
     message(FATAL_ERROR "libyaml not found. Install: apt-get install libyaml-dev")
 endif()
 
+pkg_check_modules(NGHTTP2 libnghttp2)
+if(NGHTTP2_FOUND)
+    message(STATUS "nghttp2: ${NGHTTP2_VERSION} — HTTP/2 frontend enabled")
+else()
+    message(STATUS "nghttp2: not found — HTTP/2 disabled (apt-get install libnghttp2-dev)")
+endif()
+
 # ---- OpenSSL 4.0 (required for Phase 3+) ----
 set(OPENSSL_ROOT_DIR "/opt/openssl-4.0" CACHE PATH "OpenSSL 4.0 installation prefix")
 if(EXISTS "${OPENSSL_ROOT_DIR}/include/openssl/ssl.h")
@@ -122,6 +129,9 @@ set(VORTEX_SRCS
 if(OPENSSL_AVAILABLE)
     list(APPEND VORTEX_SRCS src/tls.c)
     list(APPEND VORTEX_SRCS src/tls_pool.c)
+    if(NGHTTP2_FOUND)
+        list(APPEND VORTEX_SRCS src/worker_h2.c)
+    endif()
     list(APPEND VORTEX_SRCS
         cert/static_file.c
         cert/acme_client.c
@@ -164,8 +174,11 @@ target_include_directories(vortex PRIVATE
 
 if(QUIC_AVAILABLE)
     target_include_directories(vortex PRIVATE
+        ${NGTCP2_BUILD_DIR}/lib/includes
+        ${NGTCP2_BUILD_DIR}/crypto/includes
         ${NGTCP2_SRC_DIR}/lib/includes
         ${NGTCP2_SRC_DIR}/crypto/includes
+        ${NGHTTP3_BUILD_DIR}/lib/includes
         ${NGHTTP3_SRC_DIR}/lib/includes
     )
 endif()
@@ -179,6 +192,13 @@ target_link_libraries(vortex
     z
     brotlienc
 )
+
+if(NGHTTP2_FOUND)
+    target_compile_definitions(vortex PRIVATE VORTEX_H2=1)
+    target_include_directories(vortex PRIVATE ${NGHTTP2_INCLUDE_DIRS})
+    target_link_libraries(vortex ${NGHTTP2_LIBRARIES})
+    target_link_directories(vortex PRIVATE ${NGHTTP2_LIBRARY_DIRS})
+endif()
 
 target_link_directories(vortex PRIVATE
     ${LIBBPF_LIBRARY_DIRS}
@@ -233,6 +253,7 @@ message(STATUS "  libbpf:         ${LIBBPF_VERSION}")
 message(STATUS "  liburing:       ${LIBURING_VERSION}")
 message(STATUS "  libyaml:        ${YAML_VERSION}")
 message(STATUS "  OpenSSL 4.0:    ${OPENSSL_AVAILABLE}")
+message(STATUS "  nghttp2 (H2):   ${NGHTTP2_FOUND}")
 message(STATUS "  BPF compiler:   ${CLANG_BPF}")
 message(STATUS "===================================")
 message(STATUS "")

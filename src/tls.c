@@ -86,6 +86,23 @@ static int sni_callback(SSL *ssl, int *al, void *arg)
     return SSL_TLSEXT_ERR_OK;
 }
 
+/* ALPN: temporarily advertise only HTTP/1.1.
+ * The current H2 frontend bypasses the established proxy/cache/rewrite path. */
+static int alpn_select_cb(SSL *ssl, const uint8_t **out, uint8_t *outlen,
+                           const uint8_t *in, unsigned int inlen, void *arg)
+{
+    (void)ssl; (void)arg;
+    /* Wire-format protocol list: length byte followed by name bytes */
+    static const uint8_t protos[] = {
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1',
+    };
+    if (SSL_select_next_proto((uint8_t **)out, outlen,
+                              protos, sizeof(protos), in, inlen)
+            == OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
 static SSL_CTX *create_ssl_ctx(struct tls_ctx *tls,
                                 const struct route_config *route,
                                 int route_idx)
@@ -147,6 +164,9 @@ static SSL_CTX *create_ssl_ctx(struct tls_ctx *tls,
 
     /* SNI callback */
     SSL_CTX_set_tlsext_servername_callback(ctx, sni_callback);
+
+    /* ALPN: advertise HTTP/1.1 only */
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
 
     return ctx;
 }

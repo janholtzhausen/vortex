@@ -46,6 +46,14 @@ static void *tls_pool_worker_thread(void *arg)
             res.tls_route_idx = route_idx;
             res.tls_version  = SSL_version(ssl);
 
+            /* Detect ALPN negotiation result */
+            const uint8_t *alpn_proto;
+            unsigned int   alpn_len;
+            SSL_get0_alpn_selected(ssl, &alpn_proto, &alpn_len);
+            res.h2_negotiated = (alpn_len == 2 && memcmp(alpn_proto, "h2", 2) == 0);
+            if (res.h2_negotiated)
+                log_debug("tls_pool", "ALPN=h2 cid=%u", job.cid);
+
             if (tls_ktls_tx_active(ssl) && tls_ktls_rx_active(ssl)) {
                 res.ktls_tx = true;
                 res.ktls_rx = true;

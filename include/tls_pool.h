@@ -32,6 +32,7 @@ struct tls_handshake_result {
     bool     ok;            /* false = handshake failed, close and free conn */
     bool     ktls_tx;
     bool     ktls_rx;
+    bool     h2_negotiated; /* ALPN selected "h2" */
     int      tls_version;   /* SSL_version() result */
 };
 

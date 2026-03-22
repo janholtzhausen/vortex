@@ -22,6 +22,25 @@
 #define VORTEX_OP_SEND_BACKEND_WS    15 /* send client WS frame to backend (after RECV_CLIENT_WS) */
 #define VORTEX_OP_SEND_CLIENT_WS     16 /* send backend WS frame to client (after RECV_BACKEND_WS) */
 #define VORTEX_OP_SEND_CLIENT_ZC     17 /* zero-copy send to client (two-CQE: completion + notification) */
+#define VORTEX_OP_H2_RECV_CLIENT     18 /* recv from H2 client (nghttp2 input) */
+#define VORTEX_OP_H2_SEND_CLIENT     19 /* send nghttp2 output to H2 client */
+#define VORTEX_OP_H2_CONNECT         20 /* async TCP connect to backend for H2 stream */
+#define VORTEX_OP_H2_SEND_BACKEND    21 /* send HTTP/1.1 request to H2 stream backend */
+#define VORTEX_OP_H2_RECV_BACKEND    22 /* recv HTTP/1.1 response from H2 stream backend */
+
+/*
+ * H2 user_data encoding — encodes op, stream slot, and connection id.
+ *   bits 63-32: op
+ *   bits 23-12: stream slot (up to 4096; H2_STREAM_SLOTS=32 fits)
+ *   bits 11-0:  cid (WORKER_MAX_CONNS=4096 fits in 12 bits)
+ * For H2_RECV_CLIENT and H2_SEND_CLIENT, slot is always 0 so
+ * URING_UD_ID() correctly extracts cid via the standard macro.
+ */
+#define URING_UD_H2_ENCODE(op, slot, cid) \
+    (((uint64_t)(op) << 32) | (((uint64_t)((slot) & 0xFFF)) << 12) | ((uint64_t)((cid) & 0xFFF)))
+#define URING_UD_H2_CID(ud)   ((uint32_t)((ud) & 0xFFF))
+#define URING_UD_H2_SLOT(ud)  ((uint32_t)(((ud) >> 12) & 0xFFF))
+
 /* Legacy aliases */
 #define VORTEX_OP_RECV  VORTEX_OP_RECV_CLIENT
 #define VORTEX_OP_SEND  VORTEX_OP_SEND_BACKEND

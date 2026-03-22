@@ -165,6 +165,7 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     cold->chunk_body_len  = 0;
     cold->chunk_remaining = 0;
     cold->chunk_skip_crlf = false;
+    cold->h2 = NULL; /* h2_session_free must have been called by conn_close before conn_free */
 
     pool->free_list[pool->free_top++] = id;
     if (pool->active > 0) pool->active--;

@@ -14,7 +14,7 @@ ExecStart=/usr/bin/vortex \
     -b /usr/share/vortex/vortex_xdp.bpf.o
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 # XDP requires CAP_NET_ADMIN + CAP_SYS_ADMIN for BPF map creation
