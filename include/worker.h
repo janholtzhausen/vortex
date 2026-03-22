@@ -56,7 +56,7 @@ struct worker {
 
     /* Tarpit: unrecognised-SNI connections held with window=1 */
     int              tarpit_fds[WORKER_TARPIT_MAX];
-    uint32_t         tarpit_head;   /* FIFO head index */
+    uint32_t         tarpit_head;   /* FIFO: head is the eviction index (oldest fd), wraps via %WORKER_TARPIT_MAX */
     uint32_t         tarpit_count;  /* number of live tarpit fds */
     uint64_t         tarpit_total;  /* cumulative tarpit count */
 
@@ -75,27 +75,30 @@ struct worker {
     uint32_t             blocked_tail;
     uint32_t             blocked_count;
 
-    /* Per-(route, backend) circuit breaker state.
-     * fail_count: consecutive connect failures since last success.
-     * open_until_ns: if nonzero and > now, circuit is open (fast-reject).
-     *   When timeout expires, one probe is allowed through; success clears it,
-     *   failure extends it. */
+    /* Circuit breaker per (route, backend). fail_count resets to 0 on first success.
+     * open_until_ns=0 means closed. Half-open: when timeout expires, ONE probe request
+     * is let through; if it succeeds, open_until_ns is cleared. */
     struct {
         uint32_t fail_count;
         uint64_t open_until_ns;
     } backend_cb[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
 
-    /* Per-route token bucket for rate limiting (one per route, per worker) */
+    /* Token bucket rate limiter. tokens is in integer requests (not millirequests).
+     * last_ns is CLOCK_MONOTONIC_COARSE timestamp of last replenishment. */
     struct {
-        uint32_t tokens;    /* current token count (millirequests: tokens * 1000) */
-        uint64_t last_ns;   /* CLOCK_MONOTONIC_COARSE timestamp of last replenishment */
+        uint32_t tokens;
+        uint64_t last_ns;
     } route_rl[VORTEX_MAX_ROUTES];
 
     volatile int     stop;
 };
 
-/* Create listening socket bound to addr:port */
-int worker_create_listener(const char *addr, uint16_t port, int backlog);
+/* Create listening socket bound to addr:port.
+ * ipv4_only=true  → AF_INET socket, addr is a dotted-quad (or "" for INADDR_ANY).
+ * ipv4_only=false → AF_INET6 socket with IPV6_V6ONLY=0; accepts both IPv4-mapped
+ *                   and native IPv6.  addr should be "::" for all-interfaces.
+ * Note: the XDP/tarpit blocklist only handles IPv4 regardless of this setting. */
+int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ipv4_only);
 
 /* Initialize worker (call before starting thread).
  * capacity = connection pool size (use worker_pool_capacity() to auto-size).

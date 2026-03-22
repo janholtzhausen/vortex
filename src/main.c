@@ -22,12 +22,12 @@
 
 #ifdef VORTEX_PHASE_TLS
 #include "tls_pool.h"
-#include "../cert/cert_provider.h"
-#include "../cert/static_file.h"
-#include "../cert/acme_client.h"
-#include "../cert/acme_http01.h"
-#include "../cert/acme_dns01.h"
-#include "../cert/dns_cloudflare.h"
+#include "cert_provider.h"
+#include "static_file.h"
+#include "acme_client.h"
+#include "acme_http01.h"
+#include "acme_dns01.h"
+#include "dns_cloudflare.h"
 #include <time.h>
 #endif
 
@@ -386,7 +386,7 @@ int main(int argc, char *argv[])
     if (verbose) lvl = LOG_DEBUG;
     log_init(lvl, fmt, NULL);
 
-    log_info("vortex_start", "version=0.1 config=%s", config_path);
+    log_info("vortex_start", "version=0.3.0 config=%s", config_path);
 
     setup_signals();
 
@@ -489,7 +489,7 @@ int main(int argc, char *argv[])
     g_num_workers = num_workers;
     for (int i = 0; i < num_workers; i++) {
         int lfd = worker_create_listener(g_cfg.bind_address,
-                                         g_cfg.bind_port, 1024);
+                                         g_cfg.bind_port, 1024, g_cfg.ipv4_only);
         if (lfd < 0) {
             log_error("main", "failed to create listener %d on %s:%d",
                 i, g_cfg.bind_address, g_cfg.bind_port);

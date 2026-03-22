@@ -1,0 +1,162 @@
+#define _GNU_SOURCE
+/*
+ * worker_backend.c — circuit breaker state, backend selection, and async
+ * TCP connect for the vortex worker event loop.
+ *
+ * Functions here are called from handle_proxy_data (worker_proxy.c) at the
+ * point where a client request needs routing to an upstream server.
+ */
+#include "worker_internal.h"
+
+/* ------------------------------------------------------------------ */
+/* Circuit breaker helpers                                             */
+/* ------------------------------------------------------------------ */
+
+bool cb_is_open(struct worker *w, int ri, int bi, uint64_t now_ns)
+{
+    uint64_t until = w->backend_cb[ri][bi].open_until_ns;
+    return until != 0 && now_ns < until;
+}
+
+void cb_record_failure(struct worker *w, int ri, int bi, uint64_t now_ns,
+                       uint32_t cfg_threshold, uint32_t cfg_open_ms)
+{
+    uint32_t threshold = cfg_threshold ? cfg_threshold : CB_DEFAULT_THRESHOLD;
+    uint64_t open_ms   = cfg_open_ms   ? cfg_open_ms   : CB_DEFAULT_OPEN_MS;
+    uint32_t count = ++w->backend_cb[ri][bi].fail_count;
+    if (count >= threshold) {
+        w->backend_cb[ri][bi].open_until_ns = now_ns + open_ms * 1000000ULL;
+        log_warn("circuit_breaker",
+            "route=%d backend=%d OPEN after %u consecutive failures (retry in %llums)",
+            ri, bi, count, (unsigned long long)open_ms);
+    }
+}
+
+void cb_record_success(struct worker *w, int ri, int bi)
+{
+    if (w->backend_cb[ri][bi].fail_count > 0 ||
+        w->backend_cb[ri][bi].open_until_ns != 0) {
+        log_info("circuit_breaker", "route=%d backend=%d CLOSED (probe succeeded)", ri, bi);
+    }
+    w->backend_cb[ri][bi].fail_count    = 0;
+    w->backend_cb[ri][bi].open_until_ns = 0;
+}
+
+/*
+ * Select an available (non-open-circuit) backend for the given route.
+ * Tries the LB-selected backend first, then walks other backends.
+ * Returns backend index, or -1 if every backend's circuit is open.
+ * When a circuit whose timeout has elapsed is selected, it acts as a
+ * HALF_OPEN probe: the next connect result will reset or re-open it.
+ */
+int select_available_backend(struct worker *w, int ri, uint32_t client_ip)
+{
+    const struct route_config *rc = &w->cfg->routes[ri];
+    int n = rc->backend_count;
+    if (n == 0) return -1;
+
+    struct timespec _cb_ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &_cb_ts);
+    uint64_t now_ns = (uint64_t)_cb_ts.tv_sec * 1000000000ULL + _cb_ts.tv_nsec;
+
+    int primary = router_select_backend(&w->router, ri, client_ip);
+    for (int i = 0; i < n; i++) {
+        int bi = (primary + i) % n;
+        if (!cb_is_open(w, ri, bi, now_ns))
+            return bi;
+    }
+    return -1; /* all backends open — caller sends 503 */
+}
+
+/* Set backend response deadline for a connection.
+ * timeout_ms = 0 → use BACKEND_DEFAULT_TIMEOUT_MS. */
+void backend_deadline_set(struct worker *w, uint32_t cid, uint32_t timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    uint64_t ms = timeout_ms ? timeout_ms : BACKEND_DEFAULT_TIMEOUT_MS;
+    conn_cold_ptr(&w->pool, cid)->backend_deadline_ns = now_ns + ms * 1000000ULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Async backend connect via io_uring CONNECT                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Resolve addr_str ("host:port"), create a non-blocking socket, store the
+ * resolved address in conn_cold for use when CONNECT completes, and issue
+ * an io_uring CONNECT sqe.  Returns the new fd on success, -1 on error.
+ * The caller must NOT read from or write to the fd until VORTEX_OP_CONNECT
+ * completes on the io_uring ring.
+ */
+int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
+                        uint32_t cid)
+{
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+
+    if (bcfg->resolved_addrlen > 0) {
+        /* Fast path: use pre-resolved address — no blocking DNS call */
+        memcpy(&cold->backend_addr, &bcfg->resolved_addr, bcfg->resolved_addrlen);
+        cold->backend_addrlen = bcfg->resolved_addrlen;
+    } else {
+        /* Fallback: address not pre-resolved (parse error at startup?), resolve now */
+        const char *addr_str = bcfg->address;
+        char host[256], port_str[16];
+        const char *colon = strrchr(addr_str, ':');
+        if (!colon) return -1;
+        size_t hlen = (size_t)(colon - addr_str);
+        if (hlen >= sizeof(host)) return -1;
+        memcpy(host, addr_str, hlen);
+        host[hlen] = '\0';
+        snprintf(port_str, sizeof(port_str), "%s", colon + 1);
+
+        struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *res = NULL;
+        if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+            log_error("async_connect", "getaddrinfo(%s) failed: %s", addr_str, strerror(errno));
+            return -1;
+        }
+        bool got = false;
+        for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+            if (rp->ai_addrlen <= sizeof(cold->backend_addr)) {
+                memcpy(&cold->backend_addr, rp->ai_addr, rp->ai_addrlen);
+                cold->backend_addrlen = (socklen_t)rp->ai_addrlen;
+                got = true;
+                break;
+            }
+        }
+        freeaddrinfo(res);
+        if (!got) { log_error("async_connect", "no usable addr for %s", addr_str); return -1; }
+    }
+
+    int fd = socket(cold->backend_addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        log_error("async_connect", "socket() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* ACK backend data immediately — backend is LAN/loopback so delayed ACK
+     * (40 ms) would needlessly throttle throughput on short responses. */
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+    /* Same NOTSENT_LOWAT as the client side — keeps per-connection kernel
+     * send buffer pressure at one chunk rather than growing unbounded. */
+    int lowat = WORKER_BUF_SIZE;
+    setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
+
+    /* Issue async CONNECT — returns EINPROGRESS immediately */
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe) { close(fd); return -1; }
+    io_uring_prep_connect(sqe, fd,
+        (struct sockaddr *)&cold->backend_addr, cold->backend_addrlen);
+    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_CONNECT, cid);
+    uring_submit(&w->uring);
+
+    /* Arm deadline covering both connect and first response byte */
+    struct conn_hot *_h = conn_hot(&w->pool, cid);
+    backend_deadline_set(w, cid, w->cfg->routes[_h->route_idx].backend_timeout_ms);
+    log_debug("async_connect", "conn=%u fd=%d -> %s (CONNECT in flight)", cid, fd, bcfg->address);
+    return fd;
+}

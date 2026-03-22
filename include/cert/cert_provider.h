@@ -2,7 +2,7 @@
 
 #include <time.h>
 #include <stdlib.h>
-#include "../src/config.h"
+#include "config.h"
 
 /* Heap-allocated cert+key PEM returned by providers */
 struct cert_result {

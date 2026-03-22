@@ -19,6 +19,8 @@
 #define VORTEX_OP_SPLICE_BACKEND     12 /* splice backend_fd → pipe (zero-copy recv) */
 #define VORTEX_OP_SPLICE_CLIENT      13 /* splice pipe → client_fd (zero-copy send) */
 #define VORTEX_OP_TLS_DONE           14 /* tls_pool result pipe became readable */
+#define VORTEX_OP_SEND_BACKEND_WS    15 /* send client WS frame to backend (after RECV_CLIENT_WS) */
+#define VORTEX_OP_SEND_CLIENT_WS     16 /* send backend WS frame to client (after RECV_BACKEND_WS) */
 /* Legacy aliases */
 #define VORTEX_OP_RECV  VORTEX_OP_RECV_CLIENT
 #define VORTEX_OP_SEND  VORTEX_OP_SEND_BACKEND

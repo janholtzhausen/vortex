@@ -1,5 +1,5 @@
 #include "acme_http01.h"
-#include "../src/log.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>

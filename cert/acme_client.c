@@ -10,8 +10,8 @@
  */
 
 #include "acme_client.h"
-#include "../src/log.h"
-#include "../src/config.h"
+#include "log.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>

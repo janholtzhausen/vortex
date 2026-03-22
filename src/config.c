@@ -49,6 +49,7 @@ void config_set_defaults(struct vortex_config *cfg)
     cfg->sqpoll         = false;
     cfg->hugepages      = false;
     cfg->cpu_affinity   = true;  /* on by default — safe, scheduler can override */
+    cfg->ipv4_only      = true;  /* dual-stack off by default; XDP blocklist is IPv4-only */
     snprintf(cfg->bind_address, sizeof(cfg->bind_address), "%s", "0.0.0.0");
     cfg->bind_port      = 443;
     cfg->http_port      = 80;
@@ -159,6 +160,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "sqpoll"))       c->sqpoll         = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "hugepages"))    c->hugepages      = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "cpu_affinity")) c->cpu_affinity   = !strcmp(val,"true") || !strcmp(val,"yes");
+        else if (!strcmp(k, "ipv4_only"))    c->ipv4_only      = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "bind_address")) snprintf(c->bind_address, sizeof(c->bind_address), "%s", val);
         else if (!strcmp(k, "bind_port"))    c->bind_port      = (uint16_t)atoi(val);
         else if (!strcmp(k, "http_port"))    c->http_port      = (uint16_t)atoi(val);

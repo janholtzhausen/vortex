@@ -16,7 +16,7 @@
 
 #include "acme_dns01.h"
 #include "dns_cloudflare.h"
-#include "../src/log.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -108,6 +108,11 @@ set(VORTEX_SRCS
     src/conn.c
     src/router.c
     src/worker.c
+    src/worker_accept.c
+    src/worker_backend.c
+    src/worker_cache.c
+    src/worker_compress.c
+    src/worker_proxy.c
     src/pool.c
     src/cache.c
     src/metrics.c
@@ -148,9 +153,10 @@ add_executable(vortex ${VORTEX_SRCS})
 add_dependencies(vortex bpf_prog)
 
 target_include_directories(vortex PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/include/cert
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/bpf
-    ${CMAKE_SOURCE_DIR}/cert
     ${LIBBPF_INCLUDE_DIRS}
     ${LIBURING_INCLUDE_DIRS}
     ${YAML_INCLUDE_DIRS}
