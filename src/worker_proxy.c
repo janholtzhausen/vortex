@@ -1310,12 +1310,13 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         }
 
         /* ---- Record compressibility for splice gating ----
-         * Scan the Content-Type header on the first response chunk so subsequent
-         * chunks can be delivered via splice only when the type is non-compressible
-         * (images, video, binary).  Compressible types (HTML, JSON, text) have their
-         * first chunk potentially compressed on egress — splice would then deliver
-         * remaining chunks uncompressed, causing Content-Length mismatch. */
-        {
+         * Only on the first response chunk (starts with "HTTP/").  Subsequent
+         * chunks contain raw body bytes with no headers — scanning them would
+         * always find no Content-Type, resetting ct_compressible to 0 and
+         * incorrectly enabling splice for compressible types (HTML, JSON, JS).
+         * ct_compressible defaults to 0 in conn_hot; we only set it to 1 here
+         * when we positively identify a compressible Content-Type. */
+        if (n > 7 && memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) == 0) {
             uint8_t *sbuf_ct = conn_send_buf(&w->pool, cid);
             const uint8_t *hend_ct = (const uint8_t *)FIND_HDR_END(sbuf_ct, (size_t)n);
             size_t hdr_scan_len = hend_ct
@@ -1512,12 +1513,15 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
             /* Zero-copy splice: only safe for non-compressible types (images, video,
-             * already-compressed media). Compressible types (HTML, JSON, text) have
-             * their first chunk compressed on egress — splice would then deliver the
-             * remainder uncompressed, causing Content-Length mismatch. */
+             * already-compressed media), and only when the client connection does NOT
+             * have kTLS TX active.  kTLS TX on kernel 6.8 mis-accounts spliced bytes
+             * vs. the Content-Length sent earlier, causing ERR_CONTENT_LENGTH_MISMATCH.
+             * Compressible types also skip splice — compression of the first chunk
+             * changes the payload length, but splice delivers subsequent chunks raw. */
             if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
                 !(h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) &&
-                !h->ct_compressible) {
+                !h->ct_compressible &&
+                !(h->flags & CONN_FLAG_KTLS_TX)) {
                 begin_splice(w, cid, h);
                 break;
             }

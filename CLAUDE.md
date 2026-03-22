@@ -31,6 +31,7 @@ All 6 tests must pass before pushing.
 
 ## Known constraints
 
-- kTLS TX is incompatible with splice and send_zc on kernel 6.8 — do not re-enable
+- kTLS TX is incompatible with splice on kernel 6.8 — begin_splice is gated on `!CONN_FLAG_KTLS_TX`; do not remove this check
+- send_zc is similarly gated on `!CONN_FLAG_KTLS_TX` — do not remove
 - XDP/tarpit blocklist is IPv4-only regardless of `ipv4_only` setting
 - TLS handshakes are offloaded to `tls_pool` (4 threads) — do not block the io_uring loop with SSL_accept
