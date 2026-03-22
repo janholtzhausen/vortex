@@ -503,7 +503,6 @@ static int h2_build_http11_request(struct h2_stream *st, const char *backend_cre
                + 7 + strlen(st->authority) + 4       /* "Host: authority\r\n" */
                + st->req_hdr_len                     /* forwarded headers */
                + strlen(auth_hdr)                    /* backend auth header (may be "") */
-               + 27                                   /* "Accept-Encoding: identity\r\n" */
                + 19                                   /* "Connection: close\r\n" */
                + 2                                    /* "\r\n" end-of-headers */
                + st->req_body_len
@@ -528,8 +527,6 @@ static int h2_build_http11_request(struct h2_stream *st, const char *backend_cre
         memcpy(p, st->req_hdr_buf, st->req_hdr_len);
         p += st->req_hdr_len;
     }
-    /* Proxy→backend leg is LAN — request uncompressed so we can inspect/cache */
-    p += snprintf(p, (size_t)(end - p), "Accept-Encoding: identity\r\n");
     /* Force Connection: close — we use one TCP conn per stream */
     p += snprintf(p, (size_t)(end - p), "Connection: close\r\n\r\n");
 
@@ -694,10 +691,11 @@ static int on_header_cb(nghttp2_session *ngh2,
         (namelen == 7  && memcmp(name, "upgrade", 7) == 0))
         return 0;
 
-    /* Always strip Accept-Encoding from client headers — the proxy→backend
-     * leg is LAN; we inject "identity" in h2_build_http11_request instead. */
-    if (namelen == 15 && memcmp(name, "accept-encoding", 15) == 0)
-        return 0;
+    /* Accept-Encoding: pass through to backend unchanged.
+     * The H2 path buffers the full response before submitting to nghttp2 — it
+     * does NOT cache, so compressed responses are strictly better (smaller
+     * in-memory buffer, fits within H2_RESP_MAX).  Content-Encoding is
+     * forwarded as-is in response headers; the H2 client decompresses. */
 
     /* Accumulate in req_hdr_buf as "name: value\r\n" */
     size_t needed = namelen + 2 + valuelen + 2; /* "name: value\r\n" */
