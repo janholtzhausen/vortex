@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <linux/limits.h>
+#include <sys/socket.h>   /* sockaddr_storage, socklen_t */
 
 #define VORTEX_MAX_ROUTES    64
 #define VORTEX_MAX_BACKENDS  16
@@ -31,6 +32,9 @@ struct backend_config {
     char     address[256];
     uint16_t weight;
     int      pool_size;
+    /* Pre-resolved at config load — eliminates blocking getaddrinfo on hot path */
+    struct sockaddr_storage resolved_addr;
+    socklen_t               resolved_addrlen; /* 0 = not resolved */
 };
 
 struct cache_route_config {
@@ -145,6 +149,9 @@ struct vortex_config {
     char     log_level[16];
     char     log_format[16];
     char     pid_file[PATH_MAX];
+    /* Server header sent to clients (replaces backend's Server header).
+     * Empty string = pass backend's Server header through unchanged. */
+    char     server_header[128];
 
     struct tls_config     tls;
     struct xdp_config     xdp;
@@ -160,3 +167,4 @@ int  config_load(const char *path, struct vortex_config *cfg);
 void config_free(struct vortex_config *cfg);
 int  config_reload(const char *path, struct vortex_config *cfg);
 void config_set_defaults(struct vortex_config *cfg);
+void config_resolve_backends(struct vortex_config *cfg);

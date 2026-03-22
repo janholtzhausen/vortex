@@ -229,7 +229,7 @@ static void *proxy_thread(void *arg)
     size_t hlen = (size_t)(colon - pa->backend_addr);
     if (hlen >= sizeof(host)) goto push;
     memcpy(host, pa->backend_addr, hlen);
-    strncpy(port_str, colon + 1, sizeof(port_str) - 1);
+    snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
     {
         struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
@@ -357,10 +357,10 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
         memcpy(&pa->peer_addr, &c->peer_addr, c->peer_addrlen);
         pa->peer_addrlen = c->peer_addrlen;
         pa->stream_id    = s->stream_id;
-        strncpy(pa->backend_addr, addr,        sizeof(pa->backend_addr) - 1);
-        strncpy(pa->method,       s->method,   sizeof(pa->method)       - 1);
-        strncpy(pa->url,          s->url,       sizeof(pa->url)          - 1);
-        strncpy(pa->authority,    s->authority, sizeof(pa->authority)    - 1);
+        snprintf(pa->backend_addr, sizeof(pa->backend_addr), "%s", addr);
+        snprintf(pa->method, sizeof(pa->method), "%s", s->method);
+        snprintf(pa->url, sizeof(pa->url), "%s", s->url);
+        snprintf(pa->authority, sizeof(pa->authority), "%s", s->authority);
         if (s->req_body_len > 0) {
             pa->req_body = malloc(s->req_body_len);
             if (!pa->req_body) { free(pa); goto err_502; }

@@ -1,0 +1,118 @@
+#include "tls_pool.h"
+#include "log.h"
+
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <openssl/ssl.h>
+
+struct tls_pool g_tls_pool;
+
+static void *tls_pool_worker_thread(void *arg)
+{
+    struct tls_pool *pool = arg;
+
+    for (;;) {
+        struct tls_handshake_job job;
+
+        pthread_mutex_lock(&pool->mu);
+        while (pool->count == 0 && !pool->shutdown)
+            pthread_cond_wait(&pool->cv, &pool->mu);
+        if (pool->shutdown && pool->count == 0) {
+            pthread_mutex_unlock(&pool->mu);
+            break;
+        }
+        job = pool->queue[pool->head];
+        pool->head = (pool->head + 1) % TLS_POOL_QUEUE;
+        pool->count--;
+        pthread_mutex_unlock(&pool->mu);
+
+        /* Perform the blocking TLS handshake */
+        struct tls_handshake_result res = {
+            .cid       = job.cid,
+            .client_fd = job.client_fd,
+            .ok        = false,
+        };
+
+        char sni[256] = {0};
+        int route_idx = 0;
+        SSL *ssl = tls_accept(job.tls, job.client_fd, &route_idx, sni, sizeof(sni));
+
+        if (!ssl) {
+            log_debug("tls_pool", "handshake failed cid=%u fd=%d", job.cid, job.client_fd);
+            /* res.ok stays false — worker will close and free the conn */
+        } else {
+            res.ok           = true;
+            res.tls_route_idx = route_idx;
+            res.tls_version  = SSL_version(ssl);
+
+            if (tls_ktls_tx_active(ssl) && tls_ktls_rx_active(ssl)) {
+                res.ktls_tx = true;
+                res.ktls_rx = true;
+                res.ssl     = NULL;
+                tls_ssl_free(ssl);
+            } else {
+                res.ssl = ssl;
+            }
+
+            /* Re-set fd to blocking (io_uring works on blocking fds) */
+            int flags = fcntl(job.client_fd, F_GETFL);
+            fcntl(job.client_fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+
+        /* Write result — sizeof(result) <= PIPE_BUF so this is atomic */
+        ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
+        if (wr != (ssize_t)sizeof(res)) {
+            log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
+            if (ssl && !res.ktls_tx) SSL_free(ssl);
+        }
+    }
+    return NULL;
+}
+
+void tls_pool_init(void)
+{
+    memset(&g_tls_pool, 0, sizeof(g_tls_pool));
+    pthread_mutex_init(&g_tls_pool.mu, NULL);
+    pthread_cond_init(&g_tls_pool.cv, NULL);
+
+    for (int i = 0; i < TLS_POOL_THREADS; i++) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 256 * 1024); /* 256KB per thread */
+        pthread_create(&g_tls_pool.threads[i], &attr,
+                       tls_pool_worker_thread, &g_tls_pool);
+        pthread_attr_destroy(&attr);
+    }
+    log_info("tls_pool", "started %d handshake threads", TLS_POOL_THREADS);
+}
+
+void tls_pool_destroy(void)
+{
+    pthread_mutex_lock(&g_tls_pool.mu);
+    g_tls_pool.shutdown = true;
+    pthread_cond_broadcast(&g_tls_pool.cv);
+    pthread_mutex_unlock(&g_tls_pool.mu);
+
+    for (int i = 0; i < TLS_POOL_THREADS; i++)
+        pthread_join(g_tls_pool.threads[i], NULL);
+
+    pthread_mutex_destroy(&g_tls_pool.mu);
+    pthread_cond_destroy(&g_tls_pool.cv);
+}
+
+bool tls_pool_submit(struct tls_handshake_job job)
+{
+    pthread_mutex_lock(&g_tls_pool.mu);
+    if (g_tls_pool.count >= TLS_POOL_QUEUE) {
+        pthread_mutex_unlock(&g_tls_pool.mu);
+        log_warn("tls_pool", "queue full — dropping handshake fd=%d", job.client_fd);
+        return false;
+    }
+    g_tls_pool.queue[g_tls_pool.tail] = job;
+    g_tls_pool.tail = (g_tls_pool.tail + 1) % TLS_POOL_QUEUE;
+    g_tls_pool.count++;
+    pthread_cond_signal(&g_tls_pool.cv);
+    pthread_mutex_unlock(&g_tls_pool.mu);
+    return true;
+}

@@ -5,6 +5,7 @@
 #include "uring.h"
 #include "router.h"
 #include "tls.h"
+#include "tls_pool.h"
 #include "cache.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -61,6 +62,12 @@ struct worker {
 
     int              urandom_fd;    /* /dev/urandom for tarpit noise */
     FILE            *tarpit_log;    /* /var/log/vortex/tarpit.log */
+
+    /* Pipe for receiving completed TLS handshake results from tls_pool */
+    int              tls_done_pipe_rd; /* read end — polled by io_uring */
+    int              tls_done_pipe_wr; /* write end — passed to pool threads */
+    /* Buffer for a single read from the result pipe (one result at a time) */
+    uint8_t          tls_pipe_buf[sizeof(struct tls_handshake_result)];
 
     /* XDP blocklist expiry ring — FIFO, oldest at head */
     struct blocked_entry blocked_list[WORKER_BLOCKED_MAX];

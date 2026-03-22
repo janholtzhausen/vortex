@@ -300,7 +300,7 @@ SSL *tls_accept(struct tls_ctx *tls, int fd,
     /* Extract SNI for logging/routing */
     const char *sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     if (sni && sni_out && sni_max > 0) {
-        strncpy(sni_out, sni, sni_max - 1);
+        snprintf(sni_out, sni_max, "%s", sni);
         sni_out[sni_max - 1] = '\0';
     } else if (sni_out && sni_max > 0) {
         sni_out[0] = '\0';

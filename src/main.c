@@ -21,6 +21,7 @@
 #endif
 
 #ifdef VORTEX_PHASE_TLS
+#include "tls_pool.h"
 #include "../cert/cert_provider.h"
 #include "../cert/static_file.h"
 #include "../cert/acme_client.h"
@@ -185,14 +186,10 @@ static int cert_manager_init(struct vortex_config *cfg)
 
     if (need_acme && cfg->acme.enabled) {
         memset(&g_acme_client, 0, sizeof(g_acme_client));
-        strncpy(g_acme_client.directory_url, cfg->acme.directory_url,
-                sizeof(g_acme_client.directory_url) - 1);
-        strncpy(g_acme_client.account_key_path, cfg->acme.account_key_path,
-                sizeof(g_acme_client.account_key_path) - 1);
-        strncpy(g_acme_client.storage_path, cfg->acme.storage_path,
-                sizeof(g_acme_client.storage_path) - 1);
-        strncpy(g_acme_client.email, cfg->acme.email,
-                sizeof(g_acme_client.email) - 1);
+        snprintf(g_acme_client.directory_url, sizeof(g_acme_client.directory_url), "%s", cfg->acme.directory_url);
+        snprintf(g_acme_client.account_key_path, sizeof(g_acme_client.account_key_path), "%s", cfg->acme.account_key_path);
+        snprintf(g_acme_client.storage_path, sizeof(g_acme_client.storage_path), "%s", cfg->acme.storage_path);
+        snprintf(g_acme_client.email, sizeof(g_acme_client.email), "%s", cfg->acme.email);
         g_acme_client.renewal_days = cfg->acme.renewal_days > 0
                                    ? cfg->acme.renewal_days : 30;
         g_acme_client.libctx = g_tls.libctx; /* may be NULL before tls_init */
@@ -269,8 +266,8 @@ static int cert_manager_init(struct vortex_config *cfg)
             }
 
             /* Point route at the stored cert files */
-            strncpy(r->cert_path, cp, sizeof(r->cert_path) - 1);
-            strncpy(r->key_path,  kp, sizeof(r->key_path)  - 1);
+            snprintf(r->cert_path, sizeof(r->cert_path), "%s", cp);
+            snprintf(r->key_path, sizeof(r->key_path), "%s", kp);
         }
     }
 
@@ -354,7 +351,7 @@ int main(int argc, char *argv[])
         case 'c': config_path = optarg; break;
         case 'f': foreground  = 1;      break;
         case 't': test_config = 1;      break;
-        case 'b': strncpy(g_bpf_obj_path, optarg, sizeof(g_bpf_obj_path)-1); break;
+        case 'b': snprintf(g_bpf_obj_path, sizeof(g_bpf_obj_path), "%s", optarg); break;
         case 'X': g_no_xdp = 1;         break;
         case 'T': g_no_tls = 1;         break;
         case 'v': verbose   = 1;        break;
@@ -372,6 +369,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to load config: %s\n", config_path);
         return 1;
     }
+    config_resolve_backends(&g_cfg);
 
     if (test_config) {
         printf("Config OK: %d routes\n", g_cfg.route_count);
@@ -480,6 +478,11 @@ int main(int argc, char *argv[])
     /* Shared backend connection pool — must be initialised before workers start */
     global_pool_init();
 
+#ifdef VORTEX_PHASE_TLS
+    /* TLS handshake thread pool — shared across all workers */
+    if (tls_ptr) tls_pool_init();
+#endif
+
     /* Create one SO_REUSEPORT listen socket per worker.
      * The kernel distributes incoming connections across them by hashing the
      * 4-tuple, eliminating accept-queue contention and thundering herd. */
@@ -526,8 +529,7 @@ int main(int argc, char *argv[])
             struct cert_result cr;
             memset(&cr, 0, sizeof(cr));
             if (static_file_load(r->cert_path, r->key_path, &cr) == 0) {
-                strncpy(g_cert_info[g_cert_info_count].hostname,
-                        r->hostname, sizeof(g_cert_info[0].hostname) - 1);
+                snprintf(g_cert_info[g_cert_info_count].hostname, sizeof(g_cert_info[0].hostname), "%s", r->hostname);
                 g_cert_info[g_cert_info_count].not_after = cr.not_after;
                 g_cert_info_count++;
                 cert_result_free(&cr);
@@ -568,6 +570,7 @@ int main(int argc, char *argv[])
             g_reload = 0;
             log_info("config_reload", "SIGHUP received, reloading %s", g_config_path);
             config_reload(g_config_path, &g_cfg);
+            config_resolve_backends(&g_cfg);
             if (xdp_loaded) {
                 bpf_loader_apply_config(&g_cfg.xdp);
             }
@@ -612,6 +615,9 @@ int main(int argc, char *argv[])
         worker_destroy(&g_workers[i]);
     }
     global_pool_destroy();
+#ifdef VORTEX_PHASE_TLS
+    if (tls_ptr) tls_pool_destroy();
+#endif
     if (g_cfg.metrics.enabled) {
         metrics_stop(&g_metrics);
         metrics_join(&g_metrics);

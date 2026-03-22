@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <yaml.h>
 #include <sys/statvfs.h>
+#include <netdb.h>
+#include <errno.h>
 
 /* Environment variable substitution: replaces ${VAR} or $VAR */
 static void expand_env(char *buf, size_t bufsz, const char *src)
@@ -47,20 +49,20 @@ void config_set_defaults(struct vortex_config *cfg)
     cfg->sqpoll         = false;
     cfg->hugepages      = false;
     cfg->cpu_affinity   = true;  /* on by default — safe, scheduler can override */
-    strncpy(cfg->bind_address, "0.0.0.0", sizeof(cfg->bind_address) - 1);
+    snprintf(cfg->bind_address, sizeof(cfg->bind_address), "%s", "0.0.0.0");
     cfg->bind_port      = 443;
     cfg->http_port      = 80;
-    strncpy(cfg->interface, "eth0", sizeof(cfg->interface) - 1);
-    strncpy(cfg->log_level, "info", sizeof(cfg->log_level) - 1);
-    strncpy(cfg->log_format, "json", sizeof(cfg->log_format) - 1);
-    strncpy(cfg->pid_file, "/run/vortex.pid", sizeof(cfg->pid_file) - 1);
+    snprintf(cfg->interface,     sizeof(cfg->interface),     "%s", "eth0");
+    snprintf(cfg->log_level,     sizeof(cfg->log_level),     "%s", "info");
+    snprintf(cfg->log_format,    sizeof(cfg->log_format),    "%s", "json");
+    snprintf(cfg->pid_file,      sizeof(cfg->pid_file),      "%s", "/run/vortex.pid");
+    snprintf(cfg->server_header, sizeof(cfg->server_header), "%s", "CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)");
 
     /* TLS defaults */
     cfg->tls.min_version = 0x0303; /* TLS 1.2 */
     cfg->tls.max_version = 0x0304; /* TLS 1.3 */
-    strncpy(cfg->tls.ciphersuites,
-        "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
-        sizeof(cfg->tls.ciphersuites) - 1);
+    snprintf(cfg->tls.ciphersuites, sizeof(cfg->tls.ciphersuites), "%s",
+        "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384");
     cfg->tls.session_timeout         = 3600;
     cfg->tls.session_ticket_rotation = 3600;
     cfg->tls.ktls                    = true;
@@ -98,18 +100,15 @@ void config_set_defaults(struct vortex_config *cfg)
     /* ACME defaults */
     cfg->acme.enabled       = false;
     cfg->acme.renewal_days  = 30;
-    strncpy(cfg->acme.preferred_challenge, "http-01",
-        sizeof(cfg->acme.preferred_challenge) - 1);
-    strncpy(cfg->acme.directory_url,
-        "https://acme-v02.api.letsencrypt.org/directory",
-        sizeof(cfg->acme.directory_url) - 1);
+    snprintf(cfg->acme.preferred_challenge, sizeof(cfg->acme.preferred_challenge), "%s", "http-01");
+    snprintf(cfg->acme.directory_url, sizeof(cfg->acme.directory_url), "%s",
+        "https://acme-v02.api.letsencrypt.org/directory");
 
     /* Metrics defaults */
     cfg->metrics.enabled = true;
-    strncpy(cfg->metrics.bind_address, "127.0.0.1",
-        sizeof(cfg->metrics.bind_address) - 1);
+    snprintf(cfg->metrics.bind_address, sizeof(cfg->metrics.bind_address), "%s", "127.0.0.1");
     cfg->metrics.port = 9090;
-    strncpy(cfg->metrics.path, "/metrics", sizeof(cfg->metrics.path) - 1);
+    snprintf(cfg->metrics.path, sizeof(cfg->metrics.path), "%s", "/metrics");
 }
 
 /* ---- Minimal YAML parser ---- */
@@ -160,19 +159,20 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "sqpoll"))       c->sqpoll         = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "hugepages"))    c->hugepages      = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "cpu_affinity")) c->cpu_affinity   = !strcmp(val,"true") || !strcmp(val,"yes");
-        else if (!strcmp(k, "bind_address")) strncpy(c->bind_address, val, sizeof(c->bind_address)-1);
+        else if (!strcmp(k, "bind_address")) snprintf(c->bind_address, sizeof(c->bind_address), "%s", val);
         else if (!strcmp(k, "bind_port"))    c->bind_port      = (uint16_t)atoi(val);
         else if (!strcmp(k, "http_port"))    c->http_port      = (uint16_t)atoi(val);
-        else if (!strcmp(k, "interface"))    strncpy(c->interface, val, sizeof(c->interface)-1);
-        else if (!strcmp(k, "log_level"))    strncpy(c->log_level, val, sizeof(c->log_level)-1);
-        else if (!strcmp(k, "log_format"))   strncpy(c->log_format, val, sizeof(c->log_format)-1);
-        else if (!strcmp(k, "pid_file"))     strncpy(c->pid_file, val, sizeof(c->pid_file)-1);
+        else if (!strcmp(k, "interface"))    snprintf(c->interface, sizeof(c->interface), "%s", val);
+        else if (!strcmp(k, "log_level"))      snprintf(c->log_level, sizeof(c->log_level), "%s", val);
+        else if (!strcmp(k, "log_format"))     snprintf(c->log_format, sizeof(c->log_format), "%s", val);
+        else if (!strcmp(k, "pid_file"))       snprintf(c->pid_file, sizeof(c->pid_file), "%s", val);
+        else if (!strcmp(k, "server_header"))  snprintf(c->server_header, sizeof(c->server_header), "%s", val);
         break;
 
     case P_TLS:
         if      (!strcmp(k, "min_version")) c->tls.min_version = !strcmp(val,"1.2") ? 0x0303 : 0x0304;
         else if (!strcmp(k, "max_version")) c->tls.max_version = !strcmp(val,"1.3") ? 0x0304 : 0x0303;
-        else if (!strcmp(k, "ciphersuites"))strncpy(c->tls.ciphersuites, val, sizeof(c->tls.ciphersuites)-1);
+        else if (!strcmp(k, "ciphersuites"))snprintf(c->tls.ciphersuites, sizeof(c->tls.ciphersuites), "%s", val);
         else if (!strcmp(k, "session_timeout")) c->tls.session_timeout = (uint32_t)atol(val);
         else if (!strcmp(k, "session_ticket_rotation")) c->tls.session_ticket_rotation = (uint32_t)atol(val);
         else if (!strcmp(k, "ktls"))        c->tls.ktls = !strcmp(val,"true") || !strcmp(val,"yes");
@@ -183,7 +183,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
             if      (!strcmp(val,"native")) c->xdp.mode = XDP_MODE_NATIVE;
             else if (!strcmp(val,"skb"))    c->xdp.mode = XDP_MODE_SKB;
             else                            c->xdp.mode = XDP_MODE_AUTO;
-        } else if (!strcmp(k, "blocklist_file")) strncpy(c->xdp.blocklist_file, val, sizeof(c->xdp.blocklist_file)-1);
+        } else if (!strcmp(k, "blocklist_file")) snprintf(c->xdp.blocklist_file, sizeof(c->xdp.blocklist_file), "%s", val);
         break;
 
     case P_XDP_RATELIMIT:
@@ -198,38 +198,38 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "slab_size_mb"))     c->cache.slab_size_bytes  = (uint64_t)atol(val) * 1024 * 1024;
         else if (!strcmp(k, "default_ttl"))      c->cache.default_ttl      = (uint32_t)atol(val);
         else if (!strcmp(k, "use_hugepages"))    c->cache.use_hugepages    = !strcmp(val,"true");
-        else if (!strcmp(k, "disk_cache_path"))  strncpy(c->cache.disk_cache_path, val, sizeof(c->cache.disk_cache_path)-1);
+        else if (!strcmp(k, "disk_cache_path"))  snprintf(c->cache.disk_cache_path, sizeof(c->cache.disk_cache_path), "%s", val);
         else if (!strcmp(k, "disk_slab_size_mb")) c->cache.disk_slab_size_bytes = (uint64_t)atol(val) * 1024 * 1024;
         break;
 
     case P_ACME:
         if      (!strcmp(k, "enabled"))           c->acme.enabled        = !strcmp(val,"true");
-        else if (!strcmp(k, "email"))              strncpy(c->acme.email, val, sizeof(c->acme.email)-1);
-        else if (!strcmp(k, "directory_url"))      strncpy(c->acme.directory_url, val, sizeof(c->acme.directory_url)-1);
-        else if (!strcmp(k, "account_key_path"))   strncpy(c->acme.account_key_path, val, sizeof(c->acme.account_key_path)-1);
-        else if (!strcmp(k, "storage_path"))       strncpy(c->acme.storage_path, val, sizeof(c->acme.storage_path)-1);
+        else if (!strcmp(k, "email"))              snprintf(c->acme.email, sizeof(c->acme.email), "%s", val);
+        else if (!strcmp(k, "directory_url"))      snprintf(c->acme.directory_url, sizeof(c->acme.directory_url), "%s", val);
+        else if (!strcmp(k, "account_key_path"))   snprintf(c->acme.account_key_path, sizeof(c->acme.account_key_path), "%s", val);
+        else if (!strcmp(k, "storage_path"))       snprintf(c->acme.storage_path, sizeof(c->acme.storage_path), "%s", val);
         else if (!strcmp(k, "renewal_days_before_expiry")) c->acme.renewal_days = atoi(val);
-        else if (!strcmp(k, "preferred_challenge")) strncpy(c->acme.preferred_challenge, val, sizeof(c->acme.preferred_challenge)-1);
-        else if (!strcmp(k, "dns_provider"))       strncpy(c->acme.dns_provider, val, sizeof(c->acme.dns_provider)-1);
+        else if (!strcmp(k, "preferred_challenge")) snprintf(c->acme.preferred_challenge, sizeof(c->acme.preferred_challenge), "%s", val);
+        else if (!strcmp(k, "dns_provider"))       snprintf(c->acme.dns_provider, sizeof(c->acme.dns_provider), "%s", val);
         break;
 
     case P_ACME_DNS_CFG:
-        if (!strcmp(k, "api_token")) strncpy(c->acme.dns_api_token, val, sizeof(c->acme.dns_api_token)-1);
+        if (!strcmp(k, "api_token")) snprintf(c->acme.dns_api_token, sizeof(c->acme.dns_api_token), "%s", val);
         break;
 
     case P_METRICS:
         if      (!strcmp(k, "enabled"))      c->metrics.enabled = !strcmp(val,"true");
-        else if (!strcmp(k, "bind_address")) strncpy(c->metrics.bind_address, val, sizeof(c->metrics.bind_address)-1);
+        else if (!strcmp(k, "bind_address")) snprintf(c->metrics.bind_address, sizeof(c->metrics.bind_address), "%s", val);
         else if (!strcmp(k, "port"))         c->metrics.port    = (uint16_t)atoi(val);
-        else if (!strcmp(k, "path"))         strncpy(c->metrics.path, val, sizeof(c->metrics.path)-1);
+        else if (!strcmp(k, "path"))         snprintf(c->metrics.path, sizeof(c->metrics.path), "%s", val);
         break;
 
     case P_ROUTE: {
         struct route_config *r = &c->routes[ctx->route_idx];
         if      (!strcmp(k, "backend_timeout_ms")) r->backend_timeout_ms = (uint32_t)atol(val);
-        else if (!strcmp(k, "x_api_key"))    strncpy(r->x_api_key, val, sizeof(r->x_api_key)-1);
-        else if (!strcmp(k, "backend_credentials")) strncpy(r->backend_credentials, val, sizeof(r->backend_credentials)-1);
-        else if (!strcmp(k, "hostname"))     strncpy(r->hostname, val, sizeof(r->hostname)-1);
+        else if (!strcmp(k, "x_api_key"))    snprintf(r->x_api_key, sizeof(r->x_api_key), "%s", val);
+        else if (!strcmp(k, "backend_credentials")) snprintf(r->backend_credentials, sizeof(r->backend_credentials), "%s", val);
+        else if (!strcmp(k, "hostname"))     snprintf(r->hostname, sizeof(r->hostname), "%s", val);
         else if (!strcmp(k, "load_balancing")) {
             if      (!strcmp(val,"weighted_round_robin")) r->lb_algo = LB_WEIGHTED_ROUND_ROBIN;
             else if (!strcmp(val,"least_conn"))           r->lb_algo = LB_LEAST_CONN;
@@ -241,14 +241,14 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
             else if (!strcmp(val,"acme_dns01"))  r->cert_provider = CERT_PROVIDER_ACME_DNS01;
             else                                 r->cert_provider = CERT_PROVIDER_STATIC;
         }
-        else if (!strcmp(k, "cert_path")) strncpy(r->cert_path, val, sizeof(r->cert_path)-1);
-        else if (!strcmp(k, "key_path"))  strncpy(r->key_path,  val, sizeof(r->key_path)-1);
+        else if (!strcmp(k, "cert_path")) snprintf(r->cert_path, sizeof(r->cert_path), "%s", val);
+        else if (!strcmp(k, "key_path"))  snprintf(r->key_path, sizeof(r->key_path), "%s", val);
         break;
     }
 
     case P_ROUTE_BACKEND: {
         struct backend_config *b = &c->routes[ctx->route_idx].backends[ctx->backend_idx];
-        if      (!strcmp(k, "address"))   strncpy(b->address, val, sizeof(b->address)-1);
+        if      (!strcmp(k, "address"))   snprintf(b->address, sizeof(b->address), "%s", val);
         else if (!strcmp(k, "weight"))    b->weight    = (uint16_t)atoi(val);
         else if (!strcmp(k, "pool_size")) b->pool_size = atoi(val);
         break;
@@ -258,7 +258,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         struct cache_route_config *rc = &c->routes[ctx->route_idx].cache;
         if      (!strcmp(k, "enabled")) rc->enabled = !strcmp(val,"true");
         else if (!strcmp(k, "ttl"))     rc->ttl     = (uint32_t)atol(val);
-        else if (!strcmp(k, "key"))     strncpy(rc->key_pattern, val, sizeof(rc->key_pattern)-1);
+        else if (!strcmp(k, "key"))     snprintf(rc->key_pattern, sizeof(rc->key_pattern), "%s", val);
         break;
     }
 
@@ -271,8 +271,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         /* Each scalar in this sequence is a "user:pass" credential */
         struct route_auth_config *a = &c->routes[ctx->route_idx].auth;
         if (a->credential_count < VORTEX_MAX_AUTH_USERS) {
-            strncpy(a->credentials[a->credential_count], val,
-                    sizeof(a->credentials[0]) - 1);
+            snprintf(a->credentials[a->credential_count], sizeof(a->credentials[0]), "%s", val);
             a->credential_count++;
         }
         break;
@@ -414,7 +413,7 @@ int config_load(const char *path, struct vortex_config *cfg)
                 break;
             }
             if (!got_key) {
-                strncpy(ctx.key, sv, sizeof(ctx.key) - 1);
+                snprintf(ctx.key, sizeof(ctx.key), "%s", sv);
                 got_key = true;
 
                 /* State transitions on key */
@@ -473,4 +472,63 @@ int config_reload(const char *path, struct vortex_config *cfg)
     /* Atomic copy — caller must handle live state */
     memcpy(cfg, &new_cfg, sizeof(*cfg));
     return 0;
+}
+
+/* Resolve all backend addresses at startup so getaddrinfo never runs on the
+ * hot path.  Logs a warning for any backend that fails resolution (the
+ * address string is kept so it can be retried on SIGHUP reload). */
+void config_resolve_backends(struct vortex_config *cfg)
+{
+    for (int ri = 0; ri < cfg->route_count; ri++) {
+        struct route_config *route = &cfg->routes[ri];
+        for (int bi = 0; bi < route->backend_count; bi++) {
+            struct backend_config *b = &route->backends[bi];
+            b->resolved_addrlen = 0;
+
+            const char *addr_str = b->address;
+            const char *colon = strrchr(addr_str, ':');
+            if (!colon) {
+                log_warn("config_resolve", "route=%s backend=%s: no port in address",
+                         route->hostname, addr_str);
+                continue;
+            }
+
+            char host[256];
+            char port_str[16];
+            size_t hlen = (size_t)(colon - addr_str);
+            if (hlen >= sizeof(host)) continue;
+            memcpy(host, addr_str, hlen);
+            host[hlen] = '\0';
+            snprintf(port_str, sizeof(port_str), "%s", colon + 1);
+
+            struct addrinfo hints = {
+                .ai_family   = AF_UNSPEC,
+                .ai_socktype = SOCK_STREAM,
+            };
+            struct addrinfo *res = NULL;
+            if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+                log_warn("config_resolve", "route=%s backend=%s: getaddrinfo failed: %s",
+                         route->hostname, addr_str, strerror(errno));
+                continue;
+            }
+
+            /* Pick first usable address */
+            for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+                if (rp->ai_addrlen <= sizeof(b->resolved_addr)) {
+                    memcpy(&b->resolved_addr, rp->ai_addr, rp->ai_addrlen);
+                    b->resolved_addrlen = (socklen_t)rp->ai_addrlen;
+                    break;
+                }
+            }
+            freeaddrinfo(res);
+
+            if (b->resolved_addrlen > 0) {
+                log_info("config_resolve", "route=%s backend=%s: resolved ok",
+                         route->hostname, addr_str);
+            } else {
+                log_warn("config_resolve", "route=%s backend=%s: no usable address",
+                         route->hostname, addr_str);
+            }
+        }
+    }
 }

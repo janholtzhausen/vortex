@@ -116,6 +116,7 @@ set(VORTEX_SRCS
 
 if(OPENSSL_AVAILABLE)
     list(APPEND VORTEX_SRCS src/tls.c)
+    list(APPEND VORTEX_SRCS src/tls_pool.c)
     list(APPEND VORTEX_SRCS
         cert/static_file.c
         cert/acme_client.c

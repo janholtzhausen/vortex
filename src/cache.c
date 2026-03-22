@@ -97,10 +97,10 @@ int cache_init(struct cache *c, uint32_t index_entries,
             struct statvfs st;
             /* statvfs on the parent directory */
             char dir[4096];
-            strncpy(dir, disk_path, sizeof(dir) - 1);
+            snprintf(dir, sizeof(dir), "%s", disk_path);
             char *slash = strrchr(dir, '/');
             if (slash && slash != dir) *slash = '\0';
-            else strncpy(dir, ".", sizeof(dir) - 1);
+            else snprintf(dir, sizeof(dir), "%s", ".");
             if (statvfs(dir, &st) == 0) {
                 disk_size = (size_t)st.f_bavail * (size_t)st.f_bsize / 2;
             } else {
@@ -172,6 +172,13 @@ struct cache_index_entry *cache_lookup(struct cache *c,
         }
 
         if (e->url_hash == hash) {
+            /* Verify key prefix to guard against 64-bit hash collisions */
+            uint8_t klen = (uint8_t)(url_len > 16 ? 16 : url_len);
+            if (e->url_key_len != klen || memcmp(e->url_key, url, klen) != 0) {
+                /* Different URL — hash collision, treat as miss */
+                c->misses++;
+                return NULL;
+            }
             e->last_accessed_ts = (uint32_t)time(NULL);
             e->hit_count = e->hit_count < 0xFFFF ? e->hit_count + 1 : 0xFFFF;
             c->hits++;
@@ -265,6 +272,7 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
     size_t   slot = hash & c->index_mask;
     uint32_t now  = (uint32_t)time(NULL);
 
+    uint8_t klen = (uint8_t)(url_len > 16 ? 16 : url_len);
     struct cache_index_entry new_entry = {
         .url_hash         = hash,
         .body_etag        = etag,
@@ -277,7 +285,9 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
         .created_ts       = now,
         .last_accessed_ts = now,
         .hit_count        = 0,
+        .url_key_len      = klen,
     };
+    memcpy(new_entry.url_key, url, klen);
 
     for (size_t probe = 0; probe <= c->index_capacity; probe++) {
         struct cache_index_entry *e = &c->index[slot];

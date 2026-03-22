@@ -389,44 +389,49 @@ static void backend_deadline_set(struct worker *w, uint32_t cid, uint32_t timeou
  * The caller must NOT read from or write to the fd until VORTEX_OP_CONNECT
  * completes on the io_uring ring.
  */
-static int begin_async_connect(struct worker *w, const char *addr_str,
+static int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
                                uint32_t cid)
 {
-    char host[256];
-    char port_str[16];
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
 
-    const char *colon = strrchr(addr_str, ':');
-    if (!colon) return -1;
+    if (bcfg->resolved_addrlen > 0) {
+        /* Fast path: use pre-resolved address — no blocking DNS call */
+        memcpy(&cold->backend_addr, &bcfg->resolved_addr, bcfg->resolved_addrlen);
+        cold->backend_addrlen = bcfg->resolved_addrlen;
+    } else {
+        /* Fallback: address not pre-resolved (parse error at startup?), resolve now */
+        const char *addr_str = bcfg->address;
+        char host[256], port_str[16];
+        const char *colon = strrchr(addr_str, ':');
+        if (!colon) return -1;
+        size_t hlen = (size_t)(colon - addr_str);
+        if (hlen >= sizeof(host)) return -1;
+        memcpy(host, addr_str, hlen);
+        host[hlen] = '\0';
+        snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
-    size_t hlen = (size_t)(colon - addr_str);
-    if (hlen >= sizeof(host)) return -1;
-    memcpy(host, addr_str, hlen);
-    host[hlen] = '\0';
-    strncpy(port_str, colon + 1, sizeof(port_str) - 1);
-
-    struct addrinfo hints = {
-        .ai_family   = AF_UNSPEC,
-        .ai_socktype = SOCK_STREAM,
-    };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        log_error("async_connect", "getaddrinfo(%s) failed: %s",
-            addr_str, strerror(errno));
-        return -1;
-    }
-
-    int fd = -1;
-    struct addrinfo *chosen = NULL;
-    for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK, rp->ai_protocol);
-        if (fd < 0) continue;
-        chosen = rp;
-        break;
-    }
-
-    if (fd < 0) {
+        struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *res = NULL;
+        if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+            log_error("async_connect", "getaddrinfo(%s) failed: %s", addr_str, strerror(errno));
+            return -1;
+        }
+        bool got = false;
+        for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+            if (rp->ai_addrlen <= sizeof(cold->backend_addr)) {
+                memcpy(&cold->backend_addr, rp->ai_addr, rp->ai_addrlen);
+                cold->backend_addrlen = (socklen_t)rp->ai_addrlen;
+                got = true;
+                break;
+            }
+        }
         freeaddrinfo(res);
-        log_error("async_connect", "socket() failed for %s: %s", addr_str, strerror(errno));
+        if (!got) { log_error("async_connect", "no usable addr for %s", addr_str); return -1; }
+    }
+
+    int fd = socket(cold->backend_addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        log_error("async_connect", "socket() failed: %s", strerror(errno));
         return -1;
     }
 
@@ -440,15 +445,6 @@ static int begin_async_connect(struct worker *w, const char *addr_str,
     int lowat = WORKER_BUF_SIZE;
     setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 
-    /* Store resolved address in conn_cold for the CONNECT completion handler */
-    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-    if (chosen->ai_addrlen <= sizeof(cold->backend_addr)) {
-        memcpy(&cold->backend_addr, chosen->ai_addr, chosen->ai_addrlen);
-        cold->backend_addrlen = chosen->ai_addrlen;
-    }
-
-    freeaddrinfo(res);
-
     /* Issue async CONNECT — returns EINPROGRESS immediately */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
     if (!sqe) { close(fd); return -1; }
@@ -460,7 +456,7 @@ static int begin_async_connect(struct worker *w, const char *addr_str,
     /* Arm deadline covering both connect and first response byte */
     struct conn_hot *_h = conn_hot(&w->pool, cid);
     backend_deadline_set(w, cid, w->cfg->routes[_h->route_idx].backend_timeout_ms);
-    log_debug("async_connect", "conn=%u fd=%d -> %s (CONNECT in flight)", cid, fd, addr_str);
+    log_debug("async_connect", "conn=%u fd=%d -> %s (CONNECT in flight)", cid, fd, bcfg->address);
     return fd;
 }
 
@@ -842,37 +838,36 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 }
             }
 
-            char sni[256] = {0};
-            SSL *ssl = tls_accept(w->tls, client_fd, &tls_route_idx, sni, sizeof(sni));
-            if (!ssl) {
-                close(client_fd);
-                conn_free(&w->pool, new_cid);
+            /* Offload blocking SSL_accept to the TLS handshake pool.
+             * The worker returns immediately; when the pool thread finishes it
+             * writes a tls_handshake_result to tls_done_pipe_wr which wakes the
+             * io_uring VORTEX_OP_TLS_DONE handler below. */
+            if (w->tls_done_pipe_wr >= 0) {
+                struct tls_handshake_job job = {
+                    .client_fd      = client_fd,
+                    .cid            = new_cid,
+                    .tls            = w->tls,
+                    .result_pipe_wr = w->tls_done_pipe_wr,
+                };
+                if (!tls_pool_submit(job)) {
+                    /* Queue full — drop the connection */
+                    close(client_fd);
+                    conn_free(&w->pool, new_cid);
+                }
+                /* Return: VORTEX_OP_TLS_DONE will continue this connection */
                 return;
             }
-
-            /* Track TLS version before potentially freeing ssl */
-            {
-                int ver = SSL_version(ssl);
-                if (ver == TLS1_3_VERSION) w->tls13_count++;
-                else                       w->tls12_count++;
-            }
-
-            if (tls_ktls_tx_active(ssl) && tls_ktls_rx_active(ssl)) {
-                /* kTLS active — kernel handles crypto, raw io_uring send/recv works */
+            /* Fallback (no pipe): blocking path — should not normally happen */
+            char sni_fb[256] = {0};
+            SSL *ssl_fb = tls_accept(w->tls, client_fd, &tls_route_idx, sni_fb, sizeof(sni_fb));
+            if (!ssl_fb) { close(client_fd); conn_free(&w->pool, new_cid); return; }
+            if (SSL_version(ssl_fb) == TLS1_3_VERSION) w->tls13_count++; else w->tls12_count++;
+            if (tls_ktls_tx_active(ssl_fb) && tls_ktls_rx_active(ssl_fb)) {
                 nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
-                tls_ssl_free(ssl); /* SSL* no longer needed */
-                nh->ssl = NULL;
-                w->ktls_count++;
-                log_debug("ktls_active", "conn=%u sni=%s", (unsigned)new_cid, sni);
-            } else {
-                /* No kTLS — store SSL* for SSL_read/SSL_write data path */
-                nh->ssl = ssl;
-                log_debug("ktls_fallback", "conn=%u sni=%s", (unsigned)new_cid, sni);
-            }
-
-            /* Re-set fd to blocking now that handshake is done (io_uring works on blocking fds) */
-            int flags = fcntl(client_fd, F_GETFL);
-            fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
+                tls_ssl_free(ssl_fb); nh->ssl = NULL; w->ktls_count++;
+            } else { nh->ssl = ssl_fb; }
+            int fl = fcntl(client_fd, F_GETFL);
+            fcntl(client_fd, F_SETFL, fl & ~O_NONBLOCK);
         }
 #endif
 
@@ -908,7 +903,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         (unsigned)new_cid, pooled_fd);
                 } else {
                     /* Async connect — CONNECT completion arms RECV_CLIENT */
-                    nh->backend_fd = begin_async_connect(w, addr, new_cid);
+                    const struct backend_config *bcfg = &w->cfg->routes[route_idx].backends[backend_idx];
+                    nh->backend_fd = begin_async_connect(w, bcfg, new_cid);
                     if (nh->backend_fd >= 0)
                         uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, new_cid), nh->backend_fd);
                     if (nh->backend_fd < 0) {
@@ -955,6 +951,124 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         uring_submit(&w->uring);
         return;
     }
+
+#ifdef VORTEX_PHASE_TLS
+    if (op == VORTEX_OP_TLS_DONE) {
+        /* Re-arm pipe read for the next result before processing this one */
+        struct io_uring_sqe *rpsqe = io_uring_get_sqe(&w->uring.ring);
+        if (rpsqe) {
+            io_uring_prep_read(rpsqe, w->tls_done_pipe_rd,
+                               w->tls_pipe_buf, sizeof(w->tls_pipe_buf), 0);
+            rpsqe->user_data = URING_UD_ENCODE(VORTEX_OP_TLS_DONE, 0);
+        }
+        uring_submit(&w->uring);
+
+        if (cqe->res != (int)sizeof(struct tls_handshake_result)) {
+            /* Partial or error read — nothing we can do, pipe stays armed */
+            return;
+        }
+
+        struct tls_handshake_result res;
+        memcpy(&res, w->tls_pipe_buf, sizeof(res));
+        uint32_t hcid = res.cid;
+
+        if (hcid >= w->pool.capacity) return;
+        struct conn_hot *th = conn_hot(&w->pool, hcid);
+        if (th->state == CONN_STATE_FREE) return;
+
+        if (!res.ok) {
+            close(res.client_fd);
+            conn_free(&w->pool, hcid);
+            return;
+        }
+
+        /* Record TLS version stats */
+        if (res.tls_version == TLS1_3_VERSION) w->tls13_count++;
+        else w->tls12_count++;
+
+        if (res.ktls_tx && res.ktls_rx) {
+            th->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
+            th->ssl    = NULL;
+            w->ktls_count++;
+        } else {
+            th->ssl = res.ssl;
+        }
+
+        /* Route selection (same logic as post-TLS in handle_accept) */
+        int tls_route_idx = res.tls_route_idx;
+        int route_idx = tls_route_idx;
+        if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
+            int backend_idx = select_available_backend(w, route_idx, 0);
+            if (backend_idx < 0) {
+                static const char r503[] =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
+                    "Service Unavailable";
+                send(res.client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
+                close(res.client_fd);
+                conn_free(&w->pool, hcid);
+                return;
+            }
+            const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
+            th->route_idx   = (uint16_t)route_idx;
+            th->backend_idx = (uint16_t)backend_idx;
+
+            if (addr) {
+                int cfg_pool = w->cfg->routes[route_idx].backends[backend_idx].pool_size;
+                int pooled_fd = (cfg_pool > 0)
+                                ? global_pool_get(route_idx, backend_idx) : -1;
+                if (pooled_fd >= 0) {
+                    th->backend_fd = pooled_fd;
+                    th->flags |= CONN_FLAG_BACKEND_POOLED;
+                    uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid), pooled_fd);
+                } else {
+                    const struct backend_config *bcfg =
+                        &w->cfg->routes[route_idx].backends[backend_idx];
+                    th->backend_fd = begin_async_connect(w, bcfg, hcid);
+                    if (th->backend_fd >= 0)
+                        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid),
+                                         th->backend_fd);
+                    if (th->backend_fd < 0) {
+                        const char *r502 =
+                            "HTTP/1.1 502 Bad Gateway\r\n"
+                            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
+                        send(res.client_fd, r502, strlen(r502), MSG_NOSIGNAL);
+                        close(res.client_fd);
+                        conn_free(&w->pool, hcid);
+                        return;
+                    }
+                    th->flags |= CONN_FLAG_BACKEND_CONNECTING;
+                    th->state = CONN_STATE_BACKEND_CONNECT;
+                    th->last_active_tsc = rdtsc();
+                    w->accepted++;
+                    return; /* RECV_CLIENT armed by VORTEX_OP_CONNECT handler */
+                }
+            }
+        }
+
+        if (th->backend_fd < 0) {
+            const char *r502 =
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
+            send(res.client_fd, r502, strlen(r502), MSG_NOSIGNAL);
+            close(res.client_fd);
+            conn_free(&w->pool, hcid);
+            return;
+        }
+
+        th->state = CONN_STATE_PROXYING;
+        th->last_active_tsc = rdtsc();
+        w->accepted++;
+
+        struct io_uring_sqe *ts1 = io_uring_get_sqe(&w->uring.ring);
+        if (!ts1) { conn_close(w, hcid, true); return; }
+        PREP_RECV(w, ts1, res.client_fd, FIXED_FD_CLIENT(w, hcid),
+            conn_recv_buf(&w->pool, hcid), th->recv_window, 0, hcid);
+        ts1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, hcid);
+        uring_submit(&w->uring);
+        return;
+    }
+#endif
 
     /* For all other ops, validate cid */
     if (cid >= w->pool.capacity) return;
@@ -1037,7 +1151,8 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                      * which will trigger resend of the buffered request.
                      * We pass n as hint via send_buf_len so CONNECT can forward it. */
                     h->send_buf_len = (uint32_t)n;  /* stash the byte count */
-                    h->backend_fd = begin_async_connect(w, addr, cid);
+                    const struct backend_config *bcfg2 = &w->cfg->routes[ri].backends[bi];
+                    h->backend_fd = begin_async_connect(w, bcfg2, cid);
                     if (h->backend_fd >= 0)
                         uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid), h->backend_fd);
                     if (h->backend_fd < 0) {
@@ -1611,10 +1726,10 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             uint8_t *hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
             size_t hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
 
-            /* ---- Replace Server header with CSWS/OpenVMS identity ----
-             * VSI Secure Web Server for OpenVMS — obscures true server stack. */
-            {
-                const char *new_srv = "CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)";
+            /* ---- Replace/inject Server header ----
+             * Uses cfg->server_header (configurable); empty string = pass through. */
+            if (w->cfg->server_header[0]) {
+                const char *new_srv = w->cfg->server_header;
                 size_t new_srv_len  = strlen(new_srv);
                 uint8_t *sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nServer:", 9);
                 if (!sh) sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nserver:", 9);
@@ -2350,6 +2465,18 @@ static void *worker_thread(void *arg)
     }
     io_uring_prep_multishot_accept(asqe, w->listen_fd, NULL, NULL, 0);
     asqe->user_data = URING_UD_ENCODE(VORTEX_OP_ACCEPT, 0);
+
+    /* Arm read on the TLS-done result pipe — wakes us when pool threads finish */
+#ifdef VORTEX_PHASE_TLS
+    if (w->tls_done_pipe_rd >= 0) {
+        struct io_uring_sqe *psqe = io_uring_get_sqe(&w->uring.ring);
+        if (psqe) {
+            io_uring_prep_read(psqe, w->tls_done_pipe_rd,
+                               w->tls_pipe_buf, sizeof(w->tls_pipe_buf), 0);
+            psqe->user_data = URING_UD_ENCODE(VORTEX_OP_TLS_DONE, 0);
+        }
+    }
+#endif
     uring_submit(&w->uring);
 
     while (!w->stop) {
@@ -2575,6 +2702,18 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
     if (w->urandom_fd < 0)
         log_warn("worker_init", "cannot open /dev/urandom: %s", strerror(errno));
 
+    /* Pipe for receiving TLS handshake results from the pool */
+    {
+        int pfd[2];
+        if (pipe2(pfd, O_NONBLOCK | O_CLOEXEC) == 0) {
+            w->tls_done_pipe_rd = pfd[0];
+            w->tls_done_pipe_wr = pfd[1];
+        } else {
+            w->tls_done_pipe_rd = w->tls_done_pipe_wr = -1;
+            log_warn("worker_init", "tls_done pipe creation failed: %s", strerror(errno));
+        }
+    }
+
     /* Open tarpit log */
     w->tarpit_log = fopen("/var/log/vortex/tarpit.log", "a");
     if (!w->tarpit_log)
@@ -2664,6 +2803,8 @@ void worker_destroy(struct worker *w)
 
     if (w->listen_fd >= 0) { close(w->listen_fd); w->listen_fd = -1; }
     if (w->urandom_fd >= 0) { close(w->urandom_fd); w->urandom_fd = -1; }
+    if (w->tls_done_pipe_rd >= 0) { close(w->tls_done_pipe_rd); w->tls_done_pipe_rd = -1; }
+    if (w->tls_done_pipe_wr >= 0) { close(w->tls_done_pipe_wr); w->tls_done_pipe_wr = -1; }
     if (w->tarpit_log)  { fclose(w->tarpit_log); w->tarpit_log = NULL; }
 
     router_destroy(&w->router);
