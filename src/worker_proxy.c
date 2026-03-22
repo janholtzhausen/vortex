@@ -928,22 +928,9 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 /* Backend Basic Auth credentials if configured — inject after
                  * the proxy-level Authorization header has been stripped. */
                 if (rc_fwd->backend_credentials[0]) {
-                    static const char b64tab[] =
-                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                    const char *src = rc_fwd->backend_credentials;
-                    size_t slen = strlen(src);
                     char b64[512];
-                    size_t bi = 0;
-                    for (size_t si = 0; si < slen && bi + 4 < sizeof(b64); si += 3) {
-                        unsigned int v  = (unsigned char)src[si] << 16;
-                        if (si+1 < slen) v |= (unsigned char)src[si+1] << 8;
-                        if (si+2 < slen) v |= (unsigned char)src[si+2];
-                        b64[bi++] = b64tab[(v >> 18) & 0x3f];
-                        b64[bi++] = b64tab[(v >> 12) & 0x3f];
-                        b64[bi++] = (si+1 < slen) ? b64tab[(v >> 6) & 0x3f] : '=';
-                        b64[bi++] = (si+2 < slen) ? b64tab[v & 0x3f] : '=';
-                    }
-                    b64[bi] = '\0';
+                    b64_encode(rc_fwd->backend_credentials,
+                               strlen(rc_fwd->backend_credentials), b64, sizeof(b64));
                     inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
                         "Authorization: Basic %s\r\n", b64);
                 }

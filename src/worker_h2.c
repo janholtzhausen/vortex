@@ -479,22 +479,8 @@ static int h2_build_http11_request(struct h2_stream *st, const char *backend_cre
     /* Base64-encode backend_credentials if present ("user:pass" → b64 string) */
     char auth_hdr[512] = "";
     if (backend_creds && backend_creds[0]) {
-        static const char b64tab[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        const char *src  = backend_creds;
-        size_t      slen = strlen(src);
         char b64[400];
-        size_t bi = 0;
-        for (size_t si = 0; si < slen && bi + 4 < sizeof(b64); si += 3) {
-            unsigned int v  = (unsigned char)src[si] << 16;
-            if (si+1 < slen) v |= (unsigned char)src[si+1] << 8;
-            if (si+2 < slen) v |= (unsigned char)src[si+2];
-            b64[bi++] = b64tab[(v >> 18) & 0x3f];
-            b64[bi++] = b64tab[(v >> 12) & 0x3f];
-            b64[bi++] = (si+1 < slen) ? b64tab[(v >> 6) & 0x3f] : '=';
-            b64[bi++] = (si+2 < slen) ? b64tab[v & 0x3f] : '=';
-        }
-        b64[bi] = '\0';
+        b64_encode(backend_creds, strlen(backend_creds), b64, sizeof(b64));
         snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Basic %s\r\n", b64);
     }
 
@@ -617,8 +603,8 @@ static int on_begin_headers_cb(nghttp2_session *ngh2,
 
     struct h2_session *sess = (struct h2_session *)user_data;
     if (sess->active_streams >= H2_STREAM_SLOTS) {
-        /* No free slots — nghttp2 will send RST_STREAM for us if we return error */
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+        /* No free slots — RST this stream only, keep the session alive */
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
 
     /* Find a free slot */
@@ -637,7 +623,7 @@ static int on_begin_headers_cb(nghttp2_session *ngh2,
             return 0;
         }
     }
-    return NGHTTP2_ERR_CALLBACK_FAILURE;
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
 }
 
 static int on_header_cb(nghttp2_session *ngh2,

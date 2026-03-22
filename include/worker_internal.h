@@ -65,6 +65,26 @@
 /* Minimum body size (bytes) for compression to be worthwhile */
 #define COMPRESS_MIN_BODY 512
 
+/* Base64-encode src (len bytes) into dst (must hold ceil(len/3)*4 + 1 bytes).
+ * Returns the number of characters written (excluding NUL). */
+static inline size_t b64_encode(const char *src, size_t slen, char *dst, size_t dsz)
+{
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t di = 0;
+    for (size_t si = 0; si < slen && di + 4 < dsz; si += 3) {
+        unsigned int v  = (unsigned char)src[si] << 16;
+        if (si+1 < slen) v |= (unsigned char)src[si+1] << 8;
+        if (si+2 < slen) v |= (unsigned char)src[si+2];
+        dst[di++] = tab[(v >> 18) & 0x3f];
+        dst[di++] = tab[(v >> 12) & 0x3f];
+        dst[di++] = (si+1 < slen) ? tab[(v >> 6) & 0x3f] : '=';
+        dst[di++] = (si+2 < slen) ? tab[v & 0x3f] : '=';
+    }
+    dst[di] = '\0';
+    return di;
+}
+
 /*
  * Fixed-buffer I/O helpers.
  * recv_buf[cid] is registered at index cid.
