@@ -609,6 +609,28 @@ static bool chunked_decode_append(struct conn_cold *cold,
 }
 
 /*
+ * Build a cache key of the form "host|url" to avoid cross-host collisions.
+ * host is extracted from the raw HTTP request buffer.
+ */
+static void make_cache_key(const uint8_t *req_buf, size_t req_len,
+                            const char *url, char *key, size_t key_cap)
+{
+    char host[128] = {0};
+    const uint8_t *hh = (const uint8_t *)memmem(req_buf, req_len, "\r\nHost:", 7);
+    if (!hh) hh = (const uint8_t *)memmem(req_buf, req_len, "\r\nhost:", 7);
+    if (hh) {
+        const uint8_t *hs = hh + 7;
+        while (hs < req_buf + req_len && (*hs == ' ' || *hs == '\t')) hs++;
+        const uint8_t *he = hs;
+        while (he < req_buf + req_len && *he != '\r' && *he != '\n') he++;
+        size_t hl = (size_t)(he - hs);
+        if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+        memcpy(host, hs, hl);
+    }
+    snprintf(key, key_cap, "%s|%s", host, url);
+}
+
+/*
  * Build cache-ready headers (TE:chunked removed, Content-Length added)
  * into scratch[0..scratch_cap), then call cache_store.
  * Frees cold->chunk_buf and resets all chunk_* fields.
@@ -1167,7 +1189,9 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                         url, sizeof(url)) == 0
                 && strcmp(method, "GET") == 0) {
 
-                struct cache_index_entry *ce = cache_lookup(&w->cache, url, strlen(url));
+                char cache_key[640];
+                make_cache_key(rbuf, (size_t)n, url, cache_key, sizeof(cache_key));
+                struct cache_index_entry *ce = cache_lookup(&w->cache, cache_key, strlen(cache_key));
                 if (ce && cache_entry_valid(ce)) {
                     /* Check If-None-Match for conditional GET */
                     char req_etag[64] = {0};
@@ -1404,6 +1428,29 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 if (rc_fwd->x_api_key[0])
                     inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
                         "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
+
+                /* Backend Basic Auth credentials if configured — inject after
+                 * the proxy-level Authorization header has been stripped. */
+                if (rc_fwd->backend_credentials[0]) {
+                    static const char b64tab[] =
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                    const char *src = rc_fwd->backend_credentials;
+                    size_t slen = strlen(src);
+                    char b64[512];
+                    size_t bi = 0;
+                    for (size_t si = 0; si < slen && bi + 4 < sizeof(b64); si += 3) {
+                        unsigned int v  = (unsigned char)src[si] << 16;
+                        if (si+1 < slen) v |= (unsigned char)src[si+1] << 8;
+                        if (si+2 < slen) v |= (unsigned char)src[si+2];
+                        b64[bi++] = b64tab[(v >> 18) & 0x3f];
+                        b64[bi++] = b64tab[(v >> 12) & 0x3f];
+                        b64[bi++] = (si+1 < slen) ? b64tab[(v >> 6) & 0x3f] : '=';
+                        b64[bi++] = (si+2 < slen) ? b64tab[v & 0x3f] : '=';
+                    }
+                    b64[bi] = '\0';
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "Authorization: Basic %s\r\n", b64);
+                }
 
                 if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
                     memmove(rbuf + line_end + inj_len,
@@ -1794,12 +1841,15 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                 }
 
                                 if (cl_ok) {
-                                    cache_store(&w->cache, cc_url2, strlen(cc_url2),
+                                    char cc_key2[640];
+                                    make_cache_key(req2, (size_t)w->pool.buf_size,
+                                                   cc_url2, cc_key2, sizeof(cc_key2));
+                                    cache_store(&w->cache, cc_key2, strlen(cc_key2),
                                         (uint16_t)status2, ttl2,
                                         resp2, hl2, resp2 + hl2, bl2);
                                     log_debug("cache_store",
                                         "conn=%u url=%s ttl=%u body=%zu",
-                                        cid, cc_url2, ttl2, bl2);
+                                        cid, cc_key2, ttl2, bl2);
                                 } else if (is_chunked && !(h->flags & CONN_FLAG_CACHING)) {
                                     /* Chunked TE: begin multi-recv reassembly.
                                      * Save rewritten headers + decode body bytes
@@ -1815,9 +1865,10 @@ static void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                         cold2->chunk_remaining = 0;
                                         cold2->chunk_skip_crlf = false;
                                         cold2->chunk_ttl = ttl2;
-                                        strncpy(cold2->chunk_url, cc_url2,
-                                                sizeof(cold2->chunk_url) - 1);
-                                        cold2->chunk_url[sizeof(cold2->chunk_url)-1] = '\0';
+                                        make_cache_key(req2, (size_t)w->pool.buf_size,
+                                                       cc_url2,
+                                                       cold2->chunk_url,
+                                                       sizeof(cold2->chunk_url));
                                         /* Copy rewritten response headers verbatim */
                                         memcpy(cold2->chunk_buf, resp2, hlen2);
                                         h->flags |= CONN_FLAG_CACHING;

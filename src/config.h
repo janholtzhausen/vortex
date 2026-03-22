@@ -78,6 +78,12 @@ struct route_config {
 
     /* Optional API key injected as X-Api-Key: header on backend requests */
     char x_api_key[256];
+
+    /* Optional upstream Basic Auth credentials ("user:pass") injected as
+     * Authorization: Basic <b64> on backend requests, after stripping
+     * any proxy-level Authorization header.  Useful when the backend
+     * requires its own HTTP auth independently of the proxy auth layer. */
+    char backend_credentials[320];
 };
 
 struct xdp_config {

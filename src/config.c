@@ -228,6 +228,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         struct route_config *r = &c->routes[ctx->route_idx];
         if      (!strcmp(k, "backend_timeout_ms")) r->backend_timeout_ms = (uint32_t)atol(val);
         else if (!strcmp(k, "x_api_key"))    strncpy(r->x_api_key, val, sizeof(r->x_api_key)-1);
+        else if (!strcmp(k, "backend_credentials")) strncpy(r->backend_credentials, val, sizeof(r->backend_credentials)-1);
         else if (!strcmp(k, "hostname"))     strncpy(r->hostname, val, sizeof(r->hostname)-1);
         else if (!strcmp(k, "load_balancing")) {
             if      (!strcmp(val,"weighted_round_robin")) r->lb_algo = LB_WEIGHTED_ROUND_ROBIN;
