@@ -859,24 +859,42 @@ void h2_session_free(struct h2_session *sess)
     free(sess);
 }
 
-void h2_on_recv(struct worker *w, uint32_t cid, int n)
+void h2_on_recv(struct worker *w, uint32_t cid, int n,
+                const uint8_t *data, uint16_t buf_id, bool multishot_active)
 {
     struct conn_hot  *h   = conn_hot(&w->pool, cid);
     struct conn_cold *cc  = conn_cold_ptr(&w->pool, cid);
     struct h2_session *sess = cc->h2;
 
     if (n <= 0) {
+        /* Return ring buffer before closing (IORING_CQE_F_BUFFER may not be
+         * set on error CQEs, so only return when data is a valid ring pointer) */
+        if (w->uring.recv_ring && data &&
+            data >= w->uring.recv_ring_mem &&
+            data <  w->uring.recv_ring_mem +
+                    (size_t)w->uring.recv_ring_count * w->pool.buf_size)
+            uring_recv_ring_return(&w->uring, buf_id, w->pool.buf_size);
         conn_close(w, cid, n < 0);
         return;
     }
-    if (!sess) { conn_close(w, cid, true); return; }
+    if (!sess) {
+        if (w->uring.recv_ring && data)
+            uring_recv_ring_return(&w->uring, buf_id, w->pool.buf_size);
+        conn_close(w, cid, true);
+        return;
+    }
 
     h->bytes_in += (uint32_t)n;
 
-    const uint8_t *buf = conn_recv_buf(&w->pool, cid);
-    ssize_t ret = nghttp2_session_mem_recv(sess->ngh2, buf, (size_t)n);
+    ssize_t ret = nghttp2_session_mem_recv(sess->ngh2, data, (size_t)n);
+
+    /* Return buffer to ring immediately — nghttp2 copies data internally,
+     * so the ring buffer is safe to reuse as soon as mem_recv returns. */
+    if (w->uring.recv_ring && data)
+        uring_recv_ring_return(&w->uring, buf_id, w->pool.buf_size);
+
     if (ret < 0) {
-        log_error("h2_recv", "cid=%u nghttp2_session_mem_recv2: %s",
+        log_error("h2_recv", "cid=%u nghttp2_session_mem_recv: %s",
                   cid, nghttp2_strerror((int)ret));
         conn_close(w, cid, true);
         return;
@@ -885,13 +903,25 @@ void h2_on_recv(struct worker *w, uint32_t cid, int n)
     /* Drain any nghttp2 output (SETTINGS_ACK, WINDOW_UPDATE, etc.) */
     h2_send_pending(sess);
 
-    /* Re-arm RECV_CLIENT for next H2 frame(s) */
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-    if (!sqe) { conn_close(w, cid, true); return; }
-    io_uring_prep_recv(sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
-                       w->pool.buf_size, 0);
-    sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_CLIENT, 0, cid);
-    uring_submit(&w->uring);
+    /* With multishot recv the SQE stays armed — no re-arm needed.
+     * Re-arm only when multishot was not active (fallback path or ring stopped). */
+    if (!multishot_active) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        if (w->uring.recv_ring) {
+            int _pfd = w->uring.files_registered
+                       ? FIXED_FD_CLIENT(w, cid) : h->client_fd;
+            io_uring_prep_recv_multishot(sqe, _pfd, NULL, 0, 0);
+            sqe->buf_group = w->uring.recv_ring_bgid;
+            sqe->flags    |= IOSQE_BUFFER_SELECT;
+            if (w->uring.files_registered) sqe->flags |= IOSQE_FIXED_FILE;
+        } else {
+            io_uring_prep_recv(sqe, h->client_fd, conn_recv_buf(&w->pool, cid),
+                               w->pool.buf_size, 0);
+        }
+        sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_CLIENT, 0, cid);
+        uring_submit(&w->uring);
+    }
 }
 
 void h2_on_send_client(struct worker *w, uint32_t cid, int sent)

@@ -315,11 +315,22 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 return;
             }
 
-            /* Arm first RECV_CLIENT for H2 frame data */
+            /* Arm first RECV_CLIENT for H2 frame data.
+             * Use multishot recv with the buf ring when available — the kernel
+             * re-arms automatically so no SQE is needed per frame batch. */
             struct io_uring_sqe *h2sq = io_uring_get_sqe(&w->uring.ring);
             if (!h2sq) { conn_close(w, hcid, true); return; }
-            io_uring_prep_recv(h2sq, res.client_fd,
-                conn_recv_buf(&w->pool, hcid), w->pool.buf_size, 0);
+            if (w->uring.recv_ring) {
+                int _pfd = w->uring.files_registered
+                           ? FIXED_FD_CLIENT(w, hcid) : res.client_fd;
+                io_uring_prep_recv_multishot(h2sq, _pfd, NULL, 0, 0);
+                h2sq->buf_group = w->uring.recv_ring_bgid;
+                h2sq->flags    |= IOSQE_BUFFER_SELECT;
+                if (w->uring.files_registered) h2sq->flags |= IOSQE_FIXED_FILE;
+            } else {
+                io_uring_prep_recv(h2sq, res.client_fd,
+                    conn_recv_buf(&w->pool, hcid), w->pool.buf_size, 0);
+            }
             h2sq->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_CLIENT, 0, hcid);
             uring_submit(&w->uring);
             return;
@@ -432,7 +443,11 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         bool is_error = true;
         if (cqe->res == -ECONNRESET || cqe->res == -EPIPE ||
             cqe->res == -EBADF     || cqe->res == -ECANCELED ||
-            cqe->res == -EIO) {
+            cqe->res == -EIO       || cqe->res == -ENOBUFS) {
+            if (cqe->res == -ENOBUFS)
+                log_warn("recv_ring",
+                    "conn=%u op=%u recv buf ring exhausted — closing connection",
+                    cid, op);
             is_error = false; /* expected close conditions */
         } else {
             log_debug("proxy_err", "conn=%u op=%u err=%s", cid, op, strerror(-cqe->res));
@@ -1893,7 +1908,18 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
 #ifdef VORTEX_H2
     case VORTEX_OP_H2_RECV_CLIENT: {
-        h2_on_recv(w, cid, cqe->res);
+        /* Multishot: IORING_CQE_F_MORE means the recv SQE is still armed.
+         * When not set (ring empty, fd closed, etc.) we must re-arm. */
+        bool ms_active = (cqe->flags & IORING_CQE_F_MORE) != 0;
+        const uint8_t *data;
+        uint16_t buf_id = 0;
+        if (w->uring.recv_ring && (cqe->flags & IORING_CQE_F_BUFFER)) {
+            buf_id = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+            data   = uring_recv_ring_buf(&w->uring, buf_id, w->pool.buf_size);
+        } else {
+            data = conn_recv_buf(&w->pool, cid);
+        }
+        h2_on_recv(w, cid, cqe->res, data, buf_id, ms_active);
         break;
     }
     case VORTEX_OP_H2_SEND_CLIENT: {

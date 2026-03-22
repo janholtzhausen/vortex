@@ -55,11 +55,66 @@ int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
 
 void uring_destroy(struct uring_ctx *ctx)
 {
+    if (ctx->recv_ring) {
+        io_uring_free_buf_ring(&ctx->ring, ctx->recv_ring,
+                               ctx->recv_ring_count, (int)ctx->recv_ring_bgid);
+        free(ctx->recv_ring_mem);
+        ctx->recv_ring     = NULL;
+        ctx->recv_ring_mem = NULL;
+    }
     if (ctx->files_registered)
         io_uring_unregister_files(&ctx->ring);
     if (ctx->bufs_registered)
         io_uring_unregister_buffers(&ctx->ring);
     io_uring_queue_exit(&ctx->ring);
+}
+
+int uring_recv_ring_setup(struct uring_ctx *ctx, size_t buf_size,
+                           uint32_t count, uint16_t bgid)
+{
+    /* Kernel requires power-of-two ring entries */
+    uint32_t n = 1;
+    while (n < count) n <<= 1;
+    count = n;
+
+    uint8_t *mem = malloc((size_t)count * buf_size);
+    if (!mem) return -ENOMEM;
+
+    int ret;
+    struct io_uring_buf_ring *br =
+        io_uring_setup_buf_ring(&ctx->ring, count, (int)bgid, 0, &ret);
+    if (!br) {
+        log_error("recv_ring",
+            "io_uring_setup_buf_ring(count=%u bgid=%u): %s",
+            count, bgid, strerror(-ret));
+        free(mem);
+        return ret;
+    }
+
+    int mask = io_uring_buf_ring_mask(count);
+    for (uint32_t i = 0; i < count; i++) {
+        io_uring_buf_ring_add(br, mem + (size_t)i * buf_size,
+                              (unsigned int)buf_size, (uint16_t)i, mask, (int)i);
+    }
+    io_uring_buf_ring_advance(br, (int)count);
+
+    ctx->recv_ring       = br;
+    ctx->recv_ring_mem   = mem;
+    ctx->recv_ring_count = count;
+    ctx->recv_ring_bgid  = bgid;
+
+    log_info("recv_ring", "bgid=%u count=%u buf_size=%zu total=%.1f MB",
+             bgid, count, buf_size, (double)count * buf_size / (1024.0 * 1024.0));
+    return 0;
+}
+
+void uring_recv_ring_return(struct uring_ctx *ctx, uint16_t buf_id, size_t buf_size)
+{
+    io_uring_buf_ring_add(ctx->recv_ring,
+                          ctx->recv_ring_mem + (size_t)buf_id * buf_size,
+                          (unsigned int)buf_size, buf_id,
+                          io_uring_buf_ring_mask(ctx->recv_ring_count), 0);
+    io_uring_buf_ring_advance(ctx->recv_ring, 1);
 }
 
 int uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n)

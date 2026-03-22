@@ -117,8 +117,11 @@ struct worker;
 int  h2_session_init(struct worker *w, uint32_t cid);
 void h2_session_free(struct h2_session *sess);
 
-/* Called from VORTEX_OP_H2_RECV_CLIENT completion */
-void h2_on_recv(struct worker *w, uint32_t cid, int n);
+/* Called from VORTEX_OP_H2_RECV_CLIENT completion.
+ * data/buf_id: ring buffer assigned by the kernel (NULL/0 when no recv_ring).
+ * multishot_active: true when IORING_CQE_F_MORE is set (SQE still armed). */
+void h2_on_recv(struct worker *w, uint32_t cid, int n,
+                const uint8_t *data, uint16_t buf_id, bool multishot_active);
 
 /* Called from VORTEX_OP_H2_SEND_CLIENT completion */
 void h2_on_send_client(struct worker *w, uint32_t cid, int sent);

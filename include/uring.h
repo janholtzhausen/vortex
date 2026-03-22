@@ -58,6 +58,15 @@ struct uring_ctx {
     bool             bufs_registered; /* io_uring fixed buffers registered */
     bool             files_registered;/* io_uring fixed files registered */
     unsigned int     file_slots;      /* total fixed file slots */
+
+    /* Multishot recv buf ring — used for H2 client recv.
+     * Separate allocation from the fixed-buffer registration; the existing
+     * recv/send slabs stay pinned as fixed bufs for H1 and backend I/O.
+     * NULL when not set up (falls back to single-shot io_uring_prep_recv). */
+    struct io_uring_buf_ring *recv_ring;       /* ring descriptor (kernel-mapped) */
+    uint8_t                  *recv_ring_mem;   /* backing buffer memory            */
+    uint32_t                  recv_ring_count; /* number of ring entries (pow-of-2) */
+    uint16_t                  recv_ring_bgid;  /* buffer group ID                  */
 };
 
 int  uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll);
@@ -77,6 +86,28 @@ int  uring_register_files_sparse(struct uring_ctx *ctx, unsigned int nslots);
  * uring_remove_fd installs -1 (kernel sentinel for "empty slot"). */
 int  uring_install_fd(struct uring_ctx *ctx, unsigned int slot, int fd);
 int  uring_remove_fd(struct uring_ctx *ctx, unsigned int slot);
+
+/* Set up a multishot recv buffer ring.
+ * Allocates count (rounded up to next power-of-two) buffers of buf_size bytes
+ * and registers them with the kernel under the given buffer group id (bgid).
+ * After setup, arm H2 client recvs with io_uring_prep_recv_multishot +
+ * IOSQE_BUFFER_SELECT + sqe->buf_group = bgid.
+ * On CQE: buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT; call
+ * uring_recv_ring_return() after processing to put the buffer back.
+ * Returns 0 on success, negative errno on failure. */
+int  uring_recv_ring_setup(struct uring_ctx *ctx, size_t buf_size,
+                            uint32_t count, uint16_t bgid);
+
+/* Return buffer buf_id to the ring after the data has been consumed. */
+void uring_recv_ring_return(struct uring_ctx *ctx, uint16_t buf_id,
+                             size_t buf_size);
+
+/* Pointer to the data buffer for a given buf_id (valid until returned). */
+static inline uint8_t *uring_recv_ring_buf(const struct uring_ctx *ctx,
+                                            uint16_t buf_id, size_t buf_size)
+{
+    return ctx->recv_ring_mem + (size_t)buf_id * buf_size;
+}
 
 /* Submit all pending SQEs */
 int uring_submit(struct uring_ctx *ctx);
