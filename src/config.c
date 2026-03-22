@@ -132,6 +132,8 @@ typedef enum {
     P_ROUTE_CACHE,
     P_ROUTE_AUTH,
     P_ROUTE_AUTH_USERS,
+    P_ROUTE_RATELIMIT,
+    P_ROUTE_HEALTH,
 } parse_state_t;
 
 typedef struct {
@@ -224,7 +226,8 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
 
     case P_ROUTE: {
         struct route_config *r = &c->routes[ctx->route_idx];
-        if      (!strcmp(k, "x_api_key"))    strncpy(r->x_api_key, val, sizeof(r->x_api_key)-1);
+        if      (!strcmp(k, "backend_timeout_ms")) r->backend_timeout_ms = (uint32_t)atol(val);
+        else if (!strcmp(k, "x_api_key"))    strncpy(r->x_api_key, val, sizeof(r->x_api_key)-1);
         else if (!strcmp(k, "hostname"))     strncpy(r->hostname, val, sizeof(r->hostname)-1);
         else if (!strcmp(k, "load_balancing")) {
             if      (!strcmp(val,"weighted_round_robin")) r->lb_algo = LB_WEIGHTED_ROUND_ROBIN;
@@ -271,6 +274,21 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
                     sizeof(a->credentials[0]) - 1);
             a->credential_count++;
         }
+        break;
+    }
+
+    case P_ROUTE_RATELIMIT: {
+        struct route_rate_limit_config *rl = &c->routes[ctx->route_idx].rate_limit;
+        if      (!strcmp(k, "enabled")) rl->enabled = !strcmp(val,"true");
+        else if (!strcmp(k, "rps"))     rl->rps     = (uint32_t)atol(val);
+        else if (!strcmp(k, "burst"))   rl->burst   = (uint32_t)atol(val);
+        break;
+    }
+
+    case P_ROUTE_HEALTH: {
+        struct route_health_config *hc = &c->routes[ctx->route_idx].health;
+        if      (!strcmp(k, "fail_threshold")) hc->fail_threshold = (uint32_t)atol(val);
+        else if (!strcmp(k, "open_ms"))        hc->open_ms        = (uint32_t)atol(val);
         break;
     }
 
@@ -349,6 +367,8 @@ int config_load(const char *path, struct vortex_config *cfg)
             else if (ctx.state == P_ROUTE_BACKENDS)   { ctx.state = P_ROUTE; }
             else if (ctx.state == P_ROUTE_CACHE)      { ctx.state = P_ROUTE; }
             else if (ctx.state == P_ROUTE_AUTH)       { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_RATELIMIT)  { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_HEALTH)     { ctx.state = P_ROUTE; }
             else if (ctx.state == P_ROUTE)            { ctx.state = P_ROUTES; }
             else if (ctx.state == P_ACME_DNS_CFG)     { ctx.state = P_ACME; }
             else if (ctx.state == P_XDP_RATELIMIT)    { ctx.state = P_XDP; }
@@ -412,9 +432,11 @@ int config_load(const char *path, struct vortex_config *cfg)
                     ctx.state = P_ACME_DNS_CFG;
                     got_key = false;
                 } else if (ctx.state == P_ROUTE) {
-                    if (!strcmp(sv, "backends"))    ctx.state = P_ROUTE_BACKENDS;
-                    else if (!strcmp(sv, "cache"))  ctx.state = P_ROUTE_CACHE;
-                    else if (!strcmp(sv, "auth"))   ctx.state = P_ROUTE_AUTH;
+                    if (!strcmp(sv, "backends"))         ctx.state = P_ROUTE_BACKENDS;
+                    else if (!strcmp(sv, "cache"))       ctx.state = P_ROUTE_CACHE;
+                    else if (!strcmp(sv, "auth"))        ctx.state = P_ROUTE_AUTH;
+                    else if (!strcmp(sv, "rate_limit"))    ctx.state = P_ROUTE_RATELIMIT;
+                    else if (!strcmp(sv, "health_check")) ctx.state = P_ROUTE_HEALTH;
                 }
             } else {
                 handle_scalar(&ctx, sv);

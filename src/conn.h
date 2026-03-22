@@ -76,8 +76,26 @@ struct conn_cold {
     uint32_t       backend_body_recv;      /* body bytes received so far */
     uint8_t        backend_pooled;         /* 1 = this backend fd came from the pool */
 
+    /* Backend response deadline — ns (CLOCK_MONOTONIC_COARSE).
+     * Set when RECV_BACKEND is armed; cleared on first response byte or close.
+     * Nonzero = timeout check active. */
+    uint64_t       backend_deadline_ns;
+
     /* Zero-copy splice pipe — [0]=read end, [1]=write end; -1 when unused */
     int            splice_pipe[2];
+
+    /* Chunked TE reassembly for deferred caching.
+     * chunk_buf layout: [0..chunk_hdr_len) = response headers saved on first recv,
+     * [chunk_hdr_len..chunk_hdr_len+chunk_body_len) = decoded body accumulated.
+     * Non-NULL only while CONN_FLAG_CACHING is active. */
+    uint8_t       *chunk_buf;        /* heap-alloc accumulator; NULL when idle */
+    uint32_t       chunk_buf_cap;    /* allocated capacity of chunk_buf */
+    uint32_t       chunk_hdr_len;    /* response header bytes saved at buf start */
+    uint32_t       chunk_body_len;   /* decoded body bytes accumulated after headers */
+    uint32_t       chunk_remaining;  /* bytes left in current chunk segment */
+    bool           chunk_skip_crlf; /* true: must skip \r\n before next chunk size */
+    uint32_t       chunk_ttl;        /* TTL seconds for this URL */
+    char           chunk_url[512];   /* URL to cache under */
 };
 
 /* Per-worker connection pool */

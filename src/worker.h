@@ -17,19 +17,6 @@
 #define WORKER_URING_DEPTH 4096
 #define WORKER_TARPIT_MAX  512
 
-/* Maximum idle backend fds held per (route, backend) pair */
-#define BACKEND_POOL_SLOTS 16
-
-/*
- * Per-(route, backend) idle connection pool.
- * Stored per-worker to avoid cross-thread locking.
- * Connections are returned here after a complete HTTP response when the
- * backend has keep-alive semantics (pool_size > 0 in config).
- */
-struct backend_fd_pool {
-    int      fds[BACKEND_POOL_SLOTS];
-    uint32_t count;
-};
 
 /* How long evicted tarpit IPs stay in the XDP blocklist */
 #define WORKER_BLOCK_TTL_SECS  3600
@@ -81,8 +68,21 @@ struct worker {
     uint32_t             blocked_tail;
     uint32_t             blocked_count;
 
-    /* Per-(route, backend) idle connection pools */
-    struct backend_fd_pool backend_pool[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
+    /* Per-(route, backend) circuit breaker state.
+     * fail_count: consecutive connect failures since last success.
+     * open_until_ns: if nonzero and > now, circuit is open (fast-reject).
+     *   When timeout expires, one probe is allowed through; success clears it,
+     *   failure extends it. */
+    struct {
+        uint32_t fail_count;
+        uint64_t open_until_ns;
+    } backend_cb[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
+
+    /* Per-route token bucket for rate limiting (one per route, per worker) */
+    struct {
+        uint32_t tokens;    /* current token count (millirequests: tokens * 1000) */
+        uint64_t last_ns;   /* CLOCK_MONOTONIC_COARSE timestamp of last replenishment */
+    } route_rl[VORTEX_MAX_ROUTES];
 
     volatile int     stop;
 };

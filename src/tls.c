@@ -38,8 +38,10 @@ static void log_ssl_errors(const char *ctx_tag)
 /* SNI callback: select the SSL_CTX matching the requested hostname */
 static int sni_callback(SSL *ssl, int *al, void *arg)
 {
-    (void)al;
-    struct sni_data *sd = (struct sni_data *)arg;
+    (void)al; (void)arg;
+    /* Read per-connection data set via SSL_set_app_data() — NOT the CTX-level
+     * arg (which is shared across all workers and races on concurrent accepts). */
+    struct sni_data *sd = (struct sni_data *)SSL_get_app_data(ssl);
     struct tls_ctx  *tls = sd->tls;
 
     const char *sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
@@ -247,10 +249,12 @@ SSL *tls_accept(struct tls_ctx *tls, int fd,
         return NULL;
     }
 
-    /* Thread SNI data through app_data on the SSL object */
+    /* Thread SNI data through per-connection SSL app_data.
+     * Must NOT use SSL_CTX_set_tlsext_servername_arg() here — that sets a
+     * shared pointer on the CTX, racing when multiple workers accept concurrently.
+     * The callback reads this via SSL_get_app_data(ssl) instead. */
     struct sni_data sd = { .tls = tls, .matched_route = 0 };
     SSL_set_app_data(ssl, &sd);
-    SSL_CTX_set_tlsext_servername_arg(base_ctx, &sd);
 
     /* Attach fd — set non-blocking mode first so handshake doesn't block
      * indefinitely on a slow client; we loop on WANT_READ/WANT_WRITE */

@@ -33,6 +33,8 @@ struct uring_ctx {
     unsigned int     cq_entries;
     bool             sqpoll;          /* SQPOLL mode */
     bool             bufs_registered; /* io_uring fixed buffers registered */
+    bool             files_registered;/* io_uring fixed files registered */
+    unsigned int     file_slots;      /* total fixed file slots */
 };
 
 int  uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll);
@@ -42,6 +44,16 @@ void uring_destroy(struct uring_ctx *ctx);
  * iovecs[0..n-1] describe the buffers; must remain valid for the ring's lifetime.
  * On success, sets ctx->bufs_registered = true and returns 0. */
 int  uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n);
+
+/* Register a sparse fixed file table of nslots entries.
+ * Eliminates fdget/fdput on every SQE that sets IOSQE_FIXED_FILE.
+ * On success, sets ctx->files_registered = true and returns 0. */
+int  uring_register_files_sparse(struct uring_ctx *ctx, unsigned int nslots);
+
+/* Install / remove an fd in the fixed file table at the given slot.
+ * uring_remove_fd installs -1 (kernel sentinel for "empty slot"). */
+int  uring_install_fd(struct uring_ctx *ctx, unsigned int slot, int fd);
+int  uring_remove_fd(struct uring_ctx *ctx, unsigned int slot);
 
 /* Submit all pending SQEs */
 int uring_submit(struct uring_ctx *ctx);

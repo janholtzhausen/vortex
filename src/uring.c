@@ -55,6 +55,8 @@ int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
 
 void uring_destroy(struct uring_ctx *ctx)
 {
+    if (ctx->files_registered)
+        io_uring_unregister_files(&ctx->ring);
     if (ctx->bufs_registered)
         io_uring_unregister_buffers(&ctx->ring);
     io_uring_queue_exit(&ctx->ring);
@@ -72,6 +74,36 @@ int uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n)
     ctx->bufs_registered = true;
     log_info("uring_register_bufs", "registered %u fixed buffers (%.1f MB pinned)",
         n, (double)n * 65536 / (1024 * 1024));
+    return 0;
+}
+
+int uring_register_files_sparse(struct uring_ctx *ctx, unsigned int nslots)
+{
+    int ret = io_uring_register_files_sparse(&ctx->ring, nslots);
+    if (ret < 0) {
+        log_error("uring_register_files_sparse",
+            "io_uring_register_files_sparse(%u) failed: %s — fixed-file disabled",
+            nslots, strerror(-ret));
+        return ret;
+    }
+    ctx->files_registered = true;
+    ctx->file_slots = nslots;
+    log_info("uring_register_files_sparse", "registered %u fixed file slots", nslots);
+    return 0;
+}
+
+int uring_install_fd(struct uring_ctx *ctx, unsigned int slot, int fd)
+{
+    if (!ctx->files_registered || slot >= ctx->file_slots) return -EINVAL;
+    int ret = io_uring_register_files_update(&ctx->ring, slot, &fd, 1);
+    return (ret == 1) ? 0 : (ret < 0 ? ret : -EIO);
+}
+
+int uring_remove_fd(struct uring_ctx *ctx, unsigned int slot)
+{
+    if (!ctx->files_registered || slot >= ctx->file_slots) return 0;
+    int minus1 = -1;
+    io_uring_register_files_update(&ctx->ring, slot, &minus1, 1);
     return 0;
 }
 

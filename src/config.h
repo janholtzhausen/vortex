@@ -47,6 +47,17 @@ struct route_auth_config {
     int  credential_count;
 };
 
+struct route_rate_limit_config {
+    bool     enabled;
+    uint32_t rps;    /* requests per second (sustained) */
+    uint32_t burst;  /* max instantaneous burst above rps */
+};
+
+struct route_health_config {
+    uint32_t fail_threshold; /* consecutive connect failures to open circuit (0 = default 3) */
+    uint32_t open_ms;        /* ms to keep circuit open before probe attempt (0 = default 10000) */
+};
+
 struct route_config {
     char     hostname[VORTEX_MAX_HOSTNAME];
     struct backend_config backends[VORTEX_MAX_BACKENDS];
@@ -57,8 +68,13 @@ struct route_config {
     char cert_path[PATH_MAX];
     char key_path[PATH_MAX];
 
-    struct cache_route_config cache;
-    struct route_auth_config auth;
+    struct cache_route_config      cache;
+    struct route_auth_config       auth;
+    struct route_rate_limit_config rate_limit;
+    struct route_health_config     health;
+
+    /* Max ms to wait for first byte from backend (0 = default 30 000 ms) */
+    uint32_t backend_timeout_ms;
 
     /* Optional API key injected as X-Api-Key: header on backend requests */
     char x_api_key[256];

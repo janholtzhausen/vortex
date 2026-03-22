@@ -108,6 +108,7 @@ set(VORTEX_SRCS
     src/conn.c
     src/router.c
     src/worker.c
+    src/pool.c
     src/cache.c
     src/metrics.c
     src/simd.c

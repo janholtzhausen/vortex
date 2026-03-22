@@ -13,6 +13,7 @@
 #include "bpf_loader.h"
 
 #include "worker.h"
+#include "pool.h"
 #include "metrics.h"
 #include "tls.h"
 #ifdef VORTEX_QUIC
@@ -284,6 +285,18 @@ static int cert_manager_init(struct vortex_config *cfg)
 
 static void cert_manager_reload_static(void)
 {
+    /* Grow route_count if new routes were added since last init.
+     * IMPORTANT: zero-init new slots and load their ssl_ctx BEFORE publishing
+     * the new route_count.  Workers read route_count atomically; if we bumped
+     * it first, a worker could attempt a handshake for a route whose ssl_ctx
+     * is still NULL, falling back to route 0 and presenting the wrong cert. */
+    if (g_cfg.route_count > g_tls.route_count) {
+        for (int i = g_tls.route_count; i < g_cfg.route_count; i++)
+            memset(&g_tls.routes[i], 0, sizeof(g_tls.routes[i]));
+        /* ssl_ctx for new routes will be set in the loop below;
+         * route_count is updated at the end of this function after the loop. */
+    }
+
     /* On SIGHUP: re-read static certs from disk */
     for (int i = 0; i < g_cfg.route_count; i++) {
         struct route_config *r = &g_cfg.routes[i];
@@ -292,15 +305,39 @@ static void cert_manager_reload_static(void)
 
         struct cert_result res;
         memset(&res, 0, sizeof(res));
-        if (static_file_load(r->cert_path, r->key_path, &res) == 0) {
-            tls_rotate_cert(&g_tls, i, res.cert_pem, res.key_pem);
-            log_info("cert_reload", "route=%d cert reloaded from %s",
-                i, r->cert_path);
-        } else {
+        if (static_file_load(r->cert_path, r->key_path, &res) != 0) {
             log_warn("cert_reload", "route=%d failed to reload cert", i);
+            cert_result_free(&res);
+            continue;
+        }
+
+        if (g_tls.routes[i].ssl_ctx) {
+            /* Existing route — hot-swap via tls_rotate_cert */
+            if (tls_rotate_cert(&g_tls, i, res.cert_pem, res.key_pem) == 0)
+                log_info("cert_reload", "route=%d cert reloaded from %s", i, r->cert_path);
+            else
+                log_warn("cert_reload", "route=%d tls_rotate_cert failed", i);
+        } else {
+            /* New route — create ssl_ctx with correct hostname */
+            SSL_CTX *ctx = tls_create_ctx_from_pem(&g_tls, res.cert_pem,
+                                                    res.key_pem, r->hostname);
+            if (ctx) {
+                __atomic_store_n(&g_tls.routes[i].ssl_ctx, ctx, __ATOMIC_SEQ_CST);
+                g_tls.routes[i].route_idx = i;
+                log_info("cert_reload", "route=%d cert loaded from %s (new route)",
+                    i, r->cert_path);
+            } else {
+                log_warn("cert_reload", "route=%d tls_create_ctx_from_pem failed", i);
+            }
         }
         cert_result_free(&res);
     }
+
+    /* Publish new route_count AFTER all ssl_ctx values have been stored.
+     * A full sequential barrier ensures workers that load the new route_count
+     * will also see all the ssl_ctx writes that precede it. */
+    if (g_cfg.route_count > g_tls.route_count)
+        __atomic_store_n(&g_tls.route_count, g_cfg.route_count, __ATOMIC_SEQ_CST);
 }
 #endif /* VORTEX_PHASE_TLS */
 
@@ -440,6 +477,9 @@ int main(int argc, char *argv[])
     /* Connection pool capacity: 50% of available RAM split across workers */
     uint32_t pool_cap = worker_pool_capacity(num_workers, 0.50);
 
+    /* Shared backend connection pool — must be initialised before workers start */
+    global_pool_init();
+
     /* Create one SO_REUSEPORT listen socket per worker.
      * The kernel distributes incoming connections across them by hashing the
      * 4-tuple, eliminating accept-queue contention and thundering herd. */
@@ -571,6 +611,7 @@ int main(int argc, char *argv[])
         worker_join(&g_workers[i]);
         worker_destroy(&g_workers[i]);
     }
+    global_pool_destroy();
     if (g_cfg.metrics.enabled) {
         metrics_stop(&g_metrics);
         metrics_join(&g_metrics);

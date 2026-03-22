@@ -158,6 +158,13 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     struct conn_cold *cold = &pool->cold[id];
     if (cold->splice_pipe[0] >= 0) { close(cold->splice_pipe[0]); cold->splice_pipe[0] = -1; }
     if (cold->splice_pipe[1] >= 0) { close(cold->splice_pipe[1]); cold->splice_pipe[1] = -1; }
+    cold->backend_deadline_ns = 0;
+    if (cold->chunk_buf) { free(cold->chunk_buf); cold->chunk_buf = NULL; }
+    cold->chunk_buf_cap   = 0;
+    cold->chunk_hdr_len   = 0;
+    cold->chunk_body_len  = 0;
+    cold->chunk_remaining = 0;
+    cold->chunk_skip_crlf = false;
 
     pool->free_list[pool->free_top++] = id;
     if (pool->active > 0) pool->active--;
