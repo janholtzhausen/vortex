@@ -1513,9 +1513,9 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
             /* Zero-copy splice: only safe for non-compressible types (images, video,
-             * already-compressed media), and only when the client connection does NOT
-             * have kTLS TX active.  kTLS TX on kernel 6.8 mis-accounts spliced bytes
-             * vs. the Content-Length sent earlier, causing ERR_CONTENT_LENGTH_MISMATCH.
+             * already-compressed media), and only without kTLS TX.  Splicing into a
+             * kTLS-TX socket causes ERR_CONTENT_LENGTH_MISMATCH on kernel 6.8–6.12
+             * (kTLS mis-accounts spliced bytes against the Content-Length already sent).
              * Compressible types also skip splice — compression of the first chunk
              * changes the payload length, but splice delivers subsequent chunks raw. */
             if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
