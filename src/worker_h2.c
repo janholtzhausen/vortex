@@ -233,6 +233,22 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
     if (st->resp_submitted) return;
     if (!st->resp_headers_done) return;
 
+    struct worker *w = sess->w;
+
+    /* Pre-compute Cache-Control rewrite (same URL-TTL logic as H1.1 path) */
+    uint32_t ttl = cache_ttl_for_url(st->path);
+    char cc_val[64] = "";
+    int  cc_val_len = 0;
+    if (ttl > 0) {
+        if (ttl >= 3600)
+            cc_val_len = snprintf(cc_val, sizeof(cc_val),
+                "public, max-age=%u, immutable", ttl);
+        else
+            cc_val_len = snprintf(cc_val, sizeof(cc_val),
+                "public, max-age=%u", ttl);
+    }
+    bool cc_injected = false; /* track whether we already emitted cache-control */
+
     const char *buf = (const char *)st->resp_buf;
     size_t      len  = st->resp_buf_len;
 
@@ -304,10 +320,10 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
             q = nl + 2;
         }
     }
-    if (nv_count > 64) nv_count = 64;
+    if (nv_count > 60) nv_count = 60; /* cap; leave 4 slots for injected headers */
 
-    /* Allocate nghttp2_nv array (+1 for :status) */
-    nghttp2_nv *nvs = malloc((size_t)nv_count * sizeof(nghttp2_nv));
+    /* Allocate nghttp2_nv array (+1 for :status, +4 for injections) */
+    nghttp2_nv *nvs = malloc((size_t)(nv_count + 4) * sizeof(nghttp2_nv));
     if (!nvs) return;
 
     int idx = 0;
@@ -319,7 +335,7 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
     nvs[idx].flags   = NGHTTP2_NV_FLAG_NO_COPY_NAME; /* literal ":status" is constant */
     idx++;
 
-    /* Second pass: emit headers (lowercase names, skip hop-by-hop) */
+    /* Second pass: emit headers (lowercase names, skip hop-by-hop, rewrite) */
     while (p < hdr_end - 1 && idx < nv_count) {
         const char *nl = (const char *)memmem(p, (size_t)(hdr_end - p), "\r\n", 2);
         if (!nl || nl == p) break;
@@ -333,7 +349,7 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
         size_t val_len = (size_t)(nl - val);
 
         /* Lowercase the header name in-place (resp_buf is ours to mutate) */
-        char *name_p = (char *)p; /* cast away const — resp_buf is uint8_t* heap */
+        char *name_p = (char *)p;
         for (size_t i = 0; i < name_len; i++)
             name_p[i] = (char)tolower((unsigned char)name_p[i]);
 
@@ -345,15 +361,83 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
             continue;
         }
 
+        /* Server header obfuscation — same as H1.1 path */
+        if (name_len == 6 && memcmp(name_p, "server", 6) == 0
+            && w->cfg->server_header[0]) {
+            nvs[idx].name     = (uint8_t *)"server";
+            nvs[idx].namelen  = 6;
+            nvs[idx].value    = (uint8_t *)w->cfg->server_header;
+            nvs[idx].valuelen = strlen(w->cfg->server_header);
+            nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+            idx++;
+            p = nl + 2;
+            continue;
+        }
+
+        /* Cache-Control: override for static assets, pass through for dynamic */
+        if (name_len == 13 && memcmp(name_p, "cache-control", 13) == 0) {
+            cc_injected = true;
+            if (ttl >= 3600) {
+                /* Static asset — override backend's no-cache/no-store */
+                nvs[idx].name     = (uint8_t *)"cache-control";
+                nvs[idx].namelen  = 13;
+                nvs[idx].value    = (uint8_t *)cc_val;
+                nvs[idx].valuelen = (size_t)cc_val_len;
+                nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME;
+                idx++;
+            } else if (ttl > 0) {
+                /* Dynamic — pass through backend value */
+                nvs[idx].name     = (uint8_t *)name_p;
+                nvs[idx].namelen  = name_len;
+                nvs[idx].value    = (uint8_t *)val;
+                nvs[idx].valuelen = val_len;
+                nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+                idx++;
+            }
+            /* ttl == 0 (API): drop cache-control from backend, leave it uncached */
+            p = nl + 2;
+            continue;
+        }
+
+        /* Strip Pragma and Expires for static assets (Kestrel sends no-cache/-1) */
+        if (ttl >= 3600) {
+            if ((name_len == 6  && memcmp(name_p, "pragma",  6)  == 0) ||
+                (name_len == 7  && memcmp(name_p, "expires", 7)  == 0)) {
+                p = nl + 2;
+                continue;
+            }
+        }
+
         nvs[idx].name     = (uint8_t *)name_p;
         nvs[idx].namelen  = name_len;
         nvs[idx].value    = (uint8_t *)val;
         nvs[idx].valuelen = val_len;
-        /* resp_buf lives until h2_stream_cleanup — safe to avoid copy */
         nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
         idx++;
         p = nl + 2;
     }
+
+    /* Inject cache-control if backend sent none and we have a TTL */
+    if (ttl > 0 && !cc_injected && idx < nv_count + 4) {
+        nvs[idx].name     = (uint8_t *)"cache-control";
+        nvs[idx].namelen  = 13;
+        nvs[idx].value    = (uint8_t *)cc_val;
+        nvs[idx].valuelen = (size_t)cc_val_len;
+        nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME;
+        idx++;
+    }
+
+#ifdef VORTEX_QUIC
+    /* Advertise HTTP/3 availability */
+    if (idx < nv_count + 4) {
+        nvs[idx].name     = (uint8_t *)"alt-svc";
+        nvs[idx].namelen  = 7;
+        nvs[idx].value    = (uint8_t *)"h3=\":443\"; ma=86400";
+        nvs[idx].valuelen = 19;
+        nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+        idx++;
+    }
+#endif
 
     uint32_t body_len = st->resp_buf_len > st->resp_hdr_end
                         ? st->resp_buf_len - st->resp_hdr_end : 0u;
