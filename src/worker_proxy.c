@@ -776,26 +776,33 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
             bool is_ws = (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) != 0;
 
-            /* ---- Strip Accept-Encoding ----
-             * We handle compression ourselves; tell the backend to send plain
-             * so we can inspect, cache, and compress on the way out.
-             * Skipped when pass_accept_encoding is set — non-cached routes
-             * can let the backend compress directly and save proxy CPU. */
-            if (!rc_fwd->pass_accept_encoding) {
+            /* ---- Rewrite Accept-Encoding for backend leg ----
+             * The client→proxy leg is WAN; the proxy→backend leg is LAN where
+             * bandwidth is cheap and body inspection/caching requires plain text.
+             * Rewrite to "identity" so the backend sends uncompressed responses. */
+            bool ae_present = false;
+            {
                 uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
                 if (!ae)
                     ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
                 if (ae) {
-                    uint8_t *line_end = (uint8_t *)FIND_CRLF(ae + 2,
-                        (size_t)(rbuf + fwd_n - ae - 2));
-                    if (line_end) {
-                        line_end += 2;
-                        size_t remove = (size_t)(line_end - ae - 2);
-                        memmove(ae + 2, ae + 2 + remove,
-                            (size_t)(rbuf + fwd_n - (ae + 2 + remove)));
-                        fwd_n -= (int)remove;
+                    ae_present = true;
+                    /* Replace the header value in-place with "identity" */
+                    uint8_t *vs = ae + 18;
+                    while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
+                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
+                    if (ve && ve > vs) {
+                        const char *id = "identity";
+                        size_t id_len  = 8;
+                        int delta = (int)id_len - (int)(ve - vs);
+                        if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
+                            memmove(vs + id_len, ve, (size_t)(rbuf + fwd_n - ve));
+                            memcpy(vs, id, id_len);
+                            fwd_n += delta;
+                        }
                     }
                 }
+                /* When absent: injected in the inject block below */
             }
 
             /* ---- Strip Authorization header ----
@@ -907,6 +914,11 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                             "X-Real-IP: %s\r\nX-Forwarded-For: %s\r\n", ipstr, ipstr);
                     }
                 }
+
+                /* Accept-Encoding: identity — only when not already rewritten above */
+                if (!ae_present)
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "Accept-Encoding: identity\r\n");
 
                 /* X-Api-Key if configured */
                 if (rc_fwd->x_api_key[0])

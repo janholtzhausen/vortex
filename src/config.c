@@ -234,7 +234,6 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "backend_credentials")) snprintf(r->backend_credentials, sizeof(r->backend_credentials), "%s", val);
         else if (!strcmp(k, "server_header"))      snprintf(r->server_header, sizeof(r->server_header), "%s", !strcmp(val,"none") ? "" : val);
         else if (!strcmp(k, "congestion_control")) snprintf(r->congestion_control, sizeof(r->congestion_control), "%s", val);
-        else if (!strcmp(k, "pass_accept_encoding")) r->pass_accept_encoding = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "hostname"))     snprintf(r->hostname, sizeof(r->hostname), "%s", val);
         else if (!strcmp(k, "load_balancing")) {
             if      (!strcmp(val,"weighted_round_robin")) r->lb_algo = LB_WEIGHTED_ROUND_ROBIN;
