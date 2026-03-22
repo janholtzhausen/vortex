@@ -105,6 +105,12 @@ static void h2_stream_cleanup(struct h2_session *sess, struct h2_stream *st)
     free(st->req_body);   st->req_body   = NULL;
     free(st->resp_buf);   st->resp_buf   = NULL;
     free(st->req_http11); st->req_http11 = NULL;
+    if (st->grpc) {
+        if (st->grpc->ngh2) { nghttp2_session_del(st->grpc->ngh2); st->grpc->ngh2 = NULL; }
+        free(st->grpc->send_buf);
+        free(st->grpc);
+        st->grpc = NULL;
+    }
     st->req_body_len    = 0;
     st->req_body_cap    = 0;
     st->resp_buf_len    = 0;
@@ -184,8 +190,12 @@ static ssize_t h2_data_source_read(nghttp2_session *ngh2,
     memcpy(buf, st->resp_buf + body_start + st->resp_body_sent, to_copy);
     st->resp_body_sent += (uint32_t)to_copy;
 
-    if (st->resp_body_sent >= body_total)
+    if (st->resp_body_sent >= body_total) {
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        /* gRPC: keep stream open for trailers (nghttp2_submit_trailer follows) */
+        if (st->is_grpc && st->grpc && st->grpc->ntrailers > 0)
+            *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+    }
 
     return (ssize_t)to_copy;
 }
@@ -677,6 +687,12 @@ static int on_header_cb(nghttp2_session *ngh2,
         (namelen == 7  && memcmp(name, "upgrade", 7) == 0))
         return 0;
 
+    /* Detect gRPC by Content-Type: application/grpc[+proto|+json|...] */
+    if (namelen == 12 && memcmp(name, "content-type", 12) == 0) {
+        if (valuelen >= 16 && memcmp(value, "application/grpc", 16) == 0)
+            st->is_grpc = true;
+    }
+
     /* Accept-Encoding: pass through to backend unchanged.
      * The H2 path buffers the full response before submitting to nghttp2 — it
      * does NOT cache, so compressed responses are strictly better (smaller
@@ -950,6 +966,407 @@ void h2_on_send_client(struct worker *w, uint32_t cid, int sent)
     h2_send_pending(sess);
 }
 
+/* ================================================================== */
+/* gRPC h2c backend — nghttp2 as a client against the backend         */
+/* ================================================================== */
+
+/* Forward declaration: called from gRPC backend frame callbacks */
+static void h2_grpc_backend_init(struct h2_session *sess, struct h2_stream *st);
+
+/* ---------- send helpers ------------------------------------------ */
+
+static bool h2_grpc_send_buf_reserve(struct h2_grpc_backend *grpc, uint32_t need)
+{
+    uint32_t req = grpc->send_len + need;
+    if (req <= grpc->send_cap) return true;
+    uint32_t nc  = grpc->send_cap ? grpc->send_cap * 2 : 32768u;
+    while (nc < req) nc *= 2;
+    uint8_t *p = realloc(grpc->send_buf, nc);
+    if (!p) return false;
+    grpc->send_buf = p;
+    grpc->send_cap = nc;
+    return true;
+}
+
+/* Drain nghttp2 client output → grpc->send_buf → io_uring SEND to backend */
+static void h2_grpc_send_pending(struct h2_session *sess, struct h2_stream *st)
+{
+    struct h2_grpc_backend *grpc = st->grpc;
+    if (grpc->send_in_flight) return;
+
+    /* Compact */
+    if (grpc->send_len == 0) { /* nothing buffered */ }
+
+    /* Drain nghttp2 client output (SETTINGS, SETTINGS_ACK, WINDOW_UPDATE, etc.) */
+    while (1) {
+        const uint8_t *data;
+        ssize_t n = nghttp2_session_mem_send(grpc->ngh2, &data);
+        if (n <= 0) break;
+        if (!h2_grpc_send_buf_reserve(grpc, (uint32_t)n)) {
+            h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+            return;
+        }
+        memcpy(grpc->send_buf + grpc->send_len, data, (size_t)n);
+        grpc->send_len += (uint32_t)n;
+    }
+
+    if (grpc->send_len == 0) return;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&sess->w->uring.ring);
+    if (!sqe) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+    io_uring_prep_send(sqe, st->backend_fd,
+        grpc->send_buf, grpc->send_len, MSG_NOSIGNAL);
+    sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_GRPC_SEND_BACKEND, st->slot, sess->cid);
+    grpc->send_in_flight = true;
+    uring_submit(&sess->w->uring);
+}
+
+static void h2_grpc_arm_backend_recv(struct h2_session *sess, struct h2_stream *st)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&sess->w->uring.ring);
+    if (!sqe) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+    io_uring_prep_recv(sqe, st->backend_fd,
+        st->grpc->recv_buf, sizeof(st->grpc->recv_buf), 0);
+    sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_GRPC_RECV_BACKEND, st->slot, sess->cid);
+    uring_submit(&sess->w->uring);
+}
+
+/* ---------- submit response to frontend nghttp2 ------------------- */
+
+static void h2_grpc_submit_response(struct h2_session *sess, struct h2_stream *st)
+{
+    if (st->resp_submitted) return;
+    st->resp_submitted = true;
+
+    struct h2_grpc_backend *grpc = st->grpc;
+
+    /* Build nghttp2_nv array: :status + non-pseudo response headers */
+    int max_nv = grpc->resp_nhdrs + 1;
+    nghttp2_nv *nvs = malloc((size_t)max_nv * sizeof(nghttp2_nv));
+    if (!nvs) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+
+    char status_str[4];
+    snprintf(status_str, sizeof(status_str), "%d",
+             grpc->resp_status ? grpc->resp_status : 200);
+
+    int idx = 0;
+    nvs[idx++] = (nghttp2_nv){
+        .name     = (uint8_t *)":status", .namelen  = 7,
+        .value    = (uint8_t *)status_str,
+        .valuelen = strlen(status_str),
+        .flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME,
+    };
+
+    for (int i = 0; i < grpc->resp_nhdrs && idx < max_nv; i++) {
+        struct h2_grpc_hdr *hdr = &grpc->resp_hdrs[i];
+        if (hdr->name[0] == ':') continue; /* skip pseudo-headers */
+        nvs[idx++] = (nghttp2_nv){
+            .name     = (uint8_t *)hdr->name,
+            .namelen  = strlen(hdr->name),
+            .value    = (uint8_t *)hdr->value,
+            .valuelen = strlen(hdr->value),
+            .flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+        };
+    }
+
+    /* Point data source at resp_buf body (resp_hdr_end=0 for gRPC) */
+    st->resp_hdr_end     = 0;
+    st->resp_headers_done = true;
+
+    nghttp2_data_provider prd = { .source.ptr = st, .read_callback = h2_data_source_read };
+    int rv = nghttp2_submit_response(sess->ngh2, st->stream_id, nvs, (size_t)idx, &prd);
+    free(nvs);
+    if (rv != 0) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+
+    /* Trailers (grpc-status, grpc-message, ...) — submitted now, sent after body */
+    if (grpc->ntrailers > 0) {
+        nghttp2_nv *tvs = malloc((size_t)grpc->ntrailers * sizeof(nghttp2_nv));
+        if (tvs) {
+            for (int i = 0; i < grpc->ntrailers; i++) {
+                struct h2_grpc_hdr *t = &grpc->trailers[i];
+                tvs[i] = (nghttp2_nv){
+                    .name     = (uint8_t *)t->name,
+                    .namelen  = strlen(t->name),
+                    .value    = (uint8_t *)t->value,
+                    .valuelen = strlen(t->value),
+                    .flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+                };
+            }
+            nghttp2_submit_trailer(sess->ngh2, st->stream_id,
+                                   tvs, (size_t)grpc->ntrailers);
+            free(tvs);
+        }
+    }
+
+    h2_send_pending(sess);
+}
+
+/* ---------- nghttp2 client callbacks (backend → proxy) ------------ */
+
+static int grpc_be_on_header_cb(nghttp2_session *ngh2,
+                                  const nghttp2_frame *frame,
+                                  const uint8_t *name, size_t namelen,
+                                  const uint8_t *value, size_t valuelen,
+                                  uint8_t flags, void *user_data)
+{
+    (void)ngh2; (void)flags;
+    if (frame->hd.type != NGHTTP2_HEADERS) return 0;
+
+    struct h2_stream       *st   = (struct h2_stream *)user_data;
+    struct h2_grpc_backend *grpc = st->grpc;
+
+    bool is_trailer = (frame->headers.cat == NGHTTP2_HCAT_HEADERS);
+
+    if (!is_trailer) {
+        /* :status pseudo-header */
+        if (namelen == 7 && memcmp(name, ":status", 7) == 0)
+            grpc->resp_status = atoi((const char *)value);
+        /* Store header for forwarding */
+        if (grpc->resp_nhdrs < H2_GRPC_MAX_HDRS) {
+            struct h2_grpc_hdr *h = &grpc->resp_hdrs[grpc->resp_nhdrs++];
+            size_t nl = namelen  < H2_GRPC_HDR_NAME_MAX - 1 ? namelen  : H2_GRPC_HDR_NAME_MAX - 1;
+            size_t vl = valuelen < H2_GRPC_HDR_VAL_MAX  - 1 ? valuelen : H2_GRPC_HDR_VAL_MAX  - 1;
+            memcpy(h->name,  name,  nl); h->name[nl]  = '\0';
+            memcpy(h->value, value, vl); h->value[vl] = '\0';
+        }
+    } else {
+        if (grpc->ntrailers < H2_GRPC_MAX_TRAILERS) {
+            struct h2_grpc_hdr *h = &grpc->trailers[grpc->ntrailers++];
+            size_t nl = namelen  < H2_GRPC_HDR_NAME_MAX - 1 ? namelen  : H2_GRPC_HDR_NAME_MAX - 1;
+            size_t vl = valuelen < H2_GRPC_HDR_VAL_MAX  - 1 ? valuelen : H2_GRPC_HDR_VAL_MAX  - 1;
+            memcpy(h->name,  name,  nl); h->name[nl]  = '\0';
+            memcpy(h->value, value, vl); h->value[vl] = '\0';
+        }
+    }
+    return 0;
+}
+
+static int grpc_be_on_data_chunk_cb(nghttp2_session *ngh2, uint8_t flags,
+                                      int32_t stream_id,
+                                      const uint8_t *data, size_t len,
+                                      void *user_data)
+{
+    (void)ngh2; (void)flags; (void)stream_id;
+    struct h2_stream *st = (struct h2_stream *)user_data;
+    if (len == 0) return 0;
+    if (st->resp_buf_len + (uint32_t)len > H2_RESP_MAX) {
+        log_warn("h2_grpc", "cid=%u stream=%d grpc response too large, RST",
+                 st->cid, st->stream_id);
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    if (!h2_resp_grow(st, (uint32_t)len)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    memcpy(st->resp_buf + st->resp_buf_len, data, len);
+    st->resp_buf_len += (uint32_t)len;
+    return 0;
+}
+
+static int grpc_be_on_frame_recv_cb(nghttp2_session *ngh2,
+                                     const nghttp2_frame *frame, void *user_data)
+{
+    (void)ngh2;
+    struct h2_stream       *st   = (struct h2_stream *)user_data;
+    struct h2_grpc_backend *grpc = st->grpc;
+
+    /* After backend sends SETTINGS, nghttp2 queues SETTINGS_ACK — drain it */
+    if (frame->hd.type == NGHTTP2_SETTINGS &&
+        !(frame->hd.flags & NGHTTP2_FLAG_ACK))
+        h2_grpc_send_pending(grpc->sess, st);
+
+    /* Response HEADERS frame received */
+    if (frame->hd.type == NGHTTP2_HEADERS &&
+        frame->headers.cat == NGHTTP2_HCAT_RESPONSE)
+        grpc->resp_hdrs_done = true;
+
+    /* END_STREAM on DATA or trailing HEADERS → response complete */
+    bool end_stream = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+    if (end_stream && !grpc->trailers_done &&
+        (frame->hd.type == NGHTTP2_DATA ||
+         frame->hd.type == NGHTTP2_HEADERS)) {
+        grpc->trailers_done = true;
+        h2_grpc_submit_response(grpc->sess, st);
+    }
+    return 0;
+}
+
+/* ---------- nghttp2 client data provider (request body) ----------- */
+
+static ssize_t grpc_req_read_cb(nghttp2_session *ngh2, int32_t stream_id,
+                                  uint8_t *buf, size_t length,
+                                  uint32_t *data_flags,
+                                  nghttp2_data_source *source,
+                                  void *user_data __attribute__((unused)))
+{
+    (void)ngh2; (void)stream_id;
+    struct h2_stream       *st   = (struct h2_stream *)source->ptr;
+    struct h2_grpc_backend *grpc = st->grpc;
+
+    uint32_t remaining = st->req_body_len - grpc->req_body_sent;
+    size_t to_copy = remaining < (uint32_t)length ? (size_t)remaining : length;
+    if (to_copy > 0) {
+        memcpy(buf, st->req_body + grpc->req_body_sent, to_copy);
+        grpc->req_body_sent += (uint32_t)to_copy;
+    }
+    if (grpc->req_body_sent >= st->req_body_len)
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return (ssize_t)to_copy;
+}
+
+/* ---------- backend init: create nghttp2 client + submit request -- */
+
+static void h2_grpc_backend_init(struct h2_session *sess, struct h2_stream *st)
+{
+    struct h2_grpc_backend *grpc = calloc(1, sizeof(*grpc));
+    if (!grpc) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+    grpc->sess = sess;
+    st->grpc   = grpc;
+    st->state  = H2_STREAM_GRPC_ACTIVE;
+
+    /* Create nghttp2 client session */
+    nghttp2_session_callbacks *cbs;
+    nghttp2_session_callbacks_new(&cbs);
+    nghttp2_session_callbacks_set_on_header_callback(cbs, grpc_be_on_header_cb);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, grpc_be_on_data_chunk_cb);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, grpc_be_on_frame_recv_cb);
+    int rv = nghttp2_session_client_new(&grpc->ngh2, cbs, st);
+    nghttp2_session_callbacks_del(cbs);
+    if (rv != 0) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+
+    /* Submit client SETTINGS */
+    nghttp2_settings_entry settings[] = {
+        { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1 },
+        { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    (int32_t)H2_RESP_MAX },
+    };
+    nghttp2_submit_settings(grpc->ngh2, NGHTTP2_FLAG_NONE,
+                            settings, sizeof(settings) / sizeof(settings[0]));
+
+    /* Build request header list from stream's accumulated fields + req_hdr_buf */
+    /* Count how many extra headers are in req_hdr_buf */
+    int extra = 0;
+    {
+        const uint8_t *p = st->req_hdr_buf, *end = p + st->req_hdr_len;
+        while (p < end) {
+            const uint8_t *crlf = (const uint8_t *)memmem(p, (size_t)(end - p), "\r\n", 2);
+            if (!crlf) break;
+            if (memchr(p, ':', (size_t)(crlf - p))) extra++;
+            p = crlf + 2;
+        }
+    }
+
+    int n_fixed = 4; /* :method :path :authority :scheme */
+    int n_total = n_fixed + extra;
+    nghttp2_nv *nvs = malloc((size_t)n_total * sizeof(nghttp2_nv));
+    if (!nvs) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+
+    int idx = 0;
+    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":method",    7, (uint8_t *)st->method,    strlen(st->method),    NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
+    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":path",      5, (uint8_t *)st->path,      strlen(st->path),      NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
+    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":authority", 10,(uint8_t *)st->authority, strlen(st->authority), NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
+    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":scheme",    7, (uint8_t *)"http",        4,                     NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
+
+    /* Parse req_hdr_buf ("Name: Value\r\n") → nghttp2_nv (values live in req_hdr_buf) */
+    uint8_t *p = st->req_hdr_buf, *end = p + st->req_hdr_len;
+    while (p < end && idx < n_total) {
+        uint8_t *crlf  = (uint8_t *)memmem(p, (size_t)(end - p), "\r\n", 2);
+        if (!crlf) break;
+        uint8_t *colon = (uint8_t *)memchr(p, ':', (size_t)(crlf - p));
+        if (!colon) { p = crlf + 2; continue; }
+
+        size_t nlen = (size_t)(colon - p);
+        uint8_t *val = colon + 1;
+        while (val < crlf && *val == ' ') val++;
+        size_t vlen = (size_t)(crlf - val);
+
+        /* Lowercase name in-place (req_hdr_buf is mutable) */
+        for (size_t i = 0; i < nlen; i++)
+            p[i] = (uint8_t)tolower((unsigned char)p[i]);
+
+        nvs[idx++] = (nghttp2_nv){
+            .name = p, .namelen = nlen,
+            .value = val, .valuelen = vlen,
+            .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+        };
+        p = crlf + 2;
+    }
+
+    /* Submit the request */
+    nghttp2_data_provider prd = { .source.ptr = st, .read_callback = grpc_req_read_cb };
+    rv = nghttp2_submit_request(grpc->ngh2, NULL, nvs, (size_t)idx,
+                                 st->req_body_len > 0 ? &prd : NULL, st);
+    free(nvs);
+    if (rv < 0) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
+    grpc->stream_id = rv;
+
+    /* Drain initial output (H2 preface + SETTINGS + HEADERS + DATA) to backend */
+    h2_grpc_send_pending(sess, st);
+
+    /* Arm backend recv immediately — we need to receive SETTINGS from backend */
+    h2_grpc_arm_backend_recv(sess, st);
+
+    log_debug("h2_grpc", "cid=%u stream=%d gRPC h2c backend init fd=%d",
+              sess->cid, st->stream_id, st->backend_fd);
+}
+
+/* ---------- CQE handlers ------------------------------------------ */
+
+void h2_on_grpc_backend_send(struct worker *w, uint32_t cid, uint32_t slot, int sent)
+{
+    struct conn_cold  *cc   = conn_cold_ptr(&w->pool, cid);
+    struct h2_session *sess = cc->h2;
+    if (!sess) return;
+    if (slot >= H2_STREAM_SLOTS) return;
+
+    struct h2_stream *st = &sess->streams[slot];
+    if (!st->is_grpc || !st->grpc) return;
+
+    struct h2_grpc_backend *grpc = st->grpc;
+    grpc->send_in_flight = false;
+
+    if (sent <= 0) {
+        h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+        return;
+    }
+
+    grpc->send_len = 0; /* all bytes sent in one shot */
+
+    /* Drain any further nghttp2 output queued since the last send */
+    h2_grpc_send_pending(sess, st);
+}
+
+void h2_on_grpc_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
+{
+    struct conn_cold  *cc   = conn_cold_ptr(&w->pool, cid);
+    struct h2_session *sess = cc->h2;
+    if (!sess) return;
+    if (slot >= H2_STREAM_SLOTS) return;
+
+    struct h2_stream *st = &sess->streams[slot];
+    if (!st->is_grpc || !st->grpc) return;
+    struct h2_grpc_backend *grpc = st->grpc;
+
+    if (n <= 0) {
+        /* Backend closed connection — if we already submitted, ignore */
+        if (!st->resp_submitted)
+            h2_stream_rst(sess, st, n < 0 ? NGHTTP2_INTERNAL_ERROR : NGHTTP2_REFUSED_STREAM);
+        return;
+    }
+
+    /* Feed raw bytes to nghttp2 client session */
+    ssize_t ret = nghttp2_session_mem_recv(grpc->ngh2, grpc->recv_buf, (size_t)n);
+    if (ret < 0) {
+        log_error("h2_grpc", "cid=%u stream=%d nghttp2_session_mem_recv: %s",
+                  cid, st->stream_id, nghttp2_strerror((int)ret));
+        h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+        return;
+    }
+
+    /* Drain any control frames the nghttp2 client wants to send (WINDOW_UPDATE etc.) */
+    h2_grpc_send_pending(sess, st);
+
+    /* Continue receiving unless response is already complete */
+    if (!grpc->trailers_done)
+        h2_grpc_arm_backend_recv(sess, st);
+}
+
 void h2_on_backend_connect(struct worker *w, uint32_t cid, uint32_t slot, int res)
 {
     struct conn_cold  *cc   = conn_cold_ptr(&w->pool, cid);
@@ -964,6 +1381,12 @@ void h2_on_backend_connect(struct worker *w, uint32_t cid, uint32_t slot, int re
         log_debug("h2_connect", "cid=%u stream=%d connect failed: %s",
                   cid, st->stream_id, strerror(-res));
         h2_stream_rst(sess, st, NGHTTP2_CONNECT_ERROR);
+        return;
+    }
+
+    /* gRPC streams use h2c to the backend — forward-declared below */
+    if (st->is_grpc) {
+        h2_grpc_backend_init(sess, st);
         return;
     }
 

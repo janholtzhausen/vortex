@@ -23,6 +23,55 @@
 #define H2_MAX_STREAMS       32
 #define H2_STREAM_SLOTS      32
 
+/* gRPC backend (h2c) header/trailer storage limits */
+#define H2_GRPC_MAX_HDRS      32
+#define H2_GRPC_MAX_TRAILERS  16
+#define H2_GRPC_HDR_NAME_MAX  64
+#define H2_GRPC_HDR_VAL_MAX   256
+
+struct h2_grpc_hdr {
+    char name [H2_GRPC_HDR_NAME_MAX];
+    char value[H2_GRPC_HDR_VAL_MAX];
+};
+
+/*
+ * State for the backend h2c leg of a gRPC stream.
+ * Heap-allocated via h2_stream.grpc; freed in h2_stream_cleanup.
+ *
+ * nghttp2 is used as a client against the backend — it handles H2 preface,
+ * SETTINGS exchange, HPACK, and frame framing.  We feed raw bytes received
+ * from the backend into nghttp2_session_mem_recv and drain nghttp2 output
+ * (SETTINGS_ACK, WINDOW_UPDATE, etc.) back to the backend via io_uring.
+ */
+struct h2_grpc_backend {
+    nghttp2_session  *ngh2;         /* nghttp2 client session */
+    struct h2_session *sess;        /* parent frontend session */
+    int32_t           stream_id;    /* nghttp2 client stream ID (always 1) */
+
+    /* Pending bytes to send to backend (nghttp2 client output) */
+    uint8_t  *send_buf;
+    uint32_t  send_len;
+    uint32_t  send_cap;
+    bool      send_in_flight;
+
+    /* Per-recv scratch buffer for raw bytes from backend */
+    uint8_t   recv_buf[16384];
+
+    /* Request body offset for the nghttp2 data-provider callback */
+    uint32_t  req_body_sent;
+
+    /* Response headers received from backend HEADERS frame */
+    struct h2_grpc_hdr resp_hdrs[H2_GRPC_MAX_HDRS];
+    int                resp_nhdrs;
+    int                resp_status;   /* numeric HTTP status from :status */
+    bool               resp_hdrs_done;
+
+    /* Trailers received from backend trailing HEADERS frame (END_STREAM) */
+    struct h2_grpc_hdr trailers[H2_GRPC_MAX_TRAILERS];
+    int                ntrailers;
+    bool               trailers_done;
+};
+
 /* Initial output buffer for nghttp2_session_mem_send → io_uring SEND */
 #define H2_SEND_BUF_SIZE     (32 * 1024)
 
@@ -41,6 +90,7 @@ typedef enum {
     H2_STREAM_SENDING_REQ,   /* sending HTTP/1.1 request to backend */
     H2_STREAM_WAITING_RESP,  /* request sent, awaiting backend response */
     H2_STREAM_STREAMING,     /* receiving backend response, sending to client */
+    H2_STREAM_GRPC_ACTIVE,   /* h2c backend active, exchanging gRPC frames */
     H2_STREAM_CLOSING,       /* RST or error */
 } h2_stream_state_t;
 
@@ -88,6 +138,10 @@ struct h2_stream {
 
     uint8_t  slot;              /* index in h2_session.streams[] */
     uint32_t cid;               /* parent connection id */
+
+    /* gRPC proxying (h2c backend).  Non-NULL only when is_grpc = true. */
+    bool                   is_grpc;
+    struct h2_grpc_backend *grpc;
 };
 
 /*
@@ -134,3 +188,9 @@ void h2_on_backend_send(struct worker *w, uint32_t cid, uint32_t slot, int sent)
 
 /* Called from VORTEX_OP_H2_RECV_BACKEND completion */
 void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n);
+
+/* Called from VORTEX_OP_H2_GRPC_SEND_BACKEND completion */
+void h2_on_grpc_backend_send(struct worker *w, uint32_t cid, uint32_t slot, int sent);
+
+/* Called from VORTEX_OP_H2_GRPC_RECV_BACKEND completion */
+void h2_on_grpc_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n);

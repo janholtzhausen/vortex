@@ -27,6 +27,8 @@
 #define VORTEX_OP_H2_CONNECT         20 /* async TCP connect to backend for H2 stream */
 #define VORTEX_OP_H2_SEND_BACKEND    21 /* send HTTP/1.1 request to H2 stream backend */
 #define VORTEX_OP_H2_RECV_BACKEND    22 /* recv HTTP/1.1 response from H2 stream backend */
+#define VORTEX_OP_H2_GRPC_SEND_BACKEND 23 /* send nghttp2-client output to gRPC backend (h2c) */
+#define VORTEX_OP_H2_GRPC_RECV_BACKEND 24 /* recv raw bytes from gRPC backend (h2c) */
 
 /*
  * H2 user_data encoding — encodes op, stream slot, and connection id.

@@ -416,8 +416,10 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 #ifdef VORTEX_H2
     /* H2 backend ops encode (slot << 12) | cid in the lower 32 bits —
      * extract the real cid with URING_UD_H2_CID before the pool capacity check. */
-    if (op == VORTEX_OP_H2_CONNECT || op == VORTEX_OP_H2_SEND_BACKEND ||
-        op == VORTEX_OP_H2_RECV_BACKEND) {
+    if (op == VORTEX_OP_H2_CONNECT        || op == VORTEX_OP_H2_SEND_BACKEND ||
+        op == VORTEX_OP_H2_RECV_BACKEND   ||
+        op == VORTEX_OP_H2_GRPC_SEND_BACKEND ||
+        op == VORTEX_OP_H2_GRPC_RECV_BACKEND) {
         uint32_t h2_cid  = URING_UD_H2_CID(cqe->user_data);
         uint32_t h2_slot = URING_UD_H2_SLOT(cqe->user_data);
         if (h2_cid >= w->pool.capacity) return;
@@ -427,8 +429,12 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             h2_on_backend_connect(w, h2_cid, h2_slot, cqe->res);
         else if (op == VORTEX_OP_H2_SEND_BACKEND)
             h2_on_backend_send(w, h2_cid, h2_slot, cqe->res);
-        else
+        else if (op == VORTEX_OP_H2_RECV_BACKEND)
             h2_on_backend_recv(w, h2_cid, h2_slot, cqe->res);
+        else if (op == VORTEX_OP_H2_GRPC_SEND_BACKEND)
+            h2_on_grpc_backend_send(w, h2_cid, h2_slot, cqe->res);
+        else
+            h2_on_grpc_backend_recv(w, h2_cid, h2_slot, cqe->res);
         return;
     }
 #endif
