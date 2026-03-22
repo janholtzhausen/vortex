@@ -55,7 +55,9 @@ struct __attribute__((aligned(64))) conn_hot {
     uint32_t      send_buf_off;    /* Current send offset */
     uint32_t      recv_buf_len;
     uint32_t      send_buf_len;
-    uint8_t       _pad2[24];
+    uint8_t       ct_compressible; /* 1 = Content-Type is compressible (text/html, json, etc.); set on first RECV_BACKEND chunk; used to gate splice */
+    uint8_t       zc_notif_count;  /* in-flight send_zc notifications pending (see VORTEX_OP_SEND_CLIENT_ZC) */
+    uint8_t       _pad2[22];
 };
 _Static_assert(sizeof(struct conn_hot) == 128, "conn_hot must be 128 bytes");
 

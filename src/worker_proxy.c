@@ -1309,6 +1309,33 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
         }
 
+        /* ---- Record compressibility for splice gating ----
+         * Scan the Content-Type header on the first response chunk so subsequent
+         * chunks can be delivered via splice only when the type is non-compressible
+         * (images, video, binary).  Compressible types (HTML, JSON, text) have their
+         * first chunk potentially compressed on egress — splice would then deliver
+         * remaining chunks uncompressed, causing Content-Length mismatch. */
+        {
+            uint8_t *sbuf_ct = conn_send_buf(&w->pool, cid);
+            const uint8_t *hend_ct = (const uint8_t *)FIND_HDR_END(sbuf_ct, (size_t)n);
+            size_t hdr_scan_len = hend_ct
+                ? (size_t)(hend_ct - sbuf_ct) + 4
+                : (size_t)n;
+            const uint8_t *cth2 = (const uint8_t *)memmem(
+                sbuf_ct, hdr_scan_len, "\r\nContent-Type:", 15);
+            if (!cth2) cth2 = (const uint8_t *)memmem(
+                sbuf_ct, hdr_scan_len, "\r\ncontent-type:", 15);
+            if (cth2) {
+                const uint8_t *ctv2 = cth2 + 15;
+                while (*ctv2 == ' ') ctv2++;
+                size_t ct_rem2 = (size_t)(sbuf_ct + hdr_scan_len - ctv2);
+                h->ct_compressible = is_compressible_type(ctv2, ct_rem2) ? 1 : 0;
+            } else {
+                /* No Content-Type — treat as non-compressible (safe for splice) */
+                h->ct_compressible = 0;
+            }
+        }
+
         /* ---- Brotli / gzip compression ----
          * Only on complete single-chunk responses (Content-Length present and
          * matching) with a compressible Content-Type.  Prefer brotli (br) when
@@ -1420,9 +1447,21 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         h->send_buf_len = (uint32_t)n;
         struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
         if (!sqe) { conn_close(w, cid, true); break; }
-        PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-            conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+        if (w->uring.bufs_registered && !(h->flags & CONN_FLAG_KTLS_TX)) {
+            /* Zero-copy: kernel reads directly from pinned registered buffer.
+             * Two CQEs: completion (bytes transferred) + notification (buffer released).
+             * We arm next recv only after the notification — see SEND_CLIENT_ZC handler. */
+            h->zc_notif_count++;
+            io_uring_prep_send_zc_fixed(sqe, h->client_fd,
+                conn_send_buf(&w->pool, cid), (size_t)n,
+                MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
+            if (w->uring.files_registered) sqe->flags |= IOSQE_FIXED_FILE;
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
+        } else {
+            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+        }
         uring_submit(&w->uring);
         break;
     }
@@ -1472,6 +1511,16 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         }
 
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+            /* Zero-copy splice: only safe for non-compressible types (images, video,
+             * already-compressed media). Compressible types (HTML, JSON, text) have
+             * their first chunk compressed on egress — splice would then deliver the
+             * remainder uncompressed, causing Content-Length mismatch. */
+            if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
+                !(h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) &&
+                !h->ct_compressible) {
+                begin_splice(w, cid, h);
+                break;
+            }
             /* Still reading backend response — get next chunk */
             struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
             if (!sqe) { conn_close(w, cid, true); break; }
@@ -1740,6 +1789,50 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
         sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
         uring_submit(&w->uring);
+        break;
+    }
+
+    case VORTEX_OP_SEND_CLIENT_ZC: {
+        /*
+         * Two CQEs per send_zc_fixed operation:
+         *
+         * 1. Completion CQE (IORING_CQE_F_MORE set, IORING_CQE_F_NOTIF clear):
+         *    res = bytes transferred. Process partial sends here.
+         *    Buffer is still pinned — do NOT arm next recv yet.
+         *
+         * 2. Notification CQE (IORING_CQE_F_NOTIF set):
+         *    res = 0. Kernel has released the buffer. Safe to arm next recv.
+         *
+         * zc_notif_count tracks outstanding notifications so we handle partial
+         * sends (multiple in-flight ZC ops) and stale NOTIFs on reused slots.
+         */
+        if (cqe->flags & IORING_CQE_F_NOTIF) {
+            /* Buffer released — decrement counter and arm next recv if all done */
+            if (h->zc_notif_count > 0) h->zc_notif_count--;
+            if (h->zc_notif_count == 0) {
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+                if (!sqe) { conn_close(w, cid, true); break; }
+                if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+                    /* More backend data expected — re-arm backend recv */
+                    PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+                        conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+                } else {
+                    /* Response complete — arm next client request (keep-alive) */
+                    PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                        conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+                }
+                uring_submit(&w->uring);
+            }
+            break;
+        }
+
+        /* Completion CQE */
+        int zc_sent = cqe->res;
+        if (zc_sent <= 0) { conn_close(w, cid, true); break; }
+        h->bytes_out += (uint32_t)zc_sent;
+        /* Note: do NOT arm next recv here — wait for the NOTIF CQE */
         break;
     }
 

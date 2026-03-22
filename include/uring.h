@@ -21,6 +21,7 @@
 #define VORTEX_OP_TLS_DONE           14 /* tls_pool result pipe became readable */
 #define VORTEX_OP_SEND_BACKEND_WS    15 /* send client WS frame to backend (after RECV_CLIENT_WS) */
 #define VORTEX_OP_SEND_CLIENT_WS     16 /* send backend WS frame to client (after RECV_BACKEND_WS) */
+#define VORTEX_OP_SEND_CLIENT_ZC     17 /* zero-copy send to client (two-CQE: completion + notification) */
 /* Legacy aliases */
 #define VORTEX_OP_RECV  VORTEX_OP_RECV_CLIENT
 #define VORTEX_OP_SEND  VORTEX_OP_SEND_BACKEND
