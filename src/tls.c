@@ -86,14 +86,15 @@ static int sni_callback(SSL *ssl, int *al, void *arg)
     return SSL_TLSEXT_ERR_OK;
 }
 
-/* ALPN: temporarily advertise only HTTP/1.1.
- * The current H2 frontend bypasses the established proxy/cache/rewrite path. */
+/* ALPN: prefer h2 over http/1.1 for TCP connections.
+ * HTTP/3 clients use QUIC and never reach this callback. */
 static int alpn_select_cb(SSL *ssl, const uint8_t **out, uint8_t *outlen,
                            const uint8_t *in, unsigned int inlen, void *arg)
 {
     (void)ssl; (void)arg;
-    /* Wire-format protocol list: length byte followed by name bytes */
+    /* Wire-format: length-prefixed protocol names, server preference order */
     static const uint8_t protos[] = {
+        2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1',
     };
     if (SSL_select_next_proto((uint8_t **)out, outlen,

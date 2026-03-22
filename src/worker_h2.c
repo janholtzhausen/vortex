@@ -382,12 +382,35 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
  * Build the HTTP/1.1 request in heap-allocated req_http11.
  * Includes method, path, Host header, forwarded headers, and body.
  */
-static int h2_build_http11_request(struct h2_stream *st)
+static int h2_build_http11_request(struct h2_stream *st, const char *backend_creds)
 {
+    /* Base64-encode backend_credentials if present ("user:pass" → b64 string) */
+    char auth_hdr[512] = "";
+    if (backend_creds && backend_creds[0]) {
+        static const char b64tab[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const char *src  = backend_creds;
+        size_t      slen = strlen(src);
+        char b64[400];
+        size_t bi = 0;
+        for (size_t si = 0; si < slen && bi + 4 < sizeof(b64); si += 3) {
+            unsigned int v  = (unsigned char)src[si] << 16;
+            if (si+1 < slen) v |= (unsigned char)src[si+1] << 8;
+            if (si+2 < slen) v |= (unsigned char)src[si+2];
+            b64[bi++] = b64tab[(v >> 18) & 0x3f];
+            b64[bi++] = b64tab[(v >> 12) & 0x3f];
+            b64[bi++] = (si+1 < slen) ? b64tab[(v >> 6) & 0x3f] : '=';
+            b64[bi++] = (si+2 < slen) ? b64tab[v & 0x3f] : '=';
+        }
+        b64[bi] = '\0';
+        snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Basic %s\r\n", b64);
+    }
+
     /* Allocate generously: request line + host + headers + body + margin */
     size_t cap = 16 + strlen(st->path) + 14          /* "METHOD path HTTP/1.1\r\n" */
                + 7 + strlen(st->authority) + 4       /* "Host: authority\r\n" */
                + st->req_hdr_len                     /* forwarded headers */
+               + strlen(auth_hdr)                    /* backend auth header (may be "") */
                + 19                                   /* "Connection: close\r\n" */
                + 2                                    /* "\r\n" end-of-headers */
                + st->req_body_len
@@ -404,6 +427,9 @@ static int h2_build_http11_request(struct h2_stream *st)
                   st->method, st->path);
     /* Host */
     p += snprintf(p, (size_t)(end - p), "Host: %s\r\n", st->authority);
+    /* Backend auth (if configured) */
+    if (auth_hdr[0])
+        p += snprintf(p, (size_t)(end - p), "%s", auth_hdr);
     /* Forwarded request headers (already in "Name: Value\r\n" format) */
     if (st->req_hdr_len > 0 && (size_t)(end - p) > st->req_hdr_len) {
         memcpy(p, st->req_hdr_buf, st->req_hdr_len);
@@ -828,7 +854,10 @@ void h2_on_backend_connect(struct worker *w, uint32_t cid, uint32_t slot, int re
     }
 
     /* Build and send the HTTP/1.1 request */
-    if (h2_build_http11_request(st) != 0) {
+    int ri = conn_hot(&w->pool, cid)->route_idx;
+    const char *bcreds = (ri >= 0 && ri < (int)w->cfg->route_count)
+                         ? w->cfg->routes[ri].backend_credentials : "";
+    if (h2_build_http11_request(st, bcreds) != 0) {
         h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
         return;
     }
