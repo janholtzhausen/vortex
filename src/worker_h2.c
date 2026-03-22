@@ -361,17 +361,25 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
             continue;
         }
 
-        /* Server header obfuscation — same as H1.1 path */
-        if (name_len == 6 && memcmp(name_p, "server", 6) == 0
-            && w->cfg->server_header[0]) {
-            nvs[idx].name     = (uint8_t *)"server";
-            nvs[idx].namelen  = 6;
-            nvs[idx].value    = (uint8_t *)w->cfg->server_header;
-            nvs[idx].valuelen = strlen(w->cfg->server_header);
-            nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
-            idx++;
-            p = nl + 2;
-            continue;
+        /* Server header obfuscation — per-route overrides global; "none"/empty = pass through */
+        if (name_len == 6 && memcmp(name_p, "server", 6) == 0) {
+            int ri = (int)conn_hot(&w->pool, sess->cid)->route_idx;
+            const char *srv_hdr =
+                (ri >= 0 && ri < w->cfg->route_count &&
+                 w->cfg->routes[ri].server_header[0])
+                ? w->cfg->routes[ri].server_header
+                : w->cfg->server_header;
+            if (srv_hdr[0]) {
+                nvs[idx].name     = (uint8_t *)"server";
+                nvs[idx].namelen  = 6;
+                nvs[idx].value    = (uint8_t *)srv_hdr;
+                nvs[idx].valuelen = strlen(srv_hdr);
+                nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
+                idx++;
+                p = nl + 2;
+                continue;
+            }
+            /* srv_hdr is empty → fall through and pass the backend value unchanged */
         }
 
         /* Cache-Control: override for static assets, pass through for dynamic */

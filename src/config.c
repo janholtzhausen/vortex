@@ -168,7 +168,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "log_level"))      snprintf(c->log_level, sizeof(c->log_level), "%s", val);
         else if (!strcmp(k, "log_format"))     snprintf(c->log_format, sizeof(c->log_format), "%s", val);
         else if (!strcmp(k, "pid_file"))       snprintf(c->pid_file, sizeof(c->pid_file), "%s", val);
-        else if (!strcmp(k, "server_header"))  snprintf(c->server_header, sizeof(c->server_header), "%s", val);
+        else if (!strcmp(k, "server_header"))  snprintf(c->server_header, sizeof(c->server_header), "%s", !strcmp(val,"none") ? "" : val);
         break;
 
     case P_TLS:
@@ -231,6 +231,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         if      (!strcmp(k, "backend_timeout_ms")) r->backend_timeout_ms = (uint32_t)atol(val);
         else if (!strcmp(k, "x_api_key"))    snprintf(r->x_api_key, sizeof(r->x_api_key), "%s", val);
         else if (!strcmp(k, "backend_credentials")) snprintf(r->backend_credentials, sizeof(r->backend_credentials), "%s", val);
+        else if (!strcmp(k, "server_header")) snprintf(r->server_header, sizeof(r->server_header), "%s", !strcmp(val,"none") ? "" : val);
         else if (!strcmp(k, "hostname"))     snprintf(r->hostname, sizeof(r->hostname), "%s", val);
         else if (!strcmp(k, "load_balancing")) {
             if      (!strcmp(val,"weighted_round_robin")) r->lb_algo = LB_WEIGHTED_ROUND_ROBIN;

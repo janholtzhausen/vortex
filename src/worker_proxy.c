@@ -1095,9 +1095,12 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             size_t hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
 
             /* ---- Replace/inject Server header ----
-             * Uses cfg->server_header (configurable); empty string = pass through. */
-            if (w->cfg->server_header[0]) {
-                const char *new_srv = w->cfg->server_header;
+             * Per-route server_header takes priority over global; empty = pass through. */
+            const char *_srv_hdr = w->cfg->routes[h->route_idx].server_header[0]
+                                   ? w->cfg->routes[h->route_idx].server_header
+                                   : w->cfg->server_header;
+            if (_srv_hdr[0]) {
+                const char *new_srv = _srv_hdr;
                 size_t new_srv_len  = strlen(new_srv);
                 uint8_t *sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nServer:", 9);
                 if (!sh) sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nserver:", 9);

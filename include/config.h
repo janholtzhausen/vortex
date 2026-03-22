@@ -88,6 +88,9 @@ struct route_config {
      * any proxy-level Authorization header.  Useful when the backend
      * requires its own HTTP auth independently of the proxy auth layer. */
     char backend_credentials[320];
+
+    /* Per-route Server header override.  Empty = use global server_header. */
+    char server_header[128];
 };
 
 struct xdp_config {
