@@ -78,10 +78,15 @@ struct h2_grpc_backend {
 /* Backend receive buffer per stream */
 #define H2_STREAM_RECV_CAP   (256 * 1024)
 
-/* Maximum accumulated backend response (body + headers).
- * The current H2 path buffers the full backend response before submission, and
- * modern frontend bundles can exceed 4 MiB. */
-#define H2_RESP_MAX          (16 * 1024 * 1024)
+/* Maximum accumulated backend response for the *buffered* path
+ * (Transfer-Encoding: chunked responses that cannot be streamed).
+ * Non-chunked responses are streamed and have no fixed size cap. */
+#define H2_RESP_MAX          (64 * 1024 * 1024)
+
+/* Streaming backpressure: stop reading from backend when this many body bytes
+ * are pending in resp_buf but not yet consumed by the nghttp2 data provider.
+ * Limits per-stream memory to ~2 × this value (one window of unread + one recv). */
+#define H2_STREAM_BUF_MAX    (1 * 1024 * 1024)
 
 typedef enum {
     H2_STREAM_FREE = 0,
@@ -126,8 +131,13 @@ struct h2_stream {
     bool     resp_headers_done; /* \r\n\r\n found in resp_buf */
     uint32_t resp_hdr_end;      /* byte offset of end of headers (past \r\n\r\n) */
     bool     backend_eof;       /* backend closed connection */
-    bool     resp_submitted;    /* nghttp2_submit_response2 called */
+    bool     resp_submitted;    /* nghttp2_submit_response called */
     uint32_t resp_body_sent;    /* bytes already given to nghttp2 data provider */
+
+    /* Streaming (non-chunked) path: response submitted as soon as headers
+     * arrive; body bytes fed incrementally via NGHTTP2_ERR_DEFERRED. */
+    bool     is_chunked_resp;      /* Transfer-Encoding: chunked → use buffered path */
+    bool     backend_recv_paused;  /* recv not re-armed; resume after client drains */
 
     /* Partial HTTP/1.1 request send tracking */
     uint32_t req_send_off;      /* bytes of assembled request already sent */

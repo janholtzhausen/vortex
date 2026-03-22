@@ -182,7 +182,15 @@ static ssize_t h2_data_source_read(nghttp2_session *ngh2,
     uint32_t remaining  = body_total - st->resp_body_sent;
 
     if (remaining == 0) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        if (st->backend_eof) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            /* gRPC: keep stream open for trailers (nghttp2_submit_trailer follows) */
+            if (st->is_grpc && st->grpc && st->grpc->ntrailers > 0)
+                *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        } else {
+            /* Streaming: body not yet complete — defer until next backend recv */
+            return NGHTTP2_ERR_DEFERRED;
+        }
         return 0;
     }
 
@@ -190,9 +198,8 @@ static ssize_t h2_data_source_read(nghttp2_session *ngh2,
     memcpy(buf, st->resp_buf + body_start + st->resp_body_sent, to_copy);
     st->resp_body_sent += (uint32_t)to_copy;
 
-    if (st->resp_body_sent >= body_total) {
+    if (st->resp_body_sent >= body_total && st->backend_eof) {
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        /* gRPC: keep stream open for trailers (nghttp2_submit_trailer follows) */
         if (st->is_grpc && st->grpc && st->grpc->ntrailers > 0)
             *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
     }
@@ -465,9 +472,14 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
         .read_callback = h2_data_source_read,
     };
 
+    /* Use a data provider when there is body data OR when the backend is
+     * still writing (streaming path — data provider will DEFERRED until
+     * more bytes arrive).  Skip only when we are at EOF with zero body. */
+    bool use_provider = (body_len > 0) || !st->backend_eof;
+
     int rv = nghttp2_submit_response(sess->ngh2, st->stream_id,
                                      nvs, (size_t)idx,
-                                     body_len > 0 ? &dp : NULL);
+                                     use_provider ? &dp : NULL);
     free(nvs);
     if (rv != 0) {
         log_error("h2_resp", "nghttp2_submit_response2 stream=%d: %s",
@@ -964,6 +976,20 @@ void h2_on_send_client(struct worker *w, uint32_t cid, int sent)
 
     /* Drain any remaining nghttp2 output */
     h2_send_pending(sess);
+
+    /* Un-pause any streaming streams that were waiting for the client to drain.
+     * The client send just completed, so the send buffer has room; H2 WINDOW
+     * may have grown; re-arm backend recvs that were held back. */
+    for (int i = 0; i < H2_STREAM_SLOTS; i++) {
+        struct h2_stream *st = &sess->streams[i];
+        if (!st->backend_recv_paused) continue;
+        uint32_t pending = (st->resp_buf_len > st->resp_hdr_end + st->resp_body_sent)
+                           ? st->resp_buf_len - st->resp_hdr_end - st->resp_body_sent : 0u;
+        if (pending < H2_STREAM_BUF_MAX) {
+            st->backend_recv_paused = false;
+            h2_arm_backend_recv(sess, st);
+        }
+    }
 }
 
 /* ================================================================== */
@@ -1464,22 +1490,31 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
         /* Backend EOF — response complete */
         st->backend_eof = true;
         if (!st->resp_headers_done) {
-            /* Truncated response */
             h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
             return;
         }
-        h2_submit_response(sess, st);
+        if (st->is_chunked_resp || !st->resp_submitted) {
+            /* Buffered path or streaming path where headers just arrived */
+            h2_submit_response(sess, st);
+        } else {
+            /* Streaming path: data provider is deferred — resume so it can signal EOF */
+            nghttp2_session_resume_data(sess->ngh2, st->stream_id);
+            h2_send_pending(sess);
+        }
         return;
     }
 
     if (n < 0) {
         if (n == -ECONNRESET || n == -EPIPE) {
-            /* Treat same as EOF after partial response */
             st->backend_eof = true;
-            if (st->resp_headers_done)
-                h2_submit_response(sess, st);
-            else
+            if (!st->resp_headers_done) {
                 h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+            } else if (st->is_chunked_resp || !st->resp_submitted) {
+                h2_submit_response(sess, st);
+            } else {
+                nghttp2_session_resume_data(sess->ngh2, st->stream_id);
+                h2_send_pending(sess);
+            }
         } else {
             h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
         }
@@ -1496,17 +1531,68 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
         if (hdr_end) {
             st->resp_headers_done = true;
             st->resp_hdr_end = (uint32_t)(hdr_end - st->resp_buf) + 4;
+
+            /* Detect Transfer-Encoding: chunked → use buffered path */
+            const uint8_t *te = (const uint8_t *)memmem(
+                st->resp_buf, st->resp_hdr_end, "Transfer-Encoding:", 18);
+            if (!te) te = (const uint8_t *)memmem(
+                st->resp_buf, st->resp_hdr_end, "transfer-encoding:", 18);
+            if (te) {
+                const uint8_t *eol = (const uint8_t *)memmem(
+                    te, (size_t)(st->resp_buf + st->resp_hdr_end - te), "\r\n", 2);
+                if (eol && memmem(te, (size_t)(eol - te), "chunked", 7))
+                    st->is_chunked_resp = true;
+            }
+
+            /* Streaming path: submit response immediately so headers reach the
+             * client without waiting for the full body. */
+            if (!st->is_chunked_resp)
+                h2_submit_response(sess, st);
         }
     }
 
-    /* Check for oversize response */
-    if (st->resp_buf_len >= H2_RESP_MAX) {
-        log_warn("h2_recv", "cid=%u stream=%d response too large (>%u), RST",
-                 cid, st->stream_id, H2_RESP_MAX);
-        h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+    if (st->is_chunked_resp) {
+        /* Buffered path — accumulate until EOF then submit */
+        if (st->resp_buf_len >= H2_RESP_MAX) {
+            log_warn("h2_recv", "cid=%u stream=%d chunked response too large (>%u), RST",
+                     cid, st->stream_id, H2_RESP_MAX);
+            h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+            return;
+        }
+        h2_arm_backend_recv(sess, st);
         return;
     }
 
-    /* Continue receiving */
-    h2_arm_backend_recv(sess, st);
+    /* Streaming path ------------------------------------------------ */
+
+    /* Compact: discard body bytes already handed to nghttp2 data provider.
+     * This bounds resp_buf memory to roughly H2_STREAM_BUF_MAX regardless
+     * of total response size. */
+    if (st->resp_submitted && st->resp_body_sent > 0) {
+        uint32_t body_start = st->resp_hdr_end;
+        uint32_t remaining  = st->resp_buf_len - body_start - st->resp_body_sent;
+        if (remaining > 0)
+            memmove(st->resp_buf + body_start,
+                    st->resp_buf + body_start + st->resp_body_sent, remaining);
+        st->resp_buf_len  -= st->resp_body_sent;
+        st->resp_body_sent = 0;
+    }
+
+    /* Wake data provider and flush to client */
+    if (st->resp_submitted) {
+        nghttp2_session_resume_data(sess->ngh2, st->stream_id);
+        h2_send_pending(sess);
+    }
+
+    /* Backpressure: pause backend recv when the client is too slow to drain.
+     * The recv is re-armed in h2_on_send_client once the client catches up. */
+    uint32_t pending = (st->resp_buf_len > st->resp_hdr_end + st->resp_body_sent)
+                       ? st->resp_buf_len - st->resp_hdr_end - st->resp_body_sent : 0u;
+    if (pending < H2_STREAM_BUF_MAX) {
+        h2_arm_backend_recv(sess, st);
+    } else {
+        st->backend_recv_paused = true;
+        log_debug("h2_stream", "cid=%u stream=%d recv paused (pending=%u)",
+                  cid, st->stream_id, pending);
+    }
 }
