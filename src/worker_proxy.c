@@ -1450,6 +1450,8 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         if (!sqe) { conn_close(w, cid, true); break; }
         if (w->uring.bufs_registered && !(h->flags & CONN_FLAG_KTLS_TX)) {
             /* Zero-copy: kernel reads directly from pinned registered buffer.
+             * send_zc is incompatible with kTLS TX (like splice) — the kernel
+             * cannot handle zero-copy sends through the kTLS record layer.
              * Two CQEs: completion (bytes transferred) + notification (buffer released).
              * We arm next recv only after the notification — see SEND_CLIENT_ZC handler. */
             h->zc_notif_count++;
