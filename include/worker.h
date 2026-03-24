@@ -52,7 +52,7 @@ struct worker {
     uint64_t         tls13_count;   /* TLS 1.3 handshakes */
     uint64_t         ktls_count;    /* connections using kTLS */
 
-    struct cache     cache;
+    struct cache    *cache;
 
     /* Tarpit: unrecognised-SNI connections held with window=1 */
     int              tarpit_fds[WORKER_TARPIT_MAX];
@@ -104,7 +104,8 @@ int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ip
  * capacity = connection pool size (use worker_pool_capacity() to auto-size).
  * tls may be NULL for plain HTTP mode. */
 int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
-                struct vortex_config *cfg, struct tls_ctx *tls);
+                struct vortex_config *cfg, struct tls_ctx *tls,
+                struct cache *shared_cache);
 
 /* Compute connection pool capacity for one worker from available system memory.
  * budget_pct: fraction of MemAvailable to use across all workers (e.g. 0.5).

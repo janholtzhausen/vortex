@@ -107,7 +107,7 @@ bool chunked_decode_append(struct conn_cold *cold,
 void cache_chunked_store(struct worker *w, uint32_t cid,
                          struct conn_hot *h, struct conn_cold *cold)
 {
-    if (!cold->chunk_buf || cold->chunk_body_len == 0 || !w->cache.index)
+    if (!cold->chunk_buf || cold->chunk_body_len == 0 || !w->cache || !w->cache->index)
         goto cleanup;
 
     /* Scratch = recv_buf (client recv is idle during backend streaming) */
@@ -159,7 +159,7 @@ void cache_chunked_store(struct worker *w, uint32_t cid,
         out += (size_t)cl_len;
     } else goto cleanup;
 
-    cache_store(&w->cache, cold->chunk_url, strlen(cold->chunk_url),
+    cache_store(w->cache, cold->chunk_url, strlen(cold->chunk_url),
                 200, cold->chunk_ttl,
                 scratch, out,
                 cold->chunk_buf + cold->chunk_hdr_len, cold->chunk_body_len);

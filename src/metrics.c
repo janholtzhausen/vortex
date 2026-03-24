@@ -1,6 +1,7 @@
 #include "metrics.h"
 #include "log.h"
 #include "bpf_loader.h"
+#include "tls_pool.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +74,29 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
             "vortex_ktls_connections_total", "Connections using kernel TLS", total_ktls);
     }
 
+    {
+        struct tls_pool_stats tls_stats = {0};
+        tls_pool_snapshot(&tls_stats);
+        write_metric_gauge(buf, &pos, bufsz,
+            "vortex_tls_pool_queue_depth", "Pending TLS handshakes in the pool queue",
+            tls_stats.queue_depth);
+        write_metric_gauge(buf, &pos, bufsz,
+            "vortex_tls_pool_active_handshakes", "TLS handshakes currently executing",
+            tls_stats.active_handshakes);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_tls_pool_submitted_total", "TLS handshakes submitted to the pool",
+            tls_stats.submitted_total);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_tls_pool_completed_total", "TLS handshakes completed successfully",
+            tls_stats.completed_total);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_tls_pool_failed_total", "TLS handshakes that failed in the pool",
+            tls_stats.failed_total);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_tls_pool_dropped_total", "TLS handshakes dropped because the pool queue was full",
+            tls_stats.dropped_total);
+    }
+
     /* Cert expiry */
     if (ms->cert_info && ms->cert_info_count > 0) {
         for (int i = 0; i < ms->cert_info_count; i++) {
@@ -86,17 +110,27 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
         }
     }
 
-    /* Cache metrics */
+    uint64_t cache_hits = 0, cache_misses = 0, cache_evictions = 0;
+    uint64_t cache_stores = 0, cache_slab_bytes = 0;
     if (ms->cache) {
+        cache_hits       = ms->cache->hits;
+        cache_misses     = ms->cache->misses;
+        cache_evictions  = ms->cache->evictions;
+        cache_stores     = ms->cache->stores;
+        cache_slab_bytes = ms->cache->slab_size;
+    }
+    if (cache_hits || cache_misses || cache_evictions || cache_stores || cache_slab_bytes) {
         write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_hits_total", "Cache hits", ms->cache->hits);
+            "vortex_cache_hits_total", "Cache hits", cache_hits);
         write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_misses_total", "Cache misses", ms->cache->misses);
+            "vortex_cache_misses_total", "Cache misses", cache_misses);
         write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_evictions_total", "Cache evictions", ms->cache->evictions);
+            "vortex_cache_evictions_total", "Cache evictions", cache_evictions);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_cache_stores_total", "Cache stores", cache_stores);
         write_metric_gauge(buf, &pos, bufsz,
             "vortex_cache_memory_bytes", "Cache slab memory bytes",
-            (uint64_t)ms->cache->slab_size);
+            cache_slab_bytes);
     }
 
     /* XDP/BPF metrics */

@@ -123,6 +123,7 @@ set(VORTEX_SRCS
     src/pool.c
     src/cache.c
     src/metrics.c
+    src/dashboard.c
     src/simd.c
 )
 

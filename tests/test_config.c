@@ -24,6 +24,7 @@ static void write_test_yaml(const char *path)
         "  workers: 4\n"
         "  bind_address: \"127.0.0.1\"\n"
         "  bind_port: 8443\n"
+        "  max_request_body_mb: 4\n"
         "  interface: \"lo\"\n"
         "  log_level: \"debug\"\n"
         "  log_format: \"text\"\n"
@@ -75,6 +76,8 @@ int main(void)
         config_set_defaults(&cfg);
         ASSERT(cfg.bind_port == 443,  "default bind_port=443");
         ASSERT(cfg.http_port == 80,   "default http_port=80");
+        ASSERT(cfg.max_request_body_bytes == 8U * 1024U * 1024U,
+            "default max_request_body_bytes=8MB");
         ASSERT(cfg.tls.ktls == true,  "default ktls=true");
         ASSERT(cfg.cache.enabled == true, "default cache.enabled=true");
         ASSERT(cfg.cache.index_entries == 16384, "default index_entries=16384");
@@ -91,6 +94,8 @@ int main(void)
         ASSERT(ret == 0, "config_load returns 0");
         ASSERT(cfg.workers == 4,      "workers=4");
         ASSERT(cfg.bind_port == 8443, "bind_port=8443");
+        ASSERT(cfg.max_request_body_bytes == 4U * 1024U * 1024U,
+            "max_request_body_mb=4");
         ASSERT(!strcmp(cfg.interface, "lo"), "interface=lo");
         ASSERT(!strcmp(cfg.log_level, "debug"), "log_level=debug");
         ASSERT(cfg.tls.ktls == false, "tls.ktls=false");

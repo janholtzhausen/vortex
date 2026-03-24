@@ -2,6 +2,7 @@
 
 #ifdef VORTEX_QUIC
 
+#include "cache.h"
 #include "config.h"
 #include "tls.h"
 #include <stdint.h>
@@ -25,6 +26,7 @@ struct quic_server;
  */
 int  quic_server_init(struct quic_server **out,
                       struct tls_ctx *tls,
+                      struct cache *cache,
                       struct vortex_config *cfg,
                       const char *bind_addr,
                       uint16_t port);

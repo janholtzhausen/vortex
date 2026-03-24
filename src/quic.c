@@ -61,6 +61,7 @@ struct quic_stream {
 
     uint8_t *req_body;
     size_t   req_body_len;
+    bool     req_too_large;
     bool     headers_done;
     bool     request_done;
 
@@ -75,6 +76,13 @@ struct quic_stream {
 static int  conn_send(struct quic_conn *c);
 static void conn_free(struct quic_server *qs, struct quic_conn *c);
 static void submit_h3_response(struct quic_conn *c, struct quic_stream *s);
+
+static uint8_t *dup_http_response(const char *resp, size_t *out_len)
+{
+    uint8_t *buf = (uint8_t *)strdup(resp);
+    if (out_len) *out_len = buf ? strlen(resp) : 0;
+    return buf;
+}
 
 /* ---- Per-connection state ---- */
 struct quic_conn {
@@ -122,6 +130,7 @@ struct quic_server {
     int               conn_count;
 
     struct vortex_config *cfg;
+    struct cache         *cache;
     struct router         router;
 
     struct sockaddr_storage local_addr;
@@ -300,6 +309,33 @@ static void *proxy_thread(void *arg)
             }
         }
 
+        if (pa->server->cache && pa->server->cache->index &&
+            strcmp(pa->method, "GET") == 0 && len > 0) {
+            const uint8_t *hdr_end2 = memmem(buf, len, "\r\n\r\n", 4);
+            if (hdr_end2) {
+                size_t hdr_len = (size_t)(hdr_end2 + 4 - buf);
+                size_t body_len = len - hdr_len;
+                bool is_chunked =
+                    memmem(buf, hdr_len, "\r\nTransfer-Encoding:", 20) ||
+                    memmem(buf, hdr_len, "\r\ntransfer-encoding:", 20);
+                int status = 0;
+                if (len > 12) {
+                    const char *sp = (const char *)buf + 9;
+                    for (int i = 0; i < 3 && sp[i] >= '0' && sp[i] <= '9'; i++)
+                        status = status * 10 + (sp[i] - '0');
+                }
+                uint32_t ttl = cache_ttl_for_url(pa->url);
+                if (!is_chunked && status == 200 && ttl > 0 && body_len > 0) {
+                    char cache_key[1024];
+                    snprintf(cache_key, sizeof(cache_key), "%s|%s", pa->authority, pa->url);
+                    cache_store(pa->server->cache, cache_key, strlen(cache_key),
+                                (uint16_t)status, ttl, buf, hdr_len, buf + hdr_len, body_len);
+                    log_debug("h3_cache_store", "stream=%lld url=%s ttl=%u body=%zu",
+                              (long long)pa->stream_id, cache_key, ttl, body_len);
+                }
+            }
+        }
+
         resp_buf = buf;
         resp_len = len;
     }
@@ -333,6 +369,28 @@ push:;
 static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
 {
     struct quic_server *qs = c->server;
+
+    if (s->req_too_large) {
+        static const char r413[] =
+            "HTTP/1.1 413 Payload Too Large\r\n"
+            "Content-Length: 0\r\n\r\n";
+        s->resp_buf = dup_http_response(r413, &s->resp_len);
+        return;
+    }
+
+    if (qs->cache && qs->cache->index &&
+        s->method[0] && strcmp(s->method, "GET") == 0) {
+        char cache_key[1024];
+        snprintf(cache_key, sizeof(cache_key), "%s|%s", s->authority, s->url);
+        struct cached_response cached;
+        if (cache_fetch_copy(qs->cache, cache_key, strlen(cache_key), &cached) == 0) {
+            s->resp_buf = cached.data;
+            s->resp_len = cached.header_len + cached.body_len;
+            log_debug("h3_cache_hit", "stream=%lld url=%s",
+                      (long long)s->stream_id, cache_key);
+            return;
+        }
+    }
 
     int route_idx = 0;
     for (int i = 0; i < qs->cfg->route_count; i++) {
@@ -383,8 +441,7 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
 
 err_502:;
     static const char r502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-    s->resp_buf = (uint8_t *)strdup(r502);
-    s->resp_len = s->resp_buf ? sizeof(r502) - 1 : 0;
+    s->resp_buf = dup_http_response(r502, &s->resp_len);
 }
 
 /* ---- ngtcp2 callbacks ---- */
@@ -557,8 +614,21 @@ static int h3_recv_data(nghttp3_conn *h3, int64_t stream_id,
                          void *conn_user_data, void *stream_user_data)
 {
     (void)h3; (void)stream_user_data;
-    struct quic_stream *s = stream_find((struct quic_conn *)conn_user_data, stream_id);
+    struct quic_conn *c = (struct quic_conn *)conn_user_data;
+    struct quic_stream *s = stream_find(c, stream_id);
     if (!s) return 0;
+    if (s->req_too_large) return 0;
+
+    uint32_t limit = c->server->cfg->max_request_body_bytes;
+    if (limit > 0 && datalen > 0 &&
+        (datalen > (size_t)limit || s->req_body_len > (size_t)limit - datalen)) {
+        free(s->req_body);
+        s->req_body = NULL;
+        s->req_body_len = 0;
+        s->req_too_large = true;
+        return 0;
+    }
+
     uint8_t *nb = realloc(s->req_body, s->req_body_len + datalen);
     if (!nb) return NGHTTP3_ERR_CALLBACK_FAILURE;
     memcpy(nb + s->req_body_len, data, datalen);
@@ -672,6 +742,7 @@ static void submit_h3_response(struct quic_conn *c, struct quic_stream *s)
 #define MAX_H3_HDRS 32
     nghttp3_nv nva[MAX_H3_HDRS];
     size_t nvlen = 0;
+    bool hsts_seen = false;
 
     nva[nvlen++] = (nghttp3_nv){
         .name     = (const uint8_t *)":status",
@@ -718,6 +789,9 @@ static void submit_h3_response(struct quic_conn *c, struct quic_stream *s)
             rem -= (size_t)(lend + 2 - p); p = lend + 2; continue;
         }
 
+        if (nlen == 25 && strncasecmp(p, "strict-transport-security", 25) == 0)
+            hsts_seen = true;
+
         size_t nl2 = nlen < sizeof(hdr_names[0])-1 ? nlen : sizeof(hdr_names[0])-1;
         size_t vl2 = vlen < sizeof(hdr_vals[0])-1  ? vlen : sizeof(hdr_vals[0])-1;
         for (size_t i = 0; i < nl2; i++)
@@ -735,6 +809,16 @@ static void submit_h3_response(struct quic_conn *c, struct quic_stream *s)
         hi++;
 
         rem -= (size_t)(lend + 2 - p); p = lend + 2;
+    }
+
+    if (!hsts_seen && nvlen < MAX_H3_HDRS) {
+        static const uint8_t hsts[] = "max-age=31536000; includeSubDomains";
+        nva[nvlen++] = (nghttp3_nv){
+            .name     = (const uint8_t *)"strict-transport-security",
+            .value    = hsts,
+            .namelen  = 25,
+            .valuelen = sizeof(hsts) - 1,
+            .flags    = NGHTTP3_NV_FLAG_NONE };
     }
 
     /* Body */
@@ -1083,6 +1167,7 @@ static void *quic_thread(void *arg)
 
 int quic_server_init(struct quic_server **out,
                      struct tls_ctx *tls,
+                     struct cache *cache,
                      struct vortex_config *cfg,
                      const char *bind_addr,
                      uint16_t port)
@@ -1093,6 +1178,7 @@ int quic_server_init(struct quic_server **out,
     qs->comp_efd = -1;
 
     qs->cfg = cfg;
+    qs->cache = cache;
     if (router_init(&qs->router, cfg) != 0) { free(qs); return -1; }
 
     /* Build SSL_CTX per route */

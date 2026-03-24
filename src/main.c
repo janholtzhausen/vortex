@@ -15,6 +15,7 @@
 #include "worker.h"
 #include "pool.h"
 #include "metrics.h"
+#include "dashboard.h"
 #include "tls.h"
 #ifdef VORTEX_QUIC
 #include "quic.h"
@@ -93,7 +94,10 @@ static int    g_no_tls = 0;
 #define MAX_WORKERS 64
 static struct worker  g_workers[MAX_WORKERS];
 static int            g_num_workers = 0;
+static struct cache   g_shared_cache;
 static struct metrics_server g_metrics;
+static struct dashboard_server g_dashboard;
+static int            g_dashboard_started = 0;
 #ifdef VORTEX_QUIC
 static struct quic_server *g_quic = NULL;
 #endif
@@ -478,6 +482,23 @@ int main(int argc, char *argv[])
     /* Shared backend connection pool — must be initialised before workers start */
     global_pool_init();
 
+    struct cache *shared_cache = NULL;
+    if (g_cfg.cache.enabled) {
+        uint32_t entries = g_cfg.cache.index_entries > 0 ?
+            g_cfg.cache.index_entries : 16384;
+        size_t slab_bytes = g_cfg.cache.slab_size_bytes > 0 ?
+            g_cfg.cache.slab_size_bytes : (64ULL * 1024 * 1024);
+        size_t disk_bytes = (size_t)g_cfg.cache.disk_slab_size_bytes;
+        const char *disk_path = g_cfg.cache.disk_cache_path[0] ?
+            g_cfg.cache.disk_cache_path : NULL;
+        if (cache_init(&g_shared_cache, entries, slab_bytes,
+                       g_cfg.cache.use_hugepages, disk_path, disk_bytes) == 0) {
+            shared_cache = &g_shared_cache;
+        } else {
+            log_warn("main", "shared cache init failed — running without cache");
+        }
+    }
+
 #ifdef VORTEX_PHASE_TLS
     /* TLS handshake thread pool — shared across all workers */
     if (tls_ptr) tls_pool_init();
@@ -496,7 +517,8 @@ int main(int argc, char *argv[])
             num_workers = i;
             break;
         }
-        if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr) != 0) {
+        if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr,
+                        shared_cache) != 0) {
             log_error("main", "worker_init failed for worker %d", i);
             close(lfd);
             num_workers = i;
@@ -519,7 +541,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < num_workers; i++) worker_ptrs[i] = &g_workers[i];
     if (g_cfg.metrics.enabled) {
         metrics_init(&g_metrics, g_cfg.metrics.bind_address,
-            g_cfg.metrics.port, worker_ptrs, num_workers, NULL);
+            g_cfg.metrics.port, worker_ptrs, num_workers, shared_cache);
 #ifdef VORTEX_PHASE_TLS
         /* Populate cert expiry info for Prometheus */
         g_cert_info_count = 0;
@@ -543,10 +565,27 @@ int main(int argc, char *argv[])
         metrics_start(&g_metrics);
     }
 
+    if (g_cfg.dashboard.enabled) {
+        if (dashboard_init(&g_dashboard, g_cfg.dashboard.bind_address,
+                           g_cfg.dashboard.port, worker_ptrs, num_workers,
+                           shared_cache, &g_cfg) == 0) {
+            if (dashboard_start(&g_dashboard) != 0) {
+                log_warn("main", "dashboard thread start failed");
+                if (g_dashboard.listen_fd >= 0) {
+                    close(g_dashboard.listen_fd);
+                    g_dashboard.listen_fd = -1;
+                }
+            }
+            else g_dashboard_started = 1;
+        } else {
+            log_warn("main", "dashboard init failed");
+        }
+    }
+
 #ifdef VORTEX_QUIC
     /* Start QUIC/HTTP3 server (needs TLS to have been set up) */
     if (tls_ptr && tls_ptr->route_count > 0) {
-        if (quic_server_init(&g_quic, tls_ptr, &g_cfg,
+        if (quic_server_init(&g_quic, tls_ptr, shared_cache, &g_cfg,
                              g_cfg.bind_address, g_cfg.bind_port) == 0) {
             if (quic_server_start(g_quic) != 0) {
                 log_warn("main", "QUIC thread start failed");
@@ -609,6 +648,11 @@ int main(int argc, char *argv[])
         g_quic = NULL;
     }
 #endif
+    if (g_dashboard_started) {
+        dashboard_stop(&g_dashboard);
+        dashboard_join(&g_dashboard);
+        g_dashboard_started = 0;
+    }
     for (int i = 0; i < num_workers; i++) worker_stop(&g_workers[i]);
     for (int i = 0; i < num_workers; i++) {
         worker_join(&g_workers[i]);
@@ -621,6 +665,10 @@ int main(int argc, char *argv[])
     if (g_cfg.metrics.enabled) {
         metrics_stop(&g_metrics);
         metrics_join(&g_metrics);
+    }
+    if (shared_cache) {
+        cache_destroy(shared_cache);
+        shared_cache = NULL;
     }
 
     log_info("vortex_shutdown", "shutting down");

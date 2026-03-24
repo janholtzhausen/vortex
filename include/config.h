@@ -145,6 +145,12 @@ struct metrics_config {
     char     path[64];
 };
 
+struct dashboard_config {
+    bool     enabled;
+    char     bind_address[64];
+    uint16_t port;
+};
+
 struct vortex_config {
     /* global */
     int      workers;        /* 0 = auto (nproc) */
@@ -171,11 +177,16 @@ struct vortex_config {
      * Per-route congestion_control overrides this.  Empty = kernel default. */
     char congestion_control[16];
 
-    struct tls_config     tls;
-    struct xdp_config     xdp;
-    struct cache_config   cache;
-    struct acme_config    acme;
-    struct metrics_config metrics;
+    /* Maximum buffered client request body size for HTTP/2 and HTTP/3/QUIC.
+     * 0 disables the limit. */
+    uint32_t max_request_body_bytes;
+
+    struct tls_config      tls;
+    struct xdp_config      xdp;
+    struct cache_config    cache;
+    struct acme_config     acme;
+    struct metrics_config  metrics;
+    struct dashboard_config dashboard;
 
     struct route_config routes[VORTEX_MAX_ROUTES];
     int                 route_count;

@@ -35,6 +35,7 @@ global:
   log_level: "info"
   log_format: "json"
   pid_file: "/run/vortex.pid"
+  max_request_body_mb: 8
 
 tls:
   min_version: "1.2"
@@ -73,6 +74,11 @@ metrics:
   bind_address: "127.0.0.1"
   port: 9090
   path: "/metrics"
+
+dashboard:
+  enabled: true
+  bind_address: "127.0.0.1"
+  port: 9091
 
 routes:
   - hostname: "api.example.com"

@@ -582,6 +582,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         "HTTP/1.1 429 Too Many Requests\r\n"
                         "Content-Length: 0\r\n"
                         "Retry-After: 1\r\n"
+                        "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
                         "Connection: keep-alive\r\n\r\n";
                     struct io_uring_sqe *sqe429  = io_uring_get_sqe(&w->uring.ring);
                     struct io_uring_sqe *sqe429r = io_uring_get_sqe(&w->uring.ring);
@@ -615,6 +616,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                     "HTTP/1.1 401 Unauthorized\r\n"
                     "WWW-Authenticate: Basic realm=\"vortex\"\r\n"
                     "Content-Length: 0\r\n"
+                    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
                     "Connection: keep-alive\r\n\r\n";
                 struct io_uring_sqe *sqe401 = io_uring_get_sqe(&w->uring.ring);
                 struct io_uring_sqe *sqe401r = io_uring_get_sqe(&w->uring.ring);
@@ -669,7 +671,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         }
 
         /* Cache check: only for GET requests */
-        if (w->cache.index) {
+        if (w->cache && w->cache->index) {
             char method[16], url[512];
             const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
             if (parse_http_request_line(rbuf, n,
@@ -679,8 +681,8 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
                 char cache_key[640];
                 make_cache_key(rbuf, (size_t)n, url, cache_key, sizeof(cache_key));
-                struct cache_index_entry *ce = cache_lookup(&w->cache, cache_key, strlen(cache_key));
-                if (ce && cache_entry_valid(ce)) {
+                struct cached_response cached;
+                if (cache_fetch_copy(w->cache, cache_key, strlen(cache_key), &cached) == 0) {
                     /* Check If-None-Match for conditional GET */
                     char req_etag[64] = {0};
                     const uint8_t *inm = (const uint8_t *)memmem(rbuf, (size_t)n,
@@ -700,7 +702,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
                     char etag_str[20];
                     snprintf(etag_str, sizeof(etag_str), "%016llx",
-                             (unsigned long long)ce->body_etag);
+                             (unsigned long long)cached.body_etag);
 
                     if (req_etag[0] && strcmp(req_etag, etag_str) == 0) {
                         /* ETag matches → 304 Not Modified */
@@ -726,49 +728,49 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                 conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
                             sqer->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
                             uring_submit(&w->uring);
+                            cache_cached_response_free(&cached);
                             log_debug("cache_304", "conn=%u url=%s", cid, url);
                             break;
                         }
                     }
 
                     /* Full cache HIT — serve stored response + inject ETag / X-Cache */
-                    const uint8_t *resp = cache_response_ptr(&w->cache, ce);
-                    if (resp) {
-                        /* Extra headers to splice before the final \r\n\r\n */
-                        char extra[128];
-                        int extra_len = snprintf(extra, sizeof(extra),
-                            "ETag: \"%s\"\r\nX-Cache: HIT\r\n", etag_str);
+                    /* Extra headers to splice before the final \r\n\r\n */
+                    char extra[128];
+                    int extra_len = snprintf(extra, sizeof(extra),
+                        "ETag: \"%s\"\r\nX-Cache: HIT\r\n", etag_str);
 
-                        uint32_t stored_total = ce->header_len + ce->body_len;
-                        size_t serve_len = stored_total + (size_t)extra_len;
-                        uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+                    uint32_t stored_total = cached.header_len + cached.body_len;
+                    size_t serve_len = stored_total + (size_t)extra_len;
+                    uint8_t *sbuf = conn_send_buf(&w->pool, cid);
 
-                        if (serve_len <= w->pool.buf_size && ce->header_len >= 4) {
-                            /* Copy headers minus the blank-line terminator (\r\n).
-                             * The last header's own \r\n stays so extra headers
-                             * splice in cleanly without merging onto the same line. */
-                            size_t hdr_body = ce->header_len - 2;
-                            memcpy(sbuf, resp, hdr_body);
-                            memcpy(sbuf + hdr_body, extra, (size_t)extra_len);
-                            memcpy(sbuf + hdr_body + extra_len, "\r\n", 2);
-                            memcpy(sbuf + ce->header_len + extra_len,
-                                   resp + ce->header_len, ce->body_len);
+                    if (serve_len <= w->pool.buf_size && cached.header_len >= 4) {
+                        /* Copy headers minus the blank-line terminator (\r\n).
+                         * The last header's own \r\n stays so extra headers
+                         * splice in cleanly without merging onto the same line. */
+                        size_t hdr_body = cached.header_len - 2;
+                        memcpy(sbuf, cached.data, hdr_body);
+                        memcpy(sbuf + hdr_body, extra, (size_t)extra_len);
+                        memcpy(sbuf + hdr_body + extra_len, "\r\n", 2);
+                        memcpy(sbuf + cached.header_len + extra_len,
+                               cached.data + cached.header_len, cached.body_len);
 
-                            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-                            if (sqe) {
-                                h->send_buf_off = 0;
-                                h->send_buf_len = (uint32_t)serve_len;
-                                h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                                PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                                    sbuf, serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-                                uring_submit(&w->uring);
-                                log_debug("cache_hit", "conn=%u url=%s", cid, url);
-                                break;
-                            }
+                        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+                        if (sqe) {
+                            h->send_buf_off = 0;
+                            h->send_buf_len = (uint32_t)serve_len;
+                            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                                sbuf, serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+                            uring_submit(&w->uring);
+                            cache_cached_response_free(&cached);
+                            log_debug("cache_hit", "conn=%u url=%s", cid, url);
+                            break;
                         }
-                        /* Fall through to backend if response too large or no sqe */
                     }
+                    cache_cached_response_free(&cached);
+                    /* Fall through to backend if response too large or no sqe */
                 }
             }
         }
@@ -1232,6 +1234,25 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 }
             }
 
+            /* ---- Inject HSTS on HTTPS responses when absent ---- */
+            if (hdr_end) {
+                bool has_hsts =
+                    memmem(sbuf, hdr_len, "\r\nStrict-Transport-Security:", 28) ||
+                    memmem(sbuf, hdr_len, "\r\nstrict-transport-security:", 28);
+                if (!has_hsts) {
+                    const char *hsts = "\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains";
+                    int hsts_len = (int)strlen(hsts);
+                    if (n + hsts_len <= (int)w->pool.buf_size) {
+                        size_t hle = (size_t)(hdr_end - sbuf);
+                        memmove(sbuf + hle + hsts_len, sbuf + hle, (size_t)(n - (int)hle));
+                        memcpy(sbuf + hle, hsts, (size_t)hsts_len);
+                        n += hsts_len;
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                    }
+                }
+            }
+
             /* ---- Inject Alt-Svc to advertise HTTP/3 ---- */
 #ifdef VORTEX_QUIC
             if (hdr_end) {
@@ -1286,7 +1307,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             }
 
             /* ---- Cache store: after all rewrites so stored headers are clean ---- */
-            if (w->cache.index) {
+            if (w->cache && w->cache->index) {
                 const uint8_t *resp2 = conn_send_buf(&w->pool, cid);
                 int status2 = 0;
                 if (n > 9) {
@@ -1337,7 +1358,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                                     char cc_key2[640];
                                     make_cache_key(req2, (size_t)w->pool.buf_size,
                                                    cc_url2, cc_key2, sizeof(cc_key2));
-                                    cache_store(&w->cache, cc_key2, strlen(cc_key2),
+                                    cache_store(w->cache, cc_key2, strlen(cc_key2),
                                         (uint16_t)status2, ttl2,
                                         resp2, hl2, resp2 + hl2, bl2);
                                     log_debug("cache_store",
@@ -1823,6 +1844,8 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     case VORTEX_OP_RECV_CLIENT_WS: {
         int n = cqe->res;
         if (n <= 0) { conn_close(w, cid, false); break; }
+        h->recv_buf_off = 0;
+        h->recv_buf_len = (uint32_t)n;
         struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
         if (!sqe_ws_c) { conn_close(w, cid, false); break; }
         PREP_SEND(w, sqe_ws_c, h->backend_fd, FIXED_FD_BACKEND(w, cid),
@@ -1834,7 +1857,22 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
     /* Send to backend completed — recv_buf is free; re-arm the client recv. */
     case VORTEX_OP_SEND_BACKEND_WS: {
-        if (cqe->res <= 0) { conn_close(w, cid, false); break; }
+        int sent = cqe->res;
+        if (sent <= 0) { conn_close(w, cid, false); break; }
+        h->recv_buf_off += (uint32_t)sent;
+        if (h->recv_buf_off < h->recv_buf_len) {
+            struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe_ws_c) { conn_close(w, cid, false); break; }
+            PREP_SEND(w, sqe_ws_c, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+                conn_recv_buf(&w->pool, cid) + h->recv_buf_off,
+                (size_t)(h->recv_buf_len - h->recv_buf_off),
+                MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
+            sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND_WS, cid);
+            uring_submit(&w->uring);
+            break;
+        }
+        h->recv_buf_off = 0;
+        h->recv_buf_len = 0;
         struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
         if (!sqe_ws_c) { conn_close(w, cid, false); break; }
         PREP_RECV(w, sqe_ws_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
@@ -1851,6 +1889,8 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     case VORTEX_OP_RECV_BACKEND_WS: {
         int n = cqe->res;
         if (n <= 0) { conn_close(w, cid, false); break; }
+        h->send_buf_off = 0;
+        h->send_buf_len = (uint32_t)n;
         struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
         if (!sqe_ws_b) { conn_close(w, cid, false); break; }
         PREP_SEND(w, sqe_ws_b, h->client_fd, FIXED_FD_CLIENT(w, cid),
@@ -1862,7 +1902,22 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
     /* Send to client completed — send_buf is free; re-arm the backend recv. */
     case VORTEX_OP_SEND_CLIENT_WS: {
-        if (cqe->res <= 0) { conn_close(w, cid, false); break; }
+        int sent = cqe->res;
+        if (sent <= 0) { conn_close(w, cid, false); break; }
+        h->send_buf_off += (uint32_t)sent;
+        if (h->send_buf_off < h->send_buf_len) {
+            struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe_ws_b) { conn_close(w, cid, false); break; }
+            PREP_SEND(w, sqe_ws_b, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_send_buf(&w->pool, cid) + h->send_buf_off,
+                (size_t)(h->send_buf_len - h->send_buf_off),
+                MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+            sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_WS, cid);
+            uring_submit(&w->uring);
+            break;
+        }
+        h->send_buf_off = 0;
+        h->send_buf_len = 0;
         struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
         if (!sqe_ws_b) { conn_close(w, cid, false); break; }
         PREP_RECV(w, sqe_ws_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),

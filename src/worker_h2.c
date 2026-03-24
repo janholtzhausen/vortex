@@ -30,6 +30,77 @@
 /* Internal helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+static bool h2_resp_grow(struct h2_stream *st, uint32_t need);
+static void h2_submit_response(struct h2_session *sess, struct h2_stream *st);
+static void h2_send_pending(struct h2_session *sess);
+static void h2_stream_rst(struct h2_session *sess, struct h2_stream *st,
+                          uint32_t error_code);
+
+static void h2_submit_unauthorized(struct h2_session *sess, struct h2_stream *st)
+{
+    static const uint8_t status[] = "401";
+    static const uint8_t auth[] = "Basic realm=\"vortex\"";
+    static const uint8_t zero[] = "0";
+    static const uint8_t hsts[] = "max-age=31536000; includeSubDomains";
+    nghttp2_nv nvs[] = {
+        { .name = (uint8_t *)":status", .value = (uint8_t *)status,
+          .namelen = 7, .valuelen = sizeof(status) - 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+        { .name = (uint8_t *)"www-authenticate", .value = (uint8_t *)auth,
+          .namelen = 16, .valuelen = sizeof(auth) - 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+        { .name = (uint8_t *)"content-length", .value = (uint8_t *)zero,
+          .namelen = 14, .valuelen = 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+        { .name = (uint8_t *)"strict-transport-security", .value = (uint8_t *)hsts,
+          .namelen = 25, .valuelen = sizeof(hsts) - 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+    };
+    if (nghttp2_submit_response(sess->ngh2, st->stream_id, nvs, 4, NULL) == 0) {
+        st->resp_submitted = true;
+        h2_send_pending(sess);
+    } else {
+        h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+    }
+}
+
+static void h2_submit_payload_too_large(struct h2_session *sess, struct h2_stream *st)
+{
+    if (st->resp_submitted)
+        return;
+    static const uint8_t status[] = "413";
+    static const uint8_t zero[] = "0";
+    static const uint8_t hsts[] = "max-age=31536000; includeSubDomains";
+    nghttp2_nv nvs[] = {
+        { .name = (uint8_t *)":status", .value = (uint8_t *)status,
+          .namelen = 7, .valuelen = sizeof(status) - 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+        { .name = (uint8_t *)"content-length", .value = (uint8_t *)zero,
+          .namelen = 14, .valuelen = 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+        { .name = (uint8_t *)"strict-transport-security", .value = (uint8_t *)hsts,
+          .namelen = 25, .valuelen = sizeof(hsts) - 1,
+          .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE },
+    };
+    if (nghttp2_submit_response(sess->ngh2, st->stream_id, nvs, 3, NULL) == 0) {
+        st->resp_submitted = true;
+        h2_send_pending(sess);
+    } else {
+        h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+    }
+}
+
+static bool h2_auth_failed(struct h2_session *sess, struct h2_stream *st)
+{
+    int ri = conn_hot(&sess->w->pool, sess->cid)->route_idx;
+    if (ri < 0 || ri >= sess->w->cfg->route_count)
+        return false;
+    const struct route_auth_config *auth = &sess->w->cfg->routes[ri].auth;
+    if (!auth->enabled || auth->credential_count == 0)
+        return false;
+    return !(st->auth_seen && st->auth_ok);
+}
+
 static bool h2_send_buf_reserve(struct h2_session *sess, uint32_t need)
 {
     uint32_t required = sess->send_buf_len + need;
@@ -49,6 +120,86 @@ static bool h2_send_buf_reserve(struct h2_session *sess, uint32_t need)
     sess->send_buf = p;
     sess->send_buf_cap = newcap;
     return true;
+}
+
+static void h2_make_cache_key(struct h2_stream *st, char *key, size_t key_cap)
+{
+    snprintf(key, key_cap, "%s|%s", st->authority, st->path);
+}
+
+static bool h2_try_cache_hit(struct h2_session *sess, struct h2_stream *st)
+{
+    struct worker *w = sess->w;
+    if (!w->cache || !w->cache->index || strcmp(st->method, "GET") != 0)
+        return false;
+
+    char cache_key[2304];
+    h2_make_cache_key(st, cache_key, sizeof(cache_key));
+    struct cached_response cached;
+    if (cache_fetch_copy(w->cache, cache_key, strlen(cache_key), &cached) != 0)
+        return false;
+
+    if (!h2_resp_grow(st, cached.header_len + cached.body_len)) {
+        cache_cached_response_free(&cached);
+        return false;
+    }
+
+    memcpy(st->resp_buf, cached.data, cached.header_len + cached.body_len);
+    st->resp_buf_len      = cached.header_len + cached.body_len;
+    st->resp_hdr_end      = cached.header_len;
+    st->resp_headers_done = true;
+    st->backend_eof       = true;
+    st->is_chunked_resp   = false;
+    st->prefer_buffered_resp = false;
+    st->state             = H2_STREAM_STREAMING;
+    cache_cached_response_free(&cached);
+
+    h2_submit_response(sess, st);
+    log_debug("h2_cache_hit", "cid=%u stream=%d url=%s",
+              sess->cid, st->stream_id, cache_key);
+    return true;
+}
+
+static void h2_maybe_cache_store(struct h2_session *sess, struct h2_stream *st)
+{
+    struct worker *w = sess->w;
+    if (!w->cache || !w->cache->index || strcmp(st->method, "GET") != 0)
+        return;
+    if (!st->resp_headers_done || !st->backend_eof || st->is_chunked_resp)
+        return;
+    /* The incremental streaming path compacts resp_buf as body bytes are sent.
+     * Once that starts, resp_buf no longer contains the full response body, so
+     * storing it would poison the shared cache with a truncated payload under
+     * the original Content-Length / Content-Encoding headers. */
+    if (st->resp_submitted && !st->prefer_buffered_resp)
+        return;
+
+    if (st->resp_buf_len < 12 || memcmp(st->resp_buf, "HTTP/", 5) != 0)
+        return;
+
+    int status = 0;
+    const char *sp = (const char *)st->resp_buf + 9;
+    for (int i = 0; i < 3 && sp[i] >= '0' && sp[i] <= '9'; i++)
+        status = status * 10 + (sp[i] - '0');
+    if (status != 200)
+        return;
+
+    uint32_t ttl = cache_ttl_for_url(st->path);
+    if (ttl == 0)
+        return;
+
+    uint32_t body_len = st->resp_buf_len > st->resp_hdr_end
+                        ? st->resp_buf_len - st->resp_hdr_end : 0u;
+    if (body_len == 0)
+        return;
+
+    char cache_key[2304];
+    h2_make_cache_key(st, cache_key, sizeof(cache_key));
+    cache_store(w->cache, cache_key, strlen(cache_key), (uint16_t)status, ttl,
+                st->resp_buf, st->resp_hdr_end,
+                st->resp_buf + st->resp_hdr_end, body_len);
+    log_debug("h2_cache_store", "cid=%u stream=%d url=%s ttl=%u body=%u",
+              sess->cid, st->stream_id, cache_key, ttl, body_len);
 }
 
 /* Drain nghttp2 output into send_buf and arm SEND if not already in flight */
@@ -265,6 +416,7 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
                 "public, max-age=%u", ttl);
     }
     bool cc_injected = false; /* track whether we already emitted cache-control */
+    bool hsts_seen = false;
 
     const char *buf = (const char *)st->resp_buf;
     size_t      len  = st->resp_buf_len;
@@ -424,6 +576,9 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
             continue;
         }
 
+        if (name_len == 25 && memcmp(name_p, "strict-transport-security", 25) == 0)
+            hsts_seen = true;
+
         /* Strip Pragma and Expires for static assets (Kestrel sends no-cache/-1) */
         if (ttl >= 3600) {
             if ((name_len == 6  && memcmp(name_p, "pragma",  6)  == 0) ||
@@ -449,6 +604,16 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
         nvs[idx].value    = (uint8_t *)cc_val;
         nvs[idx].valuelen = (size_t)cc_val_len;
         nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME;
+        idx++;
+    }
+
+    if (!hsts_seen && idx < nv_count + 4) {
+        static const uint8_t hsts[] = "max-age=31536000; includeSubDomains";
+        nvs[idx].name     = (uint8_t *)"strict-transport-security";
+        nvs[idx].namelen  = 25;
+        nvs[idx].value    = (uint8_t *)hsts;
+        nvs[idx].valuelen = sizeof(hsts) - 1;
+        nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
         idx++;
     }
 
@@ -705,6 +870,15 @@ static int on_header_cb(nghttp2_session *ngh2,
             st->is_grpc = true;
     }
 
+    if (namelen == 13 && memcmp(name, "authorization", 13) == 0) {
+        int ri = conn_hot(&sess->w->pool, sess->cid)->route_idx;
+        if (ri >= 0 && ri < sess->w->cfg->route_count) {
+            st->auth_seen = true;
+            st->auth_ok = auth_check_basic_value(&sess->w->cfg->routes[ri].auth,
+                                                 (const char *)value, valuelen);
+        }
+    }
+
     /* Accept-Encoding: pass through to backend unchanged.
      * The H2 path buffers the full response before submitting to nghttp2 — it
      * does NOT cache, so compressed responses are strictly better (smaller
@@ -753,15 +927,26 @@ static int on_frame_recv_cb(nghttp2_session *ngh2,
         if (end_stream) {
             /* No body — start connecting immediately */
             st->req_complete = true;
-            h2_stream_connect_backend(sess->w, sess, st);
+            if (h2_auth_failed(sess, st))
+                h2_submit_unauthorized(sess, st);
+            else if (st->req_too_large)
+                h2_submit_payload_too_large(sess, st);
+            else if (!h2_try_cache_hit(sess, st))
+                h2_stream_connect_backend(sess->w, sess, st);
         }
         /* else: wait for DATA frames + END_STREAM */
     }
 
     if (frame->hd.type == NGHTTP2_DATA && end_stream) {
         st->req_complete = true;
-        if (st->state == H2_STREAM_OPEN)
-            h2_stream_connect_backend(sess->w, sess, st);
+        if (st->state == H2_STREAM_OPEN) {
+            if (h2_auth_failed(sess, st))
+                h2_submit_unauthorized(sess, st);
+            else if (st->req_too_large)
+                h2_submit_payload_too_large(sess, st);
+            else if (!h2_try_cache_hit(sess, st))
+                h2_stream_connect_backend(sess->w, sess, st);
+        }
     }
 
     return 0;
@@ -784,6 +969,21 @@ static int on_data_chunk_recv_cb(nghttp2_session *ngh2,
         }
     }
     if (!st) return 0;
+
+    if (st->req_too_large)
+        return 0;
+
+    uint32_t limit = sess->w->cfg->max_request_body_bytes;
+    if (limit > 0 && len > 0 &&
+        ((uint32_t)len > limit || st->req_body_len > limit - (uint32_t)len)) {
+        st->req_too_large = true;
+        free(st->req_body);
+        st->req_body = NULL;
+        st->req_body_len = 0;
+        st->req_body_cap = 0;
+        h2_submit_payload_too_large(sess, st);
+        return 0;
+    }
 
     /* Grow req_body buffer */
     uint32_t needed = st->req_body_len + (uint32_t)len;
@@ -1493,7 +1693,8 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
             h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
             return;
         }
-        if (st->is_chunked_resp || !st->resp_submitted) {
+        h2_maybe_cache_store(sess, st);
+        if (st->is_chunked_resp || st->prefer_buffered_resp || !st->resp_submitted) {
             /* Buffered path or streaming path where headers just arrived */
             h2_submit_response(sess, st);
         } else {
@@ -1509,11 +1710,14 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
             st->backend_eof = true;
             if (!st->resp_headers_done) {
                 h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
-            } else if (st->is_chunked_resp || !st->resp_submitted) {
-                h2_submit_response(sess, st);
             } else {
-                nghttp2_session_resume_data(sess->ngh2, st->stream_id);
-                h2_send_pending(sess);
+                h2_maybe_cache_store(sess, st);
+                if (st->is_chunked_resp || st->prefer_buffered_resp || !st->resp_submitted) {
+                h2_submit_response(sess, st);
+                } else {
+                    nghttp2_session_resume_data(sess->ngh2, st->stream_id);
+                    h2_send_pending(sess);
+                }
             }
         } else {
             h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
@@ -1544,14 +1748,38 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
                     st->is_chunked_resp = true;
             }
 
+            /* Static assets are safer on the buffered path. Incremental H2
+             * streaming is still used for large dynamic responses, but assets
+             * that benefit from caching or are sensitive to framing/encoding
+             * mismatches are buffered to EOF and then submitted complete. */
+            const uint8_t *ct = (const uint8_t *)memmem(
+                st->resp_buf, st->resp_hdr_end, "Content-Type:", 13);
+            if (!ct) ct = (const uint8_t *)memmem(
+                st->resp_buf, st->resp_hdr_end, "content-type:", 13);
+            if (ct) {
+                const uint8_t *eol = (const uint8_t *)memmem(
+                    ct, (size_t)(st->resp_buf + st->resp_hdr_end - ct), "\r\n", 2);
+                if (eol) {
+                    const uint8_t *v = ct + 13;
+                    while (v < eol && (*v == ' ' || *v == '\t')) v++;
+                    size_t vlen = (size_t)(eol - v);
+                    if ((vlen >= 6 && memcmp(v, "image/", 6) == 0) ||
+                        memmem(v, vlen, "font", 4) != NULL ||
+                        (vlen >= 8 && memcmp(v, "text/css", 8) == 0) ||
+                        memmem(v, vlen, "javascript", 10) != NULL) {
+                        st->prefer_buffered_resp = true;
+                    }
+                }
+            }
+
             /* Streaming path: submit response immediately so headers reach the
              * client without waiting for the full body. */
-            if (!st->is_chunked_resp)
+            if (!st->is_chunked_resp && !st->prefer_buffered_resp)
                 h2_submit_response(sess, st);
         }
     }
 
-    if (st->is_chunked_resp) {
+    if (st->is_chunked_resp || st->prefer_buffered_resp) {
         /* Buffered path — accumulate until EOF then submit */
         if (st->resp_buf_len >= H2_RESP_MAX) {
             log_warn("h2_recv", "cid=%u stream=%d chunked response too large (>%u), RST",

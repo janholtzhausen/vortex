@@ -23,6 +23,15 @@
 #define TLS_POOL_THREADS  4     /* worker threads in the pool */
 #define TLS_POOL_QUEUE   128    /* max pending jobs */
 
+struct tls_pool_stats {
+    uint32_t queue_depth;
+    uint32_t active_handshakes;
+    uint64_t submitted_total;
+    uint64_t completed_total;
+    uint64_t failed_total;
+    uint64_t dropped_total;
+};
+
 /* Result written to the per-worker pipe after handshake completes */
 struct tls_handshake_result {
     uint32_t cid;           /* connection id to resume */
@@ -50,6 +59,12 @@ struct tls_pool {
     pthread_cond_t  cv;
     struct tls_handshake_job queue[TLS_POOL_QUEUE];
     int  head, tail, count;
+    uint32_t active_handshakes;
+    uint64_t submitted_total;
+    uint64_t completed_total;
+    uint64_t failed_total;
+    uint64_t dropped_total;
+    bool initialized;
     bool shutdown;
 };
 
@@ -62,3 +77,4 @@ void tls_pool_destroy(void);
 
 /* Submit a job; returns false if the queue is full (caller should close fd) */
 bool tls_pool_submit(struct tls_handshake_job job);
+void tls_pool_snapshot(struct tls_pool_stats *out);

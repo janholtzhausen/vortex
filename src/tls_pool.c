@@ -25,6 +25,7 @@ static void *tls_pool_worker_thread(void *arg)
         job = pool->queue[pool->head];
         pool->head = (pool->head + 1) % TLS_POOL_QUEUE;
         pool->count--;
+        pool->active_handshakes++;
         pthread_mutex_unlock(&pool->mu);
 
         /* Perform the blocking TLS handshake */
@@ -74,6 +75,12 @@ static void *tls_pool_worker_thread(void *arg)
             log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
             if (ssl && !res.ktls_tx) SSL_free(ssl);
         }
+
+        pthread_mutex_lock(&pool->mu);
+        if (res.ok) pool->completed_total++;
+        else pool->failed_total++;
+        if (pool->active_handshakes > 0) pool->active_handshakes--;
+        pthread_mutex_unlock(&pool->mu);
     }
     return NULL;
 }
@@ -83,6 +90,7 @@ void tls_pool_init(void)
     memset(&g_tls_pool, 0, sizeof(g_tls_pool));
     pthread_mutex_init(&g_tls_pool.mu, NULL);
     pthread_cond_init(&g_tls_pool.cv, NULL);
+    g_tls_pool.initialized = true;
 
     for (int i = 0; i < TLS_POOL_THREADS; i++) {
         pthread_attr_t attr;
@@ -97,6 +105,8 @@ void tls_pool_init(void)
 
 void tls_pool_destroy(void)
 {
+    if (!g_tls_pool.initialized)
+        return;
     pthread_mutex_lock(&g_tls_pool.mu);
     g_tls_pool.shutdown = true;
     pthread_cond_broadcast(&g_tls_pool.cv);
@@ -107,12 +117,16 @@ void tls_pool_destroy(void)
 
     pthread_mutex_destroy(&g_tls_pool.mu);
     pthread_cond_destroy(&g_tls_pool.cv);
+    g_tls_pool.initialized = false;
 }
 
 bool tls_pool_submit(struct tls_handshake_job job)
 {
+    if (!g_tls_pool.initialized)
+        return false;
     pthread_mutex_lock(&g_tls_pool.mu);
     if (g_tls_pool.count >= TLS_POOL_QUEUE) {
+        g_tls_pool.dropped_total++;
         pthread_mutex_unlock(&g_tls_pool.mu);
         log_warn("tls_pool", "queue full — dropping handshake fd=%d", job.client_fd);
         return false;
@@ -120,7 +134,24 @@ bool tls_pool_submit(struct tls_handshake_job job)
     g_tls_pool.queue[g_tls_pool.tail] = job;
     g_tls_pool.tail = (g_tls_pool.tail + 1) % TLS_POOL_QUEUE;
     g_tls_pool.count++;
+    g_tls_pool.submitted_total++;
     pthread_cond_signal(&g_tls_pool.cv);
     pthread_mutex_unlock(&g_tls_pool.mu);
     return true;
+}
+
+void tls_pool_snapshot(struct tls_pool_stats *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!g_tls_pool.initialized)
+        return;
+    pthread_mutex_lock(&g_tls_pool.mu);
+    out->queue_depth = (uint32_t)g_tls_pool.count;
+    out->active_handshakes = g_tls_pool.active_handshakes;
+    out->submitted_total = g_tls_pool.submitted_total;
+    out->completed_total = g_tls_pool.completed_total;
+    out->failed_total = g_tls_pool.failed_total;
+    out->dropped_total = g_tls_pool.dropped_total;
+    pthread_mutex_unlock(&g_tls_pool.mu);
 }

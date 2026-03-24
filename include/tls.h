@@ -3,6 +3,8 @@
 #include "config.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
+#include <pthread.h>
 
 #ifdef VORTEX_PHASE_TLS
 #include <openssl/ssl.h>
@@ -13,6 +15,24 @@
 struct tls_route_ctx {
     SSL_CTX *ssl_ctx;
     int      route_idx;
+    const char *hostname;
+    unsigned char *ocsp_resp_der;
+    int            ocsp_resp_der_len;
+};
+
+struct tls_ticket_key {
+    unsigned char name[16];
+    unsigned char hmac_key[32];
+    unsigned char aes_key[32];
+    time_t        created_at;
+};
+
+#define VORTEX_TLS_SESSION_CACHE_SIZE 1024
+
+struct tls_session_entry {
+    SSL_SESSION  *session;
+    unsigned char id[SSL_MAX_SSL_SESSION_ID_LENGTH];
+    unsigned int  id_len;
 };
 
 /* Global TLS state — one instance shared across workers (read-only after init) */
@@ -22,6 +42,16 @@ struct tls_ctx {
     struct tls_route_ctx   routes[VORTEX_MAX_ROUTES];
     int                    route_count;
     bool                   ktls_available;
+    uint32_t               session_timeout;
+    uint32_t               session_ticket_rotation;
+    pthread_mutex_t        ticket_lock;
+    pthread_mutex_t        ocsp_lock;
+    pthread_mutex_t        session_lock;
+    struct tls_ticket_key  current_ticket_key;
+    struct tls_ticket_key  previous_ticket_key;
+    bool                   have_current_ticket_key;
+    bool                   have_previous_ticket_key;
+    struct tls_session_entry session_cache[VORTEX_TLS_SESSION_CACHE_SIZE];
 };
 
 /* Initialise TLS — loads providers, creates per-route SSL_CTX, loads certs.

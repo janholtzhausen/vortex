@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <pthread.h>
 #include <time.h>
 
 /* Cache entry flags */
@@ -46,6 +47,7 @@ _Static_assert(sizeof(struct cache_index_entry) == 64,
 #define CACHE_SLAB_DISK_FLAG (1u << 31)
 
 struct cache {
+    pthread_mutex_t lock;
     struct cache_index_entry *index;   /* mmap'd, hugepage-backed if available */
     size_t index_capacity;             /* Power of 2 */
     size_t index_mask;
@@ -65,6 +67,14 @@ struct cache {
     uint64_t stores;
 };
 
+struct cached_response {
+    uint8_t  *data;
+    uint32_t  header_len;
+    uint32_t  body_len;
+    uint16_t  status_code;
+    uint64_t  body_etag;
+};
+
 /* disk_path: path for file-backed disk slab (NULL or "" = RAM-only).
  * disk_size: 0 = auto (50% of free space on disk_path's filesystem). */
 int   cache_init(struct cache *c, uint32_t index_entries,
@@ -82,6 +92,9 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
                 uint16_t status, uint32_t ttl,
                 const uint8_t *headers, size_t header_len,
                 const uint8_t *body, size_t body_len);
+int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
+                     struct cached_response *out);
+void cache_cached_response_free(struct cached_response *resp);
 
 /* Get pointer to start of full stored response (headers + body) */
 static inline const uint8_t *cache_response_ptr(struct cache *c,

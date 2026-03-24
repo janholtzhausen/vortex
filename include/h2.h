@@ -19,9 +19,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Per-connection stream concurrency limit */
-#define H2_MAX_STREAMS       32
-#define H2_STREAM_SLOTS      32
+/* Per-connection stream concurrency limit.
+ * Browser UIs can burst well past 32 concurrent requests on one H2 session
+ * once images, JS chunks, API calls, and SignalR setup overlap. Keep the
+ * advertised max and local slot count aligned to avoid refusing streams
+ * during normal page load. */
+#define H2_MAX_STREAMS       128
+#define H2_STREAM_SLOTS      128
 
 /* gRPC backend (h2c) header/trailer storage limits */
 #define H2_GRPC_MAX_HDRS      32
@@ -123,6 +127,9 @@ struct h2_stream {
     uint32_t req_body_len;
     uint32_t req_body_cap;
     bool     req_complete;   /* END_STREAM received from client */
+    bool     req_too_large;
+    bool     auth_ok;
+    bool     auth_seen;
 
     /* Backend response accumulation buffer (heap) */
     uint8_t *resp_buf;
@@ -137,6 +144,7 @@ struct h2_stream {
     /* Streaming (non-chunked) path: response submitted as soon as headers
      * arrive; body bytes fed incrementally via NGHTTP2_ERR_DEFERRED. */
     bool     is_chunked_resp;      /* Transfer-Encoding: chunked → use buffered path */
+    bool     prefer_buffered_resp; /* fonts/images stay on the buffered path */
     bool     backend_recv_paused;  /* recv not re-armed; resume after client drains */
 
     /* Partial HTTP/1.1 request send tracking */

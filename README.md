@@ -439,6 +439,12 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 | `vortex_cache_misses_total` | Cache misses |
 | `vortex_cache_stores_total` | Cache entries written |
 | `vortex_cache_evictions_total` | Cache entries evicted (LRU) |
+| `vortex_tls_pool_queue_depth` | Pending TLS handshakes in the shared handshake queue |
+| `vortex_tls_pool_active_handshakes` | TLS handshakes currently executing |
+| `vortex_tls_pool_submitted_total` | Handshakes submitted to the TLS pool |
+| `vortex_tls_pool_completed_total` | Successful TLS handshakes completed by the pool |
+| `vortex_tls_pool_failed_total` | TLS handshakes that failed in the pool |
+| `vortex_tls_pool_dropped_total` | Handshakes dropped because the TLS pool queue was full |
 | `vortex_xdp_rx_packets_total` | Packets seen by XDP |
 | `vortex_xdp_rx_bytes_total` | Bytes seen by XDP |
 | `vortex_xdp_passed_total` | Packets passed to kernel stack |
@@ -542,7 +548,7 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 - **IPv4 only** in the XDP program — IPv6 packets are passed without filtering or conntrack
 - **Load balancer — least_conn** falls back to round-robin (per-backend active connection tracking not yet implemented)
 - **Backend connections** are synchronous blocking connects (set non-blocking after connect); async io_uring CONNECT is planned
-- **Single-segment caching** — only responses where `Content-Length` matches the first recv buffer are stored; chunked responses bypass cache
+- **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
 - **WebSocket relay** uses `select(2)` in a dedicated thread rather than io_uring
 - **Config reload** does a full in-memory replace (`memcpy`); live connections use the old route/backend config until they close
 

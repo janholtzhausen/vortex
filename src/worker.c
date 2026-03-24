@@ -308,12 +308,14 @@ uint32_t worker_pool_capacity(int num_workers, double budget_pct)
 }
 
 int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
-                struct vortex_config *cfg, struct tls_ctx *tls)
+                struct vortex_config *cfg, struct tls_ctx *tls,
+                struct cache *shared_cache)
 {
     memset(w, 0, sizeof(*w));
     w->worker_id = id;
     w->listen_fd = listen_fd;
     w->cfg       = cfg;
+    w->cache     = shared_cache;
 #ifdef VORTEX_PHASE_TLS
     w->tls       = tls;
 #else
@@ -353,21 +355,6 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
     if (router_init(&w->router, cfg) != 0) {
         conn_pool_destroy(&w->pool);
         return -1;
-    }
-
-    /* Init response cache if enabled */
-    if (cfg->cache.enabled) {
-        uint32_t entries = cfg->cache.index_entries > 0 ?
-            cfg->cache.index_entries : 16384;
-        size_t slab_bytes = cfg->cache.slab_size_bytes > 0 ?
-            cfg->cache.slab_size_bytes : (64ULL * 1024 * 1024);
-        size_t disk_bytes = (size_t)cfg->cache.disk_slab_size_bytes;
-        const char *disk_path = cfg->cache.disk_cache_path[0] ?
-            cfg->cache.disk_cache_path : NULL;
-        if (cache_init(&w->cache, entries, slab_bytes,
-                       cfg->cache.use_hugepages, disk_path, disk_bytes) != 0) {
-            log_warn("worker_init", "cache init failed — running without cache");
-        }
     }
 
     return 0;
@@ -436,14 +423,13 @@ void worker_destroy(struct worker *w)
 
     router_destroy(&w->router);
     conn_pool_destroy(&w->pool);
-    if (w->cache.index) {
+    if (w->cache && w->cache->index && w->worker_id == 0) {
         log_info("cache_stats", "worker=%d hits=%llu misses=%llu stores=%llu evictions=%llu",
             w->worker_id,
-            (unsigned long long)w->cache.hits,
-            (unsigned long long)w->cache.misses,
-            (unsigned long long)w->cache.stores,
-            (unsigned long long)w->cache.evictions);
-        cache_destroy(&w->cache);
+            (unsigned long long)w->cache->hits,
+            (unsigned long long)w->cache->misses,
+            (unsigned long long)w->cache->stores,
+            (unsigned long long)w->cache->evictions);
     }
     /* uring is destroyed inside the worker thread */
 }

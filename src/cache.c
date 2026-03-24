@@ -2,6 +2,7 @@
 #include "log.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -63,6 +64,7 @@ int cache_init(struct cache *c, uint32_t index_entries,
                const char *disk_path, size_t disk_size)
 {
     memset(c, 0, sizeof(*c));
+    pthread_mutex_init(&c->lock, NULL);
 
     /* Round up index_entries to power of 2 */
     if (!IS_POWER_OF_2(index_entries)) {
@@ -81,6 +83,7 @@ int cache_init(struct cache *c, uint32_t index_entries,
 
     c->slab = alloc_aligned(slab_size, try_hugepages);
     if (!c->slab) {
+        pthread_mutex_destroy(&c->lock);
         munmap(c->index, index_bytes);
         c->index = NULL;
         return -1;
@@ -140,6 +143,7 @@ int cache_init(struct cache *c, uint32_t index_entries,
 
 void cache_destroy(struct cache *c)
 {
+    pthread_mutex_destroy(&c->lock);
     if (c->index) {
         munmap(c->index, c->index_capacity * sizeof(struct cache_index_entry));
     }
@@ -153,14 +157,12 @@ void cache_destroy(struct cache *c)
     memset(c, 0, sizeof(*c));
 }
 
-/* Robin Hood hash probing */
-struct cache_index_entry *cache_lookup(struct cache *c,
+static struct cache_index_entry *cache_lookup_locked(struct cache *c,
     const char *url, size_t url_len)
 {
     uint64_t hash = xxhash64(url, url_len);
     size_t   slot = hash & c->index_mask;
 
-    /* Prefetch the first candidate */
     PREFETCH_R(&c->index[slot]);
 
     for (size_t probe = 0; probe <= c->index_capacity; probe++) {
@@ -168,14 +170,12 @@ struct cache_index_entry *cache_lookup(struct cache *c,
 
         if (!(e->flags & CACHE_FLAG_VALID)) {
             c->misses++;
-            return NULL; /* Empty slot — definitely a miss */
+            return NULL;
         }
 
         if (e->url_hash == hash) {
-            /* Verify key prefix to guard against 64-bit hash collisions */
             uint8_t klen = (uint8_t)(url_len > 16 ? 16 : url_len);
             if (e->url_key_len != klen || memcmp(e->url_key, url, klen) != 0) {
-                /* Different URL — hash collision, treat as miss */
                 c->misses++;
                 return NULL;
             }
@@ -185,7 +185,6 @@ struct cache_index_entry *cache_lookup(struct cache *c,
             return e;
         }
 
-        /* Robin Hood: if this entry's probe distance < ours, stop */
         size_t entry_home = e->url_hash & c->index_mask;
         size_t entry_dist = (slot - entry_home + c->index_capacity) & c->index_mask;
         if (entry_dist < probe) {
@@ -200,13 +199,27 @@ struct cache_index_entry *cache_lookup(struct cache *c,
     return NULL;
 }
 
+/* Robin Hood hash probing */
+struct cache_index_entry *cache_lookup(struct cache *c,
+    const char *url, size_t url_len)
+{
+    pthread_mutex_lock(&c->lock);
+    struct cache_index_entry *e = cache_lookup_locked(c, url, url_len);
+    pthread_mutex_unlock(&c->lock);
+    return e;
+}
+
 int cache_store(struct cache *c, const char *url, size_t url_len,
                 uint16_t status, uint32_t ttl,
                 const uint8_t *headers, size_t header_len,
                 const uint8_t *body, size_t body_len)
 {
+    pthread_mutex_lock(&c->lock);
     size_t total = header_len + body_len;
-    if (total == 0) return -1;
+    if (total == 0) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
 
     /* Compute ETag from body */
     uint64_t etag = (body && body_len > 0) ? xxhash64(body, body_len) : 0;
@@ -295,6 +308,7 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
         if (!(e->flags & CACHE_FLAG_VALID)) {
             *e = new_entry;
             c->stores++;
+            pthread_mutex_unlock(&c->lock);
             return 0;
         }
 
@@ -302,6 +316,7 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
             /* Update existing */
             *e = new_entry;
             c->stores++;
+            pthread_mutex_unlock(&c->lock);
             return 0;
         }
 
@@ -320,7 +335,41 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
 
     /* Table full — evict LRU */
     cache_evict_one(c);
+    pthread_mutex_unlock(&c->lock);
     return -1;
+}
+
+int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
+                     struct cached_response *out)
+{
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&c->lock);
+    struct cache_index_entry *e = cache_lookup_locked(c, url, url_len);
+    if (!e || !cache_entry_valid(e)) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+
+    const uint8_t *resp = cache_response_ptr(c, e);
+    size_t total = e->header_len + e->body_len;
+    out->data = malloc(total);
+    if (!out->data) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+    memcpy(out->data, resp, total);
+    out->header_len = e->header_len;
+    out->body_len = e->body_len;
+    out->status_code = e->status_code;
+    out->body_etag = e->body_etag;
+    pthread_mutex_unlock(&c->lock);
+    return 0;
+}
+
+void cache_cached_response_free(struct cached_response *resp)
+{
+    free(resp->data);
+    memset(resp, 0, sizeof(*resp));
 }
 
 const uint8_t *cache_body_ptr(struct cache *c,

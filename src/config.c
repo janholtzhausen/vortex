@@ -58,6 +58,7 @@ void config_set_defaults(struct vortex_config *cfg)
     snprintf(cfg->log_format,    sizeof(cfg->log_format),    "%s", "json");
     snprintf(cfg->pid_file,      sizeof(cfg->pid_file),      "%s", "/run/vortex.pid");
     snprintf(cfg->server_header, sizeof(cfg->server_header), "%s", "CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)");
+    cfg->max_request_body_bytes = 8U * 1024U * 1024U;
 
     /* TLS defaults */
     cfg->tls.min_version = 0x0303; /* TLS 1.2 */
@@ -110,6 +111,11 @@ void config_set_defaults(struct vortex_config *cfg)
     snprintf(cfg->metrics.bind_address, sizeof(cfg->metrics.bind_address), "%s", "127.0.0.1");
     cfg->metrics.port = 9090;
     snprintf(cfg->metrics.path, sizeof(cfg->metrics.path), "%s", "/metrics");
+
+    /* Dashboard defaults */
+    cfg->dashboard.enabled = false;
+    snprintf(cfg->dashboard.bind_address, sizeof(cfg->dashboard.bind_address), "%s", "127.0.0.1");
+    cfg->dashboard.port = 9091;
 }
 
 /* ---- Minimal YAML parser ---- */
@@ -125,6 +131,7 @@ typedef enum {
     P_ACME,
     P_ACME_DNS_CFG,
     P_METRICS,
+    P_DASHBOARD,
     P_ROUTES,
     P_ROUTE,
     P_ROUTE_BACKENDS,
@@ -170,6 +177,8 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "pid_file"))       snprintf(c->pid_file, sizeof(c->pid_file), "%s", val);
         else if (!strcmp(k, "server_header"))       snprintf(c->server_header, sizeof(c->server_header), "%s", !strcmp(val,"none") ? "" : val);
         else if (!strcmp(k, "congestion_control"))  snprintf(c->congestion_control, sizeof(c->congestion_control), "%s", val);
+        else if (!strcmp(k, "max_request_body_mb")) c->max_request_body_bytes = (uint32_t)atol(val) * 1024U * 1024U;
+        else if (!strcmp(k, "max_request_body_bytes")) c->max_request_body_bytes = (uint32_t)atol(val);
         break;
 
     case P_TLS:
@@ -225,6 +234,12 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "bind_address")) snprintf(c->metrics.bind_address, sizeof(c->metrics.bind_address), "%s", val);
         else if (!strcmp(k, "port"))         c->metrics.port    = (uint16_t)atoi(val);
         else if (!strcmp(k, "path"))         snprintf(c->metrics.path, sizeof(c->metrics.path), "%s", val);
+        break;
+
+    case P_DASHBOARD:
+        if      (!strcmp(k, "enabled"))      c->dashboard.enabled = !strcmp(val,"true");
+        else if (!strcmp(k, "bind_address")) snprintf(c->dashboard.bind_address, sizeof(c->dashboard.bind_address), "%s", val);
+        else if (!strcmp(k, "port"))         c->dashboard.port = (uint16_t)atoi(val);
         break;
 
     case P_ROUTE: {
@@ -378,9 +393,10 @@ int config_load(const char *path, struct vortex_config *cfg)
             else if (ctx.state == P_ACME_DNS_CFG)     { ctx.state = P_ACME; }
             else if (ctx.state == P_XDP_RATELIMIT)    { ctx.state = P_XDP; }
             /* Section mappings pop back to root */
-            else if (ctx.state == P_GLOBAL  || ctx.state == P_TLS   ||
-                     ctx.state == P_XDP     || ctx.state == P_CACHE  ||
-                     ctx.state == P_ACME    || ctx.state == P_METRICS) {
+            else if (ctx.state == P_GLOBAL    || ctx.state == P_TLS      ||
+                     ctx.state == P_XDP       || ctx.state == P_CACHE    ||
+                     ctx.state == P_ACME      || ctx.state == P_METRICS  ||
+                     ctx.state == P_DASHBOARD) {
                 ctx.state = P_ROOT;
             }
             break;
@@ -428,7 +444,8 @@ int config_load(const char *path, struct vortex_config *cfg)
                     else if (!strcmp(sv, "xdp"))     ctx.state = P_XDP;
                     else if (!strcmp(sv, "cache"))   ctx.state = P_CACHE;
                     else if (!strcmp(sv, "acme"))    ctx.state = P_ACME;
-                    else if (!strcmp(sv, "metrics")) ctx.state = P_METRICS;
+                    else if (!strcmp(sv, "metrics"))   ctx.state = P_METRICS;
+                    else if (!strcmp(sv, "dashboard")) ctx.state = P_DASHBOARD;
                     else if (!strcmp(sv, "routes"))  { /* handled in sequence */ }
                 } else if (ctx.state == P_XDP && !strcmp(sv, "rate_limit")) {
                     ctx.state = P_XDP_RATELIMIT;
