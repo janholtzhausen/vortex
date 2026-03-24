@@ -66,7 +66,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
   - Dynamic content: `public, max-age=60` injected if backend sent nothing
   - API endpoints (`/api/*`): Cache-Control left untouched
   - `Pragma: no-cache` stripped from responses for static assets
-- Chunked and large responses (exceeding buffer) are not cached (served from backend only)
+- Full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
 - RAM slab defaults to 30% of system RAM (floor 64 MB, cap 4 GB); optional disk slab
 
 ### HTTP Header Rewrites
@@ -91,6 +91,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
   - Cache: hits, misses, stores, evictions
   - XDP: all drop/pass counters aggregated from per-CPU BPF array
   - TLS cert expiry timestamps per hostname (`vortex_cert_expiry_seconds`)
+- **Live dashboard** on a separate HTTP server (default `127.0.0.1:9091`) with a WebSocket-fed status view for routes, cache, TLS, tarpit, and XDP state
 - **Structured JSON logging** (or plain text via config) — all log events are key=value pairs
 - Log levels: `debug`, `info`, `warn`, `error`
 - XDP metrics logged every second at `debug` level in the main loop
