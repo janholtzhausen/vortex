@@ -43,6 +43,19 @@ static void expand_env(char *buf, size_t bufsz, const char *src)
     buf[out] = '\0';
 }
 
+static int validate_no_crlf(const char *val, const char *field_name, int route_idx)
+{
+    for (const char *p = val; *p; p++) {
+        if (*p == '\r' || *p == '\n') {
+            log_error("config",
+                      "route %d %s contains CR/LF - refusing to start",
+                      route_idx, field_name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 void config_set_defaults(struct vortex_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -154,6 +167,22 @@ typedef struct {
     int                  seq_depth;      /* sequence depth */
     int                  error;
 } parser_ctx_t;
+
+static const char *backend_addr_hostport(const char *addr, bool *tls_out)
+{
+    if (tls_out)
+        *tls_out = false;
+    if (!addr)
+        return "";
+    if (strncmp(addr, "https://", 8) == 0) {
+        if (tls_out)
+            *tls_out = true;
+        return addr + 8;
+    }
+    if (strncmp(addr, "http://", 7) == 0)
+        return addr + 7;
+    return addr;
+}
 
 static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
 {
@@ -270,9 +299,26 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
 
     case P_ROUTE_BACKEND: {
         struct backend_config *b = &c->routes[ctx->route_idx].backends[ctx->backend_idx];
-        if      (!strcmp(k, "address"))   snprintf(b->address, sizeof(b->address), "%s", val);
-        else if (!strcmp(k, "weight"))    b->weight    = (uint16_t)atoi(val);
-        else if (!strcmp(k, "pool_size")) b->pool_size = atoi(val);
+        if (!strcmp(k, "address")) {
+            bool addr_tls = false;
+            const char *hostport = backend_addr_hostport(val, &addr_tls);
+            snprintf(b->address, sizeof(b->address), "%s", hostport);
+            if (addr_tls)
+                b->tls = true;
+        } else if (!strcmp(k, "weight")) {
+            b->weight = (uint16_t)atoi(val);
+        } else if (!strcmp(k, "pool_size")) {
+            b->pool_size = atoi(val);
+        } else if (!strcmp(k, "sni") || !strcmp(k, "server_name")) {
+            snprintf(b->sni, sizeof(b->sni), "%s", val);
+        } else if (!strcmp(k, "tls")) {
+            b->tls = !strcmp(val, "true") || !strcmp(val, "yes");
+        } else if (!strcmp(k, "scheme")) {
+            b->tls = !strcmp(val, "https");
+        } else if (!strcmp(k, "verify_peer")) {
+            b->verify_peer = !strcmp(val, "true") || !strcmp(val, "yes");
+            b->verify_peer_set = true;
+        }
         break;
     }
 
@@ -510,6 +556,13 @@ int config_load(const char *path, struct vortex_config *cfg)
                 ret = -1;
                 break;
             }
+            if (validate_no_crlf(route->x_api_key, "x_api_key", i) != 0 ||
+                validate_no_crlf(route->backend_credentials, "backend_credentials", i) != 0 ||
+                validate_no_crlf(route->server_header, "server_header", i) != 0 ||
+                validate_no_crlf(route->congestion_control, "congestion_control", i) != 0) {
+                ret = -1;
+                break;
+            }
         }
     }
 
@@ -545,6 +598,8 @@ void config_resolve_backends(struct vortex_config *cfg)
         for (int bi = 0; bi < route->backend_count; bi++) {
             struct backend_config *b = &route->backends[bi];
             b->resolved_addrlen = 0;
+            if (b->tls && !b->verify_peer_set)
+                b->verify_peer = true;
 
             const char *addr_str = b->address;
             const char *colon = strrchr(addr_str, ':');
@@ -565,6 +620,7 @@ void config_resolve_backends(struct vortex_config *cfg)
             struct addrinfo hints = {
                 .ai_family   = AF_UNSPEC,
                 .ai_socktype = SOCK_STREAM,
+                .ai_flags    = AI_ADDRCONFIG,
             };
             struct addrinfo *res = NULL;
             if (getaddrinfo(host, port_str, &hints, &res) != 0) {
@@ -573,12 +629,17 @@ void config_resolve_backends(struct vortex_config *cfg)
                 continue;
             }
 
-            /* Pick first usable address */
-            for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
-                if (rp->ai_addrlen <= sizeof(b->resolved_addr)) {
-                    memcpy(&b->resolved_addr, rp->ai_addr, rp->ai_addrlen);
-                    b->resolved_addrlen = (socklen_t)rp->ai_addrlen;
-                    break;
+            /* Prefer IPv4 on hosts without working IPv6 routing; fall back to any. */
+            for (int pass = 0; pass < 2 && b->resolved_addrlen == 0; pass++) {
+                int family = (pass == 0) ? AF_INET : AF_UNSPEC;
+                for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+                    if (family != AF_UNSPEC && rp->ai_family != family)
+                        continue;
+                    if (rp->ai_addrlen <= sizeof(b->resolved_addr)) {
+                        memcpy(&b->resolved_addr, rp->ai_addr, rp->ai_addrlen);
+                        b->resolved_addrlen = (socklen_t)rp->ai_addrlen;
+                        break;
+                    }
                 }
             }
             freeaddrinfo(res);

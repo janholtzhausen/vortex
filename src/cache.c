@@ -302,6 +302,8 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
     };
     memcpy(new_entry.url_key, url, klen);
 
+    int retried = 0;
+insert_retry:
     for (size_t probe = 0; probe <= c->index_capacity; probe++) {
         struct cache_index_entry *e = &c->index[slot];
 
@@ -335,6 +337,11 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
 
     /* Table full — evict LRU */
     cache_evict_one(c);
+    if (!retried) {
+        retried = 1;
+        slot = hash & c->index_mask;
+        goto insert_retry;
+    }
     pthread_mutex_unlock(&c->lock);
     return -1;
 }

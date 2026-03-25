@@ -140,6 +140,7 @@ uint32_t conn_alloc(struct conn_pool *pool)
     memset(&pool->cold[id], 0, sizeof(pool->cold[id]));
     pool->cold[id].splice_pipe[0] = -1;
     pool->cold[id].splice_pipe[1] = -1;
+    pool->cold[id].backend_ssl = NULL;
 
     return id;
 }
@@ -166,6 +167,7 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     cold->chunk_remaining = 0;
     cold->chunk_skip_crlf = false;
     cold->h2 = NULL; /* h2_session_free must have been called by conn_close before conn_free */
+    cold->backend_ssl = NULL;
 
     pool->free_list[pool->free_top++] = id;
     if (pool->active > 0) pool->active--;

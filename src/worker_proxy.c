@@ -43,6 +43,556 @@ int parse_http_request_line(const uint8_t *buf, int len,
     return 0;
 }
 
+static void send_bad_gateway_and_close(struct worker *w, uint32_t cid)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    static const char r502[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
+    send(h->client_fd, r502, sizeof(r502) - 1, MSG_NOSIGNAL);
+    conn_close(w, cid, false);
+}
+
+static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    struct conn_cold *cold_main = conn_cold_ptr(&w->pool, cid);
+
+    log_debug("recv_backend", "conn=%u n=%d", cid, n);
+    if (n > 0 && !(h->flags & CONN_FLAG_BACKEND_TLS)) {
+        RECV_WINDOW_GROW(h, n, w->pool.buf_size);
+        /* Re-arm TCP_QUICKACK — kernel clears it after each ACK */
+        int one = 1;
+        setsockopt(h->backend_fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+    }
+    if (n == 0) {
+        /* Backend EOF */
+        if (!(h->flags & CONN_FLAG_STREAMING_BACKEND)) {
+            /* No response bytes were ever received — stale pooled connection
+             * closed by the backend before it could respond.  The client has
+             * already sent its request and is waiting; send 502 and close. */
+            send_bad_gateway_and_close(w, cid);
+            return;
+        }
+        /* Normal EOF — backend finished streaming response */
+        h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+        /* Backend closed the connection — never return to pool */
+        if (cold_main->backend_ssl) {
+#ifdef VORTEX_PHASE_TLS
+            SSL_free((SSL *)cold_main->backend_ssl);
+#endif
+            cold_main->backend_ssl = NULL;
+        }
+        if (h->backend_fd >= 0) {
+            uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
+            close(h->backend_fd); h->backend_fd = -1;
+        }
+        h->flags &= ~(CONN_FLAG_BACKEND_POOLED | CONN_FLAG_BACKEND_TLS);
+        /* Keep client alive for next request */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, false); return; }
+        PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        uring_submit(&w->uring);
+        return;
+    }
+    /* First response byte received — cancel the backend deadline */
+    cold_main->backend_deadline_ns = 0;
+    h->flags |= CONN_FLAG_STREAMING_BACKEND;
+    h->bytes_out += (uint32_t)n;
+
+    /* Track body bytes for keep-alive pool return */
+    {
+        int _ri = h->route_idx, _bi = h->backend_idx;
+        int _ps = (h->flags & CONN_FLAG_BACKEND_TLS) ? 0
+                 : w->cfg->routes[_ri].backends[_bi].pool_size;
+        if (_ps > 0) {
+            /* Parse Content-Length from the first response chunk */
+            if (cold_main->backend_content_length == 0 && n > 12) {
+                const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
+                const char *clh = (const char *)memmem(sbuf2, (size_t)n,
+                                                        "\r\nContent-Length:", 17);
+                if (!clh) clh = (const char *)memmem(sbuf2, (size_t)n,
+                                                       "\r\ncontent-length:", 17);
+                if (clh) {
+                    const char *cv = clh + 17;
+                    while (*cv == ' ') cv++;
+                    cold_main->backend_content_length = (uint32_t)atol(cv);
+                }
+            }
+            /* Count body bytes (after \r\n\r\n header terminator) */
+            if (cold_main->backend_content_length > 0) {
+                const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
+                const char *hend = (const char *)FIND_HDR_END(sbuf2, (size_t)n);
+                if (hend && (hend + 4 <= (const char *)sbuf2 + n)) {
+                    size_t body_in_chunk = (size_t)n - (size_t)(hend + 4 - (const char *)sbuf2);
+                    cold_main->backend_body_recv += (uint32_t)body_in_chunk;
+                } else if (!hend) {
+                    cold_main->backend_body_recv += (uint32_t)n;
+                }
+            }
+        }
+    }
+
+    /* Chunked TE reassembly: accumulate body on follow-up recvs */
+    if ((h->flags & CONN_FLAG_CACHING) &&
+        (n < 5 || memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) != 0)) {
+        if (cold_main->chunk_buf) {
+            bool final = chunked_decode_append(cold_main,
+                conn_send_buf(&w->pool, cid), (size_t)n);
+            if (final) {
+                cache_chunked_store(w, cid, h, cold_main);
+                h->flags &= ~CONN_FLAG_CACHING;
+            }
+        }
+    }
+
+    /* WebSocket 101 upgrade — backend TLS origins do not support raw io_uring
+     * relay yet, so reject before switching to passthrough mode. */
+    if ((h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) && n > 12 &&
+        memcmp(conn_send_buf(&w->pool, cid), "HTTP/1.1 101", 12) == 0) {
+        if (h->flags & CONN_FLAG_BACKEND_TLS) {
+            send_bad_gateway_and_close(w, cid);
+            return;
+        }
+        send(h->client_fd, conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL);
+
+        /* Arm both recv directions simultaneously. */
+        struct io_uring_sqe *ws_c = io_uring_get_sqe(&w->uring.ring);
+        struct io_uring_sqe *ws_b = io_uring_get_sqe(&w->uring.ring);
+        if (!ws_c || !ws_b) { conn_close(w, cid, false); return; }
+
+        /* client → backend direction: recv into recv_buf */
+        PREP_RECV(w, ws_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_RECV(w, cid));
+        ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT_WS, cid);
+
+        /* backend → client direction: recv into send_buf */
+        PREP_RECV(w, ws_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+            conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+        ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
+
+        uring_submit(&w->uring);
+        return;
+    }
+
+    /* Response header rewrites — only on the first chunk (starts with "HTTP/") */
+    if (n > 7 && memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) == 0) {
+        uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+
+        /* Locate end of headers */
+        uint8_t *hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+        size_t hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+
+        /* ---- Replace/inject Server header ----
+         * Per-route server_header takes priority over global; empty = pass through. */
+        const char *_srv_hdr = w->cfg->routes[h->route_idx].server_header[0]
+                               ? w->cfg->routes[h->route_idx].server_header
+                               : w->cfg->server_header;
+        if (_srv_hdr[0]) {
+            const char *new_srv = _srv_hdr;
+            size_t new_srv_len  = strlen(new_srv);
+            uint8_t *sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nServer:", 9);
+            if (!sh) sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nserver:", 9);
+            if (sh) {
+                uint8_t *vs = sh + 9;
+                while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
+                uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                    (size_t)(sbuf + hdr_len - vs));
+                if (ve) {
+                    size_t old_len = (size_t)(ve - vs);
+                    int delta = (int)new_srv_len - (int)old_len;
+                    if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
+                        memmove(vs + new_srv_len, ve, (size_t)(sbuf + n - ve));
+                        memcpy(vs, new_srv, new_srv_len);
+                        n += delta;
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                    }
+                }
+            } else if (hdr_end) {
+                /* No Server header — inject one */
+                char inj_srv[80];
+                int inj_srv_len = snprintf(inj_srv, sizeof(inj_srv),
+                    "\r\nServer: %s", new_srv);
+                if (n + inj_srv_len <= (int)w->pool.buf_size) {
+                    size_t hle = (size_t)(hdr_end - sbuf);
+                    memmove(sbuf + hle + inj_srv_len, sbuf + hle,
+                            (size_t)(n - (int)hle));
+                    memcpy(sbuf + hle, inj_srv, (size_t)inj_srv_len);
+                    n += inj_srv_len;
+                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                }
+            }
+        }
+
+        /* ---- Cache-Control rewrite based on request URL ---- */
+        {
+            char cc_url[512] = {0};
+            char cc_method[16] = {0};
+            const uint8_t *req = conn_recv_buf(&w->pool, cid);
+            parse_http_request_line(req, (int)w->pool.buf_size,
+                                    cc_method, sizeof(cc_method),
+                                    cc_url, sizeof(cc_url));
+            uint32_t ttl = cache_ttl_for_url(cc_url);
+
+            /* For static assets (ttl >= 3600): override whatever the backend sent —
+             * Kestrel/Sonarr sends no-cache,no-store for ALL responses including images.
+             * For dynamic content (ttl == 60): only inject if backend sent nothing.
+             * For API (ttl == 0): leave Cache-Control untouched. */
+            if (hdr_end && ttl > 0) {
+                /* Build the value we want */
+                char cc_val[64];
+                if (ttl >= 3600) snprintf(cc_val, sizeof(cc_val), "public, max-age=%u", ttl);
+                else             snprintf(cc_val, sizeof(cc_val), "public, max-age=%u", ttl);
+
+                uint8_t *cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nCache-Control:", 16);
+                if (!cch) cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\ncache-control:", 16);
+
+                if (cch && ttl >= 3600) {
+                    uint8_t *vs = cch + 16;
+                    while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
+                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(sbuf + hdr_len - vs));
+                    if (ve) {
+                        size_t old_len = (size_t)(ve - vs);
+                        int delta = (int)strlen(cc_val) - (int)old_len;
+                        if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
+                            memmove(vs + strlen(cc_val), ve, (size_t)(sbuf + n - ve));
+                            memcpy(vs, cc_val, strlen(cc_val));
+                            n += delta;
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                        }
+                    }
+                } else if (!cch) {
+                    /* No Cache-Control present — inject one */
+                    char cc_hdr[80];
+                    int cc_len = snprintf(cc_hdr, sizeof(cc_hdr),
+                        "\r\nCache-Control: %s", cc_val);
+                    if (n + cc_len <= (int)w->pool.buf_size) {
+                        size_t hle = (size_t)(hdr_end - sbuf);
+                        memmove(sbuf + hle + cc_len, sbuf + hle, (size_t)(n - (int)hle));
+                        memcpy(sbuf + hle, cc_hdr, (size_t)cc_len);
+                        n += cc_len;
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                    }
+                }
+
+                /* For static assets: also strip Pragma header (no-cache from Kestrel) */
+                if (ttl >= 3600 && hdr_end) {
+                    uint8_t *ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\nPragma:", 9);
+                    if (!ph)
+                        ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\npragma:", 9);
+                    if (ph) {
+                        uint8_t *pe = (uint8_t *)FIND_CRLF(ph + 2,
+                            (size_t)(sbuf + n - ph - 2));
+                        if (pe) {
+                            pe += 2; /* point past the line's \r\n */
+                            size_t remove = (size_t)(pe - (ph + 2));
+                            memmove(ph + 2, ph + 2 + remove,
+                                (size_t)(sbuf + n - (ph + 2 + remove)));
+                            n -= (int)remove;
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ---- Inject HSTS on HTTPS responses when absent ---- */
+        if (hdr_end) {
+            bool has_hsts =
+                memmem(sbuf, hdr_len, "\r\nStrict-Transport-Security:", 28) ||
+                memmem(sbuf, hdr_len, "\r\nstrict-transport-security:", 28);
+            if (!has_hsts) {
+                const char *hsts = "\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains";
+                int hsts_len = (int)strlen(hsts);
+                if (n + hsts_len <= (int)w->pool.buf_size) {
+                    size_t hle = (size_t)(hdr_end - sbuf);
+                    memmove(sbuf + hle + hsts_len, sbuf + hle, (size_t)(n - (int)hle));
+                    memcpy(sbuf + hle, hsts, (size_t)hsts_len);
+                    n += hsts_len;
+                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                }
+            }
+        }
+
+#ifdef VORTEX_QUIC
+        if (hdr_end) {
+            const char *altsvc = "\r\nAlt-Svc: h3=\":443\"; ma=86400";
+            int as_len = 30;
+            if (n + as_len <= (int)w->pool.buf_size) {
+                size_t hle = (size_t)(hdr_end - sbuf);
+                memmove(sbuf + hle + as_len, sbuf + hle, (size_t)(n - (int)hle));
+                memcpy(sbuf + hle, altsvc, (size_t)as_len);
+                n += as_len;
+                hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+            }
+        }
+#endif
+
+        {
+            uint8_t *ch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nConnection:", 13);
+            if (!ch) ch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nconnection:", 13);
+            if (ch) {
+                uint8_t *vs = ch + 13;
+                while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
+                uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                    (size_t)(sbuf + hdr_len - vs));
+                if (ve && ve > vs) {
+                    const char *kl = "keep-alive";
+                    size_t kl_len = 10;
+                    size_t old_len = (size_t)(ve - vs);
+                    int delta = (int)kl_len - (int)old_len;
+                    if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
+                        memmove(vs + kl_len, ve, (size_t)(sbuf + n - ve));
+                        memcpy(vs, kl, kl_len);
+                        n += delta;
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                    }
+                }
+            } else if (hdr_end) {
+                const int ka_len = 24;
+                if (n + ka_len <= (int)w->pool.buf_size) {
+                    size_t hle = (size_t)(hdr_end - sbuf);
+                    memmove(sbuf + hle + ka_len, sbuf + hle, (size_t)(n - (int)hle));
+                    memcpy(sbuf + hle, "\r\nConnection: keep-alive", (size_t)ka_len);
+                    n += ka_len;
+                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                }
+            }
+            (void)hdr_len;
+        }
+
+        if (w->cache && w->cache->index) {
+            const uint8_t *resp2 = conn_send_buf(&w->pool, cid);
+            int status2 = 0;
+            if (n > 9) {
+                const char *sp = (const char *)resp2 + 9;
+                for (int i = 0; i < 3 && sp[i] >= '0' && sp[i] <= '9'; i++)
+                    status2 = status2 * 10 + (sp[i] - '0');
+            }
+            if (status2 == 200) {
+                char cc_method2[16] = {0}, cc_url2[512] = {0};
+                const uint8_t *req2 = conn_recv_buf(&w->pool, cid);
+                if (req2[0] != 0 &&
+                    parse_http_request_line(req2, (int)w->pool.buf_size,
+                                            cc_method2, sizeof(cc_method2),
+                                            cc_url2, sizeof(cc_url2)) == 0 &&
+                    strcmp(cc_method2, "GET") == 0) {
+
+                    uint32_t ttl2 = cache_ttl_for_url(cc_url2);
+                    if (ttl2 > 0) {
+                        const char *he2 = (const char *)FIND_HDR_END(
+                            resp2, (size_t)n);
+                        if (he2) {
+                            size_t hl2 = (size_t)(he2 + 4 - (const char *)resp2);
+                            size_t bl2 = (size_t)n - hl2;
+
+                            bool is_chunked =
+                                memmem(resp2, hl2, "\r\nTransfer-Encoding: chunked", 28) ||
+                                memmem(resp2, hl2, "\r\ntransfer-encoding: chunked", 28);
+
+                            bool cl_ok = false;
+                            if (!is_chunked) {
+                                const char *clh = (const char *)memmem(
+                                    resp2, hl2, "\r\nContent-Length:", 17);
+                                if (!clh) clh = (const char *)memmem(
+                                    resp2, hl2, "\r\ncontent-length:", 17);
+                                if (clh) {
+                                    const char *cv = clh + 17;
+                                    while (*cv == ' ') cv++;
+                                    uint32_t cl = (uint32_t)atol(cv);
+                                    cl_ok = (bl2 == cl);
+                                }
+                            }
+
+                            if (cl_ok) {
+                                char cc_key2[640];
+                                make_cache_key(req2, (size_t)w->pool.buf_size,
+                                               cc_url2, cc_key2, sizeof(cc_key2));
+                                cache_store(w->cache, cc_key2, strlen(cc_key2),
+                                    (uint16_t)status2, ttl2,
+                                    resp2, hl2, resp2 + hl2, bl2);
+                                log_debug("cache_store",
+                                    "conn=%u url=%s ttl=%u body=%zu",
+                                    cid, cc_key2, ttl2, bl2);
+                            } else if (is_chunked && !(h->flags & CONN_FLAG_CACHING)) {
+                                uint32_t hlen2 = (uint32_t)hl2;
+                                uint32_t init_cap = hlen2 + 65536;
+                                cold_main->chunk_buf = malloc(init_cap);
+                                if (cold_main->chunk_buf) {
+                                    cold_main->chunk_buf_cap  = init_cap;
+                                    cold_main->chunk_hdr_len  = hlen2;
+                                    cold_main->chunk_body_len = 0;
+                                    cold_main->chunk_remaining = 0;
+                                    cold_main->chunk_skip_crlf = false;
+                                    cold_main->chunk_ttl = ttl2;
+                                    make_cache_key(req2, (size_t)w->pool.buf_size,
+                                                   cc_url2,
+                                                   cold_main->chunk_url,
+                                                   sizeof(cold_main->chunk_url));
+                                    memcpy(cold_main->chunk_buf, resp2, hlen2);
+                                    h->flags |= CONN_FLAG_CACHING;
+                                    if (bl2 > 0) {
+                                        bool fin2 = chunked_decode_append(cold_main,
+                                            resp2 + hlen2, bl2);
+                                        if (fin2) {
+                                            cache_chunked_store(w, cid, h, cold_main);
+                                            h->flags &= ~CONN_FLAG_CACHING;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (n > 7 && memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) == 0) {
+        uint8_t *sbuf_ct = conn_send_buf(&w->pool, cid);
+        const uint8_t *hend_ct = (const uint8_t *)FIND_HDR_END(sbuf_ct, (size_t)n);
+        size_t hdr_scan_len = hend_ct
+            ? (size_t)(hend_ct - sbuf_ct) + 4
+            : (size_t)n;
+        const uint8_t *cth2 = (const uint8_t *)memmem(
+            sbuf_ct, hdr_scan_len, "\r\nContent-Type:", 15);
+        if (!cth2) cth2 = (const uint8_t *)memmem(
+            sbuf_ct, hdr_scan_len, "\r\ncontent-type:", 15);
+        if (cth2) {
+            const uint8_t *ctv2 = cth2 + 15;
+            while (*ctv2 == ' ') ctv2++;
+            size_t ct_rem2 = (size_t)(sbuf_ct + hdr_scan_len - ctv2);
+            h->ct_compressible = is_compressible_type(ctv2, ct_rem2) ? 1 : 0;
+        } else {
+            h->ct_compressible = 0;
+        }
+    }
+
+    if ((h->flags & (CONN_FLAG_CLIENT_BR | CONN_FLAG_CLIENT_GZIP)) && n > 0) {
+        uint8_t *sbuf_gz = conn_send_buf(&w->pool, cid);
+        const uint8_t *hend_gz = (const uint8_t *)FIND_HDR_END(sbuf_gz, (size_t)n);
+        if (hend_gz) {
+            size_t hdr_end_off = (size_t)(hend_gz - sbuf_gz);
+            size_t body_off    = hdr_end_off + 4;
+            size_t body_len    = (size_t)n - body_off;
+
+            bool cl_match = false;
+            if (body_len >= COMPRESS_MIN_BODY) {
+                const char *clh2 = (const char *)memmem(
+                    sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
+                if (!clh2) clh2 = (const char *)memmem(
+                    sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
+                if (clh2) {
+                    const char *cv2 = clh2 + 17;
+                    while (*cv2 == ' ') cv2++;
+                    cl_match = ((size_t)atol(cv2) == body_len);
+                }
+            }
+
+            if (cl_match) {
+                const uint8_t *cth = (const uint8_t *)memmem(
+                    sbuf_gz, hdr_end_off + 4, "\r\nContent-Type:", 15);
+                if (!cth) cth = (const uint8_t *)memmem(
+                    sbuf_gz, hdr_end_off + 4, "\r\ncontent-type:", 15);
+                bool already_encoded =
+                    memmem(sbuf_gz, hdr_end_off + 4, "\r\nContent-Encoding:", 19) ||
+                    memmem(sbuf_gz, hdr_end_off + 4, "\r\ncontent-encoding:", 19);
+
+                if (cth && !already_encoded) {
+                    const uint8_t *ct_val = cth + 15;
+                    while (*ct_val == ' ') ct_val++;
+                    size_t ct_remaining = (size_t)(sbuf_gz + hdr_end_off + 4 - ct_val);
+
+                    if (is_compressible_type(ct_val, ct_remaining)) {
+                        bool use_br = (h->flags & CONN_FLAG_CLIENT_BR) != 0;
+                        uint8_t *scratch = conn_recv_buf(&w->pool, cid);
+                        size_t clen = use_br
+                            ? brotli_compress(sbuf_gz + body_off, body_len,
+                                              scratch, w->pool.buf_size)
+                            : gzip_compress(sbuf_gz + body_off, body_len,
+                                            scratch, w->pool.buf_size);
+                        if (use_br && (clen == 0 || clen >= body_len)) {
+                            use_br = false;
+                            clen = gzip_compress(sbuf_gz + body_off, body_len,
+                                                 scratch, w->pool.buf_size);
+                        }
+
+                        if (clen > 0 && clen < body_len) {
+                            uint8_t *clh3 = (uint8_t *)memmem(
+                                sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
+                            if (!clh3) clh3 = (uint8_t *)memmem(
+                                sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
+                            if (clh3) {
+                                uint8_t *vs = clh3 + 17;
+                                while (*vs == ' ') vs++;
+                                uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                                    (size_t)(sbuf_gz + hdr_end_off - vs));
+                                if (ve) {
+                                    char new_cl[20];
+                                    int ncl = snprintf(new_cl, sizeof(new_cl), "%zu", clen);
+                                    int delta = ncl - (int)(ve - vs);
+                                    memmove(vs + ncl, ve,
+                                        (size_t)(sbuf_gz + hdr_end_off + 4 - ve));
+                                    memcpy(vs, new_cl, (size_t)ncl);
+                                    hdr_end_off = (size_t)((int)hdr_end_off + delta);
+                                }
+                            }
+
+                            {
+                                const char *ce_hdr = use_br
+                                    ? "\r\nContent-Encoding: br"
+                                    : "\r\nContent-Encoding: gzip";
+                                int ce_len = use_br ? 22 : 24;
+                                memmove(sbuf_gz + hdr_end_off + ce_len,
+                                        sbuf_gz + hdr_end_off, 4);
+                                memcpy(sbuf_gz + hdr_end_off, ce_hdr, (size_t)ce_len);
+                                size_t new_body_off = hdr_end_off + (size_t)ce_len + 4;
+                                if (new_body_off + clen <= w->pool.buf_size) {
+                                    memcpy(sbuf_gz + new_body_off, scratch, clen);
+                                    n = (int)(new_body_off + clen);
+                                    log_debug("compress", "conn=%u %s %zu→%zu bytes",
+                                              cid, use_br ? "br" : "gzip", body_len, clen);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    h->send_buf_off = 0;
+    h->send_buf_len = (uint32_t)n;
+    {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        if (w->uring.bufs_registered && !(h->flags & CONN_FLAG_KTLS_TX)) {
+            h->zc_notif_count++;
+            io_uring_prep_send_zc_fixed(sqe, h->client_fd,
+                conn_send_buf(&w->pool, cid), (size_t)n,
+                MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
+            if (w->uring.files_registered) sqe->flags |= IOSQE_FIXED_FILE;
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
+        } else {
+            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+        }
+        uring_submit(&w->uring);
+    }
+}
+
 /*
  * handle_proxy_data — core io_uring completion dispatcher.
  *
@@ -79,6 +629,125 @@ int parse_http_request_line(const uint8_t *buf, int len,
  * TIMEOUT op fires periodically from a recurring kernel timeout SQE and
  * is used to expire idle connections and XDP blocklist entries.
  */
+#ifdef VORTEX_PHASE_TLS
+static void process_tls_result(struct worker *w,
+                               const struct tls_handshake_result *res)
+{
+    uint32_t hcid = res->cid;
+    if (hcid >= w->pool.capacity) return;
+    struct conn_hot *th = conn_hot(&w->pool, hcid);
+    if (th->state == CONN_STATE_FREE) return;
+    if (!res->ok) {
+        close(res->client_fd);
+        conn_free(&w->pool, hcid);
+        return;
+    }
+    if (res->tls_version == TLS1_3_VERSION) w->tls13_count++;
+    else w->tls12_count++;
+    if (res->ktls_tx && res->ktls_rx) {
+        th->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
+        th->ssl = NULL;
+        w->ktls_count++;
+    } else {
+        th->ssl = res->ssl;
+    }
+#ifdef VORTEX_H2
+    if (res->h2_negotiated) {
+        th->flags |= CONN_FLAG_HTTP2;
+        th->state = CONN_STATE_PROXYING;
+        th->route_idx = (uint16_t)(res->tls_route_idx >= 0 ? res->tls_route_idx : 0);
+        th->last_active_tsc = rdtsc();
+        w->accepted++;
+        if (h2_session_init(w, hcid) != 0) {
+            close(res->client_fd);
+            conn_free(&w->pool, hcid);
+            return;
+        }
+        struct io_uring_sqe *h2sq = io_uring_get_sqe(&w->uring.ring);
+        if (!h2sq) { conn_close(w, hcid, true); return; }
+        if (w->uring.recv_ring) {
+            int _pfd = w->uring.files_registered ? FIXED_FD_CLIENT(w, hcid) : res->client_fd;
+            io_uring_prep_recv_multishot(h2sq, _pfd, NULL, 0, 0);
+            h2sq->buf_group = w->uring.recv_ring_bgid;
+            h2sq->flags |= IOSQE_BUFFER_SELECT;
+            if (w->uring.files_registered) h2sq->flags |= IOSQE_FIXED_FILE;
+        } else {
+            io_uring_prep_recv(h2sq, res->client_fd,
+                conn_recv_buf(&w->pool, hcid), w->pool.buf_size, 0);
+        }
+        h2sq->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_CLIENT, 0, hcid);
+        uring_submit(&w->uring);
+        return;
+    }
+#endif
+    {
+        int route_idx = res->tls_route_idx;
+        if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
+            int backend_idx = select_available_backend(w, route_idx, 0);
+            if (backend_idx < 0) {
+                static const char r503[] =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
+                    "Service Unavailable";
+                send(res->client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
+                close(res->client_fd);
+                conn_free(&w->pool, hcid);
+                return;
+            }
+            const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
+            th->route_idx = (uint16_t)route_idx;
+            th->backend_idx = (uint16_t)backend_idx;
+            if (addr) {
+                const struct backend_config *bcfg = &w->cfg->routes[route_idx].backends[backend_idx];
+                int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
+                int pooled_fd = (cfg_pool > 0) ? global_pool_get(route_idx, backend_idx) : -1;
+                if (pooled_fd >= 0) {
+                    th->backend_fd = pooled_fd;
+                    th->flags |= CONN_FLAG_BACKEND_POOLED;
+                    uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid), pooled_fd);
+                } else {
+                    th->backend_fd = begin_async_connect(w, bcfg, hcid);
+                    if (th->backend_fd >= 0)
+                        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid), th->backend_fd);
+                    if (th->backend_fd < 0) {
+                        const char *r502 =
+                            "HTTP/1.1 502 Bad Gateway\r\n"
+                            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
+                        send(res->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
+                        close(res->client_fd);
+                        conn_free(&w->pool, hcid);
+                        return;
+                    }
+                    th->flags |= CONN_FLAG_BACKEND_CONNECTING;
+                    th->state = CONN_STATE_BACKEND_CONNECT;
+                    th->last_active_tsc = rdtsc();
+                    w->accepted++;
+                    return;
+                }
+            }
+        }
+    }
+    if (th->backend_fd < 0) {
+        const char *r502 =
+            "HTTP/1.1 502 Bad Gateway\r\n"
+            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
+        send(res->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
+        close(res->client_fd);
+        conn_free(&w->pool, hcid);
+        return;
+    }
+    th->state = CONN_STATE_PROXYING;
+    th->last_active_tsc = rdtsc();
+    w->accepted++;
+    struct io_uring_sqe *ts1 = io_uring_get_sqe(&w->uring.ring);
+    if (!ts1) { conn_close(w, hcid, true); return; }
+    PREP_RECV(w, ts1, res->client_fd, FIXED_FD_CLIENT(w, hcid),
+        conn_recv_buf(&w->pool, hcid), th->recv_window, 0, hcid);
+    ts1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, hcid);
+    uring_submit(&w->uring);
+}
+#endif
+
 void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 {
     uint64_t ud  = cqe->user_data;
@@ -198,7 +867,9 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
             if (addr) {
                 /* Try idle pool first */
-                int cfg_pool = w->cfg->routes[route_idx].backends[backend_idx].pool_size;
+                const struct backend_config *bcfg =
+                    &w->cfg->routes[route_idx].backends[backend_idx];
+                int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
                 int pooled_fd = (cfg_pool > 0)
                                 ? global_pool_get(route_idx, backend_idx) : -1;
                 if (pooled_fd >= 0) {
@@ -209,7 +880,6 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         (unsigned)new_cid, pooled_fd);
                 } else {
                     /* Async connect — CONNECT completion arms RECV_CLIENT */
-                    const struct backend_config *bcfg = &w->cfg->routes[route_idx].backends[backend_idx];
                     nh->backend_fd = begin_async_connect(w, bcfg, new_cid);
                     if (nh->backend_fd >= 0)
                         uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, new_cid), nh->backend_fd);
@@ -276,139 +946,15 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
         struct tls_handshake_result res;
         memcpy(&res, w->tls_pipe_buf, sizeof(res));
-        uint32_t hcid = res.cid;
+        process_tls_result(w, &res);
 
-        if (hcid >= w->pool.capacity) return;
-        struct conn_hot *th = conn_hot(&w->pool, hcid);
-        if (th->state == CONN_STATE_FREE) return;
-
-        if (!res.ok) {
-            close(res.client_fd);
-            conn_free(&w->pool, hcid);
-            return;
+        /* Drain any additional results queued in the pipe */
+        for (;;) {
+            struct tls_handshake_result extra;
+            ssize_t nr = read(w->tls_done_pipe_rd, &extra, sizeof(extra));
+            if (nr != (ssize_t)sizeof(extra)) break;
+            process_tls_result(w, &extra);
         }
-
-        /* Record TLS version stats */
-        if (res.tls_version == TLS1_3_VERSION) w->tls13_count++;
-        else w->tls12_count++;
-
-        if (res.ktls_tx && res.ktls_rx) {
-            th->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
-            th->ssl    = NULL;
-            w->ktls_count++;
-        } else {
-            th->ssl = res.ssl;
-        }
-
-#ifdef VORTEX_H2
-        /* If client negotiated h2 via ALPN, hand off to the H2 session */
-        if (res.h2_negotiated) {
-            th->flags |= CONN_FLAG_HTTP2;
-            th->state  = CONN_STATE_PROXYING;
-            th->route_idx = (uint16_t)(res.tls_route_idx >= 0 ? res.tls_route_idx : 0);
-            th->last_active_tsc = rdtsc();
-            w->accepted++;
-
-            if (h2_session_init(w, hcid) != 0) {
-                close(res.client_fd);
-                conn_free(&w->pool, hcid);
-                return;
-            }
-
-            /* Arm first RECV_CLIENT for H2 frame data.
-             * Use multishot recv with the buf ring when available — the kernel
-             * re-arms automatically so no SQE is needed per frame batch. */
-            struct io_uring_sqe *h2sq = io_uring_get_sqe(&w->uring.ring);
-            if (!h2sq) { conn_close(w, hcid, true); return; }
-            if (w->uring.recv_ring) {
-                int _pfd = w->uring.files_registered
-                           ? FIXED_FD_CLIENT(w, hcid) : res.client_fd;
-                io_uring_prep_recv_multishot(h2sq, _pfd, NULL, 0, 0);
-                h2sq->buf_group = w->uring.recv_ring_bgid;
-                h2sq->flags    |= IOSQE_BUFFER_SELECT;
-                if (w->uring.files_registered) h2sq->flags |= IOSQE_FIXED_FILE;
-            } else {
-                io_uring_prep_recv(h2sq, res.client_fd,
-                    conn_recv_buf(&w->pool, hcid), w->pool.buf_size, 0);
-            }
-            h2sq->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_CLIENT, 0, hcid);
-            uring_submit(&w->uring);
-            return;
-        }
-#endif
-
-        /* Route selection (same logic as post-TLS in handle_accept) */
-        int tls_route_idx = res.tls_route_idx;
-        int route_idx = tls_route_idx;
-        if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
-            int backend_idx = select_available_backend(w, route_idx, 0);
-            if (backend_idx < 0) {
-                static const char r503[] =
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
-                    "Service Unavailable";
-                send(res.client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
-                close(res.client_fd);
-                conn_free(&w->pool, hcid);
-                return;
-            }
-            const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
-            th->route_idx   = (uint16_t)route_idx;
-            th->backend_idx = (uint16_t)backend_idx;
-
-            if (addr) {
-                int cfg_pool = w->cfg->routes[route_idx].backends[backend_idx].pool_size;
-                int pooled_fd = (cfg_pool > 0)
-                                ? global_pool_get(route_idx, backend_idx) : -1;
-                if (pooled_fd >= 0) {
-                    th->backend_fd = pooled_fd;
-                    th->flags |= CONN_FLAG_BACKEND_POOLED;
-                    uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid), pooled_fd);
-                } else {
-                    const struct backend_config *bcfg =
-                        &w->cfg->routes[route_idx].backends[backend_idx];
-                    th->backend_fd = begin_async_connect(w, bcfg, hcid);
-                    if (th->backend_fd >= 0)
-                        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid),
-                                         th->backend_fd);
-                    if (th->backend_fd < 0) {
-                        const char *r502 =
-                            "HTTP/1.1 502 Bad Gateway\r\n"
-                            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-                        send(res.client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-                        close(res.client_fd);
-                        conn_free(&w->pool, hcid);
-                        return;
-                    }
-                    th->flags |= CONN_FLAG_BACKEND_CONNECTING;
-                    th->state = CONN_STATE_BACKEND_CONNECT;
-                    th->last_active_tsc = rdtsc();
-                    w->accepted++;
-                    return; /* RECV_CLIENT armed by VORTEX_OP_CONNECT handler */
-                }
-            }
-        }
-
-        if (th->backend_fd < 0) {
-            const char *r502 =
-                "HTTP/1.1 502 Bad Gateway\r\n"
-                "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-            send(res.client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-            close(res.client_fd);
-            conn_free(&w->pool, hcid);
-            return;
-        }
-
-        th->state = CONN_STATE_PROXYING;
-        th->last_active_tsc = rdtsc();
-        w->accepted++;
-
-        struct io_uring_sqe *ts1 = io_uring_get_sqe(&w->uring.ring);
-        if (!ts1) { conn_close(w, hcid, true); return; }
-        PREP_RECV(w, ts1, res.client_fd, FIXED_FD_CLIENT(w, hcid),
-            conn_recv_buf(&w->pool, hcid), th->recv_window, 0, hcid);
-        ts1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, hcid);
-        uring_submit(&w->uring);
         return;
     }
 #endif
@@ -444,7 +990,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     struct conn_hot *h = conn_hot(&w->pool, cid);
     if (h->state == CONN_STATE_FREE) return;
 
-    if (cqe->res < 0) {
+    if (cqe->res < 0 && op != VORTEX_OP_CONNECT) {
         /* EIO on kTLS = TLS close_notify or alert — treat as normal close */
         bool is_error = true;
         if (cqe->res == -ECONNRESET || cqe->res == -EPIPE ||
@@ -497,7 +1043,8 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             /* Prefer the sticky backend fd pinned from the previous request.
              * This avoids pool operations (uring_install_fd/remove_fd) on every
              * request for long-lived client connections. */
-            int cfg_pool = w->cfg->routes[ri].backends[bi].pool_size;
+            const struct backend_config *bcfg = &w->cfg->routes[ri].backends[bi];
+            int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
             if (h->backend_fd >= 0 && h->backend_idx == (uint16_t)bi) {
                 /* Reuse existing connection — already installed in fixed slot */
                 log_debug("backend_reuse", "conn=%u fd=%d", cid, h->backend_fd);
@@ -505,12 +1052,20 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                 /* Release any fd for a different backend (route switch) */
                 if (h->backend_fd >= 0) {
                     int old_ps = w->cfg->routes[h->route_idx].backends[h->backend_idx].pool_size;
+                    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
                     uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-                    if (old_ps > 0)
+                    if (cold->backend_ssl) {
+#ifdef VORTEX_PHASE_TLS
+                        SSL_free((SSL *)cold->backend_ssl);
+#endif
+                        cold->backend_ssl = NULL;
+                    }
+                    if (old_ps > 0 && !(h->flags & CONN_FLAG_BACKEND_TLS))
                         global_pool_put(h->route_idx, h->backend_idx, h->backend_fd, old_ps);
                     else
                         close(h->backend_fd);
                     h->backend_fd = -1;
+                    h->flags &= ~(CONN_FLAG_BACKEND_POOLED | CONN_FLAG_BACKEND_TLS);
                 }
                 /* Try global pool, then async connect */
                 int pfd = (cfg_pool > 0) ? global_pool_get(ri, bi) : -1;
@@ -524,8 +1079,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                      * which will trigger resend of the buffered request.
                      * We pass n as hint via send_buf_len so CONNECT can forward it. */
                     h->send_buf_len = (uint32_t)n;  /* stash the byte count */
-                    const struct backend_config *bcfg2 = &w->cfg->routes[ri].backends[bi];
-                    h->backend_fd = begin_async_connect(w, bcfg2, cid);
+                    h->backend_fd = begin_async_connect(w, bcfg, cid);
                     if (h->backend_fd >= 0)
                         uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid), h->backend_fd);
                     if (h->backend_fd < 0) {
@@ -647,6 +1201,10 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             if (memmem(rbuf, (size_t)n, "Upgrade: websocket", 18) != NULL ||
                 memmem(rbuf, (size_t)n, "upgrade: websocket", 18) != NULL) {
                 h->flags |= CONN_FLAG_WEBSOCKET_ACTIVE;
+                if (w->cfg->routes[h->route_idx].backends[h->backend_idx].tls) {
+                    send_bad_gateway_and_close(w, cid);
+                    break;
+                }
             }
         }
 
@@ -841,9 +1399,10 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
              * reuse the connection.  For all others: force "close" so the
              * backend signals response completion with EOF. */
             if (!is_ws) {
-                bool use_ka = (h->flags & CONN_FLAG_BACKEND_POOLED) != 0
+                bool backend_tls = backend_uses_tls(w, cid);
+                bool use_ka = !backend_tls && ((h->flags & CONN_FLAG_BACKEND_POOLED) != 0
                               || (w->cfg->routes[h->route_idx]
-                                     .backends[h->backend_idx].pool_size > 0);
+                                     .backends[h->backend_idx].pool_size > 0));
                 const char *conn_val = use_ka ? "keep-alive" : "close";
                 size_t      conn_val_len = use_ka ? 10 : 5;
 
@@ -953,6 +1512,26 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         }
 
         /* Forward client data to backend */
+        if (backend_uses_tls(w, cid)) {
+            if (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) {
+                send_bad_gateway_and_close(w, cid);
+                break;
+            }
+            if (backend_tls_send_all(w, cid, conn_recv_buf(&w->pool, cid), (size_t)fwd_n) < 0) {
+                send_bad_gateway_and_close(w, cid);
+                break;
+            }
+            backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+            {
+                int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+                if (rn < 0) {
+                    send_bad_gateway_and_close(w, cid);
+                    break;
+                }
+                handle_backend_read_result(w, cid, rn);
+            }
+            break;
+        }
         struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
         if (!sqe) { conn_close(w, cid, true); break; }
         PREP_SEND(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
@@ -968,6 +1547,15 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         if (n < 0) { conn_close(w, cid, true); break; }
         /* All client data forwarded — arm deadline then wait for backend response */
         backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+        if (backend_uses_tls(w, cid)) {
+            int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+            if (rn < 0) {
+                send_bad_gateway_and_close(w, cid);
+                break;
+            }
+            handle_backend_read_result(w, cid, rn);
+            break;
+        }
         struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
         if (!sqe) { conn_close(w, cid, true); break; }
         PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
@@ -978,589 +1566,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     }
 
     case VORTEX_OP_RECV_BACKEND: {
-        int n = cqe->res;
-        log_debug("recv_backend", "conn=%u n=%d", cid, n);
-        if (n > 0) {
-            RECV_WINDOW_GROW(h, n, w->pool.buf_size);
-            /* Re-arm TCP_QUICKACK — kernel clears it after each ACK */
-            int one = 1;
-            setsockopt(h->backend_fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-        }
-        if (n == 0) {
-            /* Backend EOF */
-            if (!(h->flags & CONN_FLAG_STREAMING_BACKEND)) {
-                /* No response bytes were ever received — stale pooled connection
-                 * closed by the backend before it could respond.  The client has
-                 * already sent its request and is waiting; send 502 and close. */
-                static const char r502[] =
-                    "HTTP/1.1 502 Bad Gateway\r\n"
-                    "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-                send(h->client_fd, r502, sizeof(r502) - 1, MSG_NOSIGNAL);
-                conn_close(w, cid, false);
-                break;
-            }
-            /* Normal EOF — backend finished streaming response */
-            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-            /* Backend closed the connection — never return to pool */
-            if (h->backend_fd >= 0) {
-                uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-                close(h->backend_fd); h->backend_fd = -1;
-            }
-            h->flags &= ~CONN_FLAG_BACKEND_POOLED;
-            /* Keep client alive for next request */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, false); break; }
-            PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-            uring_submit(&w->uring);
-            break;
-        }
-        /* First response byte received — cancel the backend deadline */
-        conn_cold_ptr(&w->pool, cid)->backend_deadline_ns = 0;
-        h->flags |= CONN_FLAG_STREAMING_BACKEND;
-        h->bytes_out += (uint32_t)n;
-
-        /* Track body bytes for keep-alive pool return */
-        {
-            int _ri = h->route_idx, _bi = h->backend_idx;
-            int _ps = w->cfg->routes[_ri].backends[_bi].pool_size;
-            if (_ps > 0) {
-                struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                /* Parse Content-Length from the first response chunk */
-                if (cold->backend_content_length == 0 && n > 12) {
-                    const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
-                    const char *clh = (const char *)memmem(sbuf2, (size_t)n,
-                                                            "\r\nContent-Length:", 17);
-                    if (!clh) clh = (const char *)memmem(sbuf2, (size_t)n,
-                                                           "\r\ncontent-length:", 17);
-                    if (clh) {
-                        const char *cv = clh + 17;
-                        while (*cv == ' ') cv++;
-                        cold->backend_content_length = (uint32_t)atol(cv);
-                    }
-                }
-                /* Count body bytes (after \r\n\r\n header terminator) */
-                if (cold->backend_content_length > 0) {
-                    const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
-                    const char *hend = (const char *)FIND_HDR_END(sbuf2, (size_t)n);
-                    if (hend) {
-                        size_t body_in_chunk = (size_t)n - (size_t)(hend + 4 - (const char *)sbuf2);
-                        cold->backend_body_recv += (uint32_t)body_in_chunk;
-                    } else {
-                        cold->backend_body_recv += (uint32_t)n;
-                    }
-                }
-            }
-        }
-
-        /* Chunked TE reassembly: accumulate body on follow-up recvs */
-        if ((h->flags & CONN_FLAG_CACHING) &&
-            (n < 5 || memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) != 0)) {
-            struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-            if (cold->chunk_buf) {
-                bool final = chunked_decode_append(cold,
-                    conn_send_buf(&w->pool, cid), (size_t)n);
-                if (final) {
-                    cache_chunked_store(w, cid, h, cold);
-                    h->flags &= ~CONN_FLAG_CACHING;
-                }
-            }
-        }
-
-        /* WebSocket 101 upgrade — switch to io_uring relay mode.
-         * Forward the 101 response synchronously (small, bounded), then arm
-         * two concurrent io_uring read chains (one per direction) and return.
-         * The connection stays alive in the pool; conn_close() will clean up. */
-        if ((h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) && n > 12 &&
-            memcmp(conn_send_buf(&w->pool, cid), "HTTP/1.1 101", 12) == 0) {
-            send(h->client_fd, conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL);
-
-            /* Arm both recv directions simultaneously. */
-            struct io_uring_sqe *ws_c = io_uring_get_sqe(&w->uring.ring);
-            struct io_uring_sqe *ws_b = io_uring_get_sqe(&w->uring.ring);
-            if (!ws_c || !ws_b) { conn_close(w, cid, false); break; }
-
-            /* client → backend direction: recv into recv_buf */
-            PREP_RECV(w, ws_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_RECV(w, cid));
-            ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT_WS, cid);
-
-            /* backend → client direction: recv into send_buf */
-            PREP_RECV(w, ws_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-                conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
-            ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
-
-            uring_submit(&w->uring);
-            break;
-        }
-
-        /* Response header rewrites — only on the first chunk (starts with "HTTP/") */
-        if (n > 7 && memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) == 0) {
-            uint8_t *sbuf = conn_send_buf(&w->pool, cid);
-
-            /* Locate end of headers */
-            uint8_t *hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-            size_t hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-
-            /* ---- Replace/inject Server header ----
-             * Per-route server_header takes priority over global; empty = pass through. */
-            const char *_srv_hdr = w->cfg->routes[h->route_idx].server_header[0]
-                                   ? w->cfg->routes[h->route_idx].server_header
-                                   : w->cfg->server_header;
-            if (_srv_hdr[0]) {
-                const char *new_srv = _srv_hdr;
-                size_t new_srv_len  = strlen(new_srv);
-                uint8_t *sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nServer:", 9);
-                if (!sh) sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nserver:", 9);
-                if (sh) {
-                    uint8_t *vs = sh + 9;
-                    while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                        (size_t)(sbuf + hdr_len - vs));
-                    if (ve) {
-                        size_t old_len = (size_t)(ve - vs);
-                        int delta = (int)new_srv_len - (int)old_len;
-                        if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
-                            memmove(vs + new_srv_len, ve, (size_t)(sbuf + n - ve));
-                            memcpy(vs, new_srv, new_srv_len);
-                            n += delta;
-                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                        }
-                    }
-                } else if (hdr_end) {
-                    /* No Server header — inject one */
-                    char inj_srv[80];
-                    int inj_srv_len = snprintf(inj_srv, sizeof(inj_srv),
-                        "\r\nServer: %s", new_srv);
-                    if (n + inj_srv_len <= (int)w->pool.buf_size) {
-                        size_t hle = (size_t)(hdr_end - sbuf);
-                        memmove(sbuf + hle + inj_srv_len, sbuf + hle,
-                                (size_t)(n - (int)hle));
-                        memcpy(sbuf + hle, inj_srv, (size_t)inj_srv_len);
-                        n += inj_srv_len;
-                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                    }
-                }
-            }
-
-            /* ---- Cache-Control rewrite based on request URL ---- */
-            {
-                char cc_url[512] = {0};
-                char cc_method[16] = {0};
-                const uint8_t *req = conn_recv_buf(&w->pool, cid);
-                parse_http_request_line(req, (int)w->pool.buf_size,
-                                        cc_method, sizeof(cc_method),
-                                        cc_url, sizeof(cc_url));
-                uint32_t ttl = cache_ttl_for_url(cc_url);
-
-                /* For static assets (ttl >= 3600): override whatever the backend sent —
-                 * Kestrel/Sonarr sends no-cache,no-store for ALL responses including images.
-                 * For dynamic content (ttl == 60): only inject if backend sent nothing.
-                 * For API (ttl == 0): leave Cache-Control untouched. */
-                if (hdr_end && ttl > 0) {
-                    /* Build the value we want */
-                    char cc_val[64];
-                    int cc_val_len;
-                    if (ttl >= 3600) {
-                        cc_val_len = snprintf(cc_val, sizeof(cc_val),
-                            "public, max-age=%u, immutable", ttl);
-                    } else {
-                        cc_val_len = snprintf(cc_val, sizeof(cc_val),
-                            "public, max-age=%u", ttl);
-                    }
-
-                    /* Find existing Cache-Control header */
-                    uint8_t *cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nCache-Control:", 16);
-                    if (!cch)
-                        cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\ncache-control:", 16);
-
-                    if (cch) {
-                        if (ttl >= 3600) {
-                            /* Replace value in-place */
-                            uint8_t *vs = cch + 16;
-                            while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
-                            uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                                (size_t)(sbuf + hdr_len - vs));
-                            if (ve) {
-                                size_t old_len = (size_t)(ve - vs);
-                                int delta = cc_val_len - (int)old_len;
-                                if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
-                                    memmove(vs + cc_val_len, ve, (size_t)(sbuf + n - ve));
-                                    memcpy(vs, cc_val, (size_t)cc_val_len);
-                                    n += delta;
-                                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                                }
-                            }
-                        }
-                        /* else ttl==60 and header present: leave it alone */
-                    } else {
-                        /* No Cache-Control present — inject one */
-                        char cc_hdr[80];
-                        int cc_len = snprintf(cc_hdr, sizeof(cc_hdr),
-                            "\r\nCache-Control: %s", cc_val);
-                        if (n + cc_len <= (int)w->pool.buf_size) {
-                            size_t hle = (size_t)(hdr_end - sbuf);
-                            memmove(sbuf + hle + cc_len, sbuf + hle, (size_t)(n - (int)hle));
-                            memcpy(sbuf + hle, cc_hdr, (size_t)cc_len);
-                            n += cc_len;
-                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                        }
-                    }
-
-                    /* For static assets: also strip Pragma header (no-cache from Kestrel) */
-                    if (ttl >= 3600 && hdr_end) {
-                        uint8_t *ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\nPragma:", 9);
-                        if (!ph)
-                            ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\npragma:", 9);
-                        if (ph) {
-                            uint8_t *pe = (uint8_t *)FIND_CRLF(ph + 2,
-                                (size_t)(sbuf + n - ph - 2));
-                            if (pe) {
-                                pe += 2; /* point past the line's \r\n */
-                                size_t remove = (size_t)(pe - (ph + 2));
-                                memmove(ph + 2, ph + 2 + remove,
-                                    (size_t)(sbuf + n - (ph + 2 + remove)));
-                                n -= (int)remove;
-                                hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                                hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* ---- Inject HSTS on HTTPS responses when absent ---- */
-            if (hdr_end) {
-                bool has_hsts =
-                    memmem(sbuf, hdr_len, "\r\nStrict-Transport-Security:", 28) ||
-                    memmem(sbuf, hdr_len, "\r\nstrict-transport-security:", 28);
-                if (!has_hsts) {
-                    const char *hsts = "\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains";
-                    int hsts_len = (int)strlen(hsts);
-                    if (n + hsts_len <= (int)w->pool.buf_size) {
-                        size_t hle = (size_t)(hdr_end - sbuf);
-                        memmove(sbuf + hle + hsts_len, sbuf + hle, (size_t)(n - (int)hle));
-                        memcpy(sbuf + hle, hsts, (size_t)hsts_len);
-                        n += hsts_len;
-                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                    }
-                }
-            }
-
-            /* ---- Inject Alt-Svc to advertise HTTP/3 ---- */
-#ifdef VORTEX_QUIC
-            if (hdr_end) {
-                const char *altsvc = "\r\nAlt-Svc: h3=\":443\"; ma=86400";
-                int as_len = 30; /* strlen of above */
-                if (n + as_len <= (int)w->pool.buf_size) {
-                    size_t hle = (size_t)(hdr_end - sbuf);
-                    memmove(sbuf + hle + as_len, sbuf + hle, (size_t)(n - (int)hle));
-                    memcpy(sbuf + hle, altsvc, (size_t)as_len);
-                    n += as_len;
-                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                }
-            }
-#endif
-
-            /* ---- Replace Connection: close → keep-alive ---- */
-            {
-                uint8_t *ch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nConnection:", 13);
-                if (!ch) ch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nconnection:", 13);
-                if (ch) {
-                    uint8_t *vs = ch + 13;
-                    while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                        (size_t)(sbuf + hdr_len - vs));
-                    if (ve && ve > vs) {
-                        const char *kl = "keep-alive";
-                        size_t kl_len = 10;
-                        size_t old_len = (size_t)(ve - vs);
-                        int delta = (int)kl_len - (int)old_len;
-                        if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
-                            memmove(vs + kl_len, ve, (size_t)(sbuf + n - ve));
-                            memcpy(vs, kl, kl_len);
-                            n += delta;
-                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                        }
-                    }
-                } else if (hdr_end) {
-                    /* No Connection header — inject one (24 bytes: \r\nConnection: keep-alive) */
-                    const int ka_len = 24;
-                    if (n + ka_len <= (int)w->pool.buf_size) {
-                        size_t hle = (size_t)(hdr_end - sbuf);
-                        memmove(sbuf + hle + ka_len, sbuf + hle, (size_t)(n - (int)hle));
-                        memcpy(sbuf + hle, "\r\nConnection: keep-alive", (size_t)ka_len);
-                        n += ka_len;
-                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                    }
-                }
-                (void)hdr_len;
-            }
-
-            /* ---- Cache store: after all rewrites so stored headers are clean ---- */
-            if (w->cache && w->cache->index) {
-                const uint8_t *resp2 = conn_send_buf(&w->pool, cid);
-                int status2 = 0;
-                if (n > 9) {
-                    const char *sp = (const char *)resp2 + 9;
-                    for (int i = 0; i < 3 && sp[i] >= '0' && sp[i] <= '9'; i++)
-                        status2 = status2 * 10 + (sp[i] - '0');
-                }
-                if (status2 == 200) {
-                    char cc_method2[16] = {0}, cc_url2[512] = {0};
-                    const uint8_t *req2 = conn_recv_buf(&w->pool, cid);
-                    if (req2[0] != 0 &&
-                        parse_http_request_line(req2, (int)w->pool.buf_size,
-                                                cc_method2, sizeof(cc_method2),
-                                                cc_url2, sizeof(cc_url2)) == 0 &&
-                        strcmp(cc_method2, "GET") == 0) {
-
-                        uint32_t ttl2 = cache_ttl_for_url(cc_url2);
-                        if (ttl2 > 0) {
-                            const char *he2 = (const char *)FIND_HDR_END(
-                                resp2, (size_t)n);
-                            if (he2) {
-                                size_t hl2 = (size_t)(he2 + 4 - (const char *)resp2);
-                                size_t bl2 = (size_t)n - hl2;
-
-                                /* Skip chunked responses — we only have the first
-                                 * segment and would serve a truncated body from cache. */
-                                bool is_chunked =
-                                    memmem(resp2, hl2, "\r\nTransfer-Encoding: chunked", 28) ||
-                                    memmem(resp2, hl2, "\r\ntransfer-encoding: chunked", 28);
-
-                                /* Only cache if Content-Length matches received bytes
-                                 * (guarantees the full body is in this one recv). */
-                                bool cl_ok = false;
-                                if (!is_chunked) {
-                                    const char *clh = (const char *)memmem(
-                                        resp2, hl2, "\r\nContent-Length:", 17);
-                                    if (!clh) clh = (const char *)memmem(
-                                        resp2, hl2, "\r\ncontent-length:", 17);
-                                    if (clh) {
-                                        const char *cv = clh + 17;
-                                        while (*cv == ' ') cv++;
-                                        uint32_t cl = (uint32_t)atol(cv);
-                                        cl_ok = (bl2 == cl);
-                                    }
-                                }
-
-                                if (cl_ok) {
-                                    char cc_key2[640];
-                                    make_cache_key(req2, (size_t)w->pool.buf_size,
-                                                   cc_url2, cc_key2, sizeof(cc_key2));
-                                    cache_store(w->cache, cc_key2, strlen(cc_key2),
-                                        (uint16_t)status2, ttl2,
-                                        resp2, hl2, resp2 + hl2, bl2);
-                                    log_debug("cache_store",
-                                        "conn=%u url=%s ttl=%u body=%zu",
-                                        cid, cc_key2, ttl2, bl2);
-                                } else if (is_chunked && !(h->flags & CONN_FLAG_CACHING)) {
-                                    /* Chunked TE: begin multi-recv reassembly.
-                                     * Save rewritten headers + decode body bytes
-                                     * in this first recv; continue on RECV_BACKEND. */
-                                    struct conn_cold *cold2 = conn_cold_ptr(&w->pool, cid);
-                                    uint32_t hlen2 = (uint32_t)hl2;
-                                    uint32_t init_cap = hlen2 + 65536;
-                                    cold2->chunk_buf = malloc(init_cap);
-                                    if (cold2->chunk_buf) {
-                                        cold2->chunk_buf_cap  = init_cap;
-                                        cold2->chunk_hdr_len  = hlen2;
-                                        cold2->chunk_body_len = 0;
-                                        cold2->chunk_remaining = 0;
-                                        cold2->chunk_skip_crlf = false;
-                                        cold2->chunk_ttl = ttl2;
-                                        make_cache_key(req2, (size_t)w->pool.buf_size,
-                                                       cc_url2,
-                                                       cold2->chunk_url,
-                                                       sizeof(cold2->chunk_url));
-                                        /* Copy rewritten response headers verbatim */
-                                        memcpy(cold2->chunk_buf, resp2, hlen2);
-                                        h->flags |= CONN_FLAG_CACHING;
-                                        /* Decode any body bytes in this recv */
-                                        if (bl2 > 0) {
-                                            bool fin2 = chunked_decode_append(cold2,
-                                                resp2 + hlen2, bl2);
-                                            if (fin2) {
-                                                cache_chunked_store(w, cid, h, cold2);
-                                                h->flags &= ~CONN_FLAG_CACHING;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /* ---- Record compressibility for splice gating ----
-         * Only on the first response chunk (starts with "HTTP/").  Subsequent
-         * chunks contain raw body bytes with no headers — scanning them would
-         * always find no Content-Type, resetting ct_compressible to 0 and
-         * incorrectly enabling splice for compressible types (HTML, JSON, JS).
-         * ct_compressible defaults to 0 in conn_hot; we only set it to 1 here
-         * when we positively identify a compressible Content-Type. */
-        if (n > 7 && memcmp(conn_send_buf(&w->pool, cid), "HTTP/", 5) == 0) {
-            uint8_t *sbuf_ct = conn_send_buf(&w->pool, cid);
-            const uint8_t *hend_ct = (const uint8_t *)FIND_HDR_END(sbuf_ct, (size_t)n);
-            size_t hdr_scan_len = hend_ct
-                ? (size_t)(hend_ct - sbuf_ct) + 4
-                : (size_t)n;
-            const uint8_t *cth2 = (const uint8_t *)memmem(
-                sbuf_ct, hdr_scan_len, "\r\nContent-Type:", 15);
-            if (!cth2) cth2 = (const uint8_t *)memmem(
-                sbuf_ct, hdr_scan_len, "\r\ncontent-type:", 15);
-            if (cth2) {
-                const uint8_t *ctv2 = cth2 + 15;
-                while (*ctv2 == ' ') ctv2++;
-                size_t ct_rem2 = (size_t)(sbuf_ct + hdr_scan_len - ctv2);
-                h->ct_compressible = is_compressible_type(ctv2, ct_rem2) ? 1 : 0;
-            } else {
-                /* No Content-Type — treat as non-compressible (safe for splice) */
-                h->ct_compressible = 0;
-            }
-        }
-
-        /* ---- Brotli / gzip compression ----
-         * Only on complete single-chunk responses (Content-Length present and
-         * matching) with a compressible Content-Type.  Prefer brotli (br) when
-         * the client supports it — typically 15-25% smaller than gzip at the
-         * same CPU cost.  recv_buf is free at this point (client request already
-         * forwarded) and used as scratch.  Cache store above saved uncompressed. */
-        if ((h->flags & (CONN_FLAG_CLIENT_BR | CONN_FLAG_CLIENT_GZIP)) && n > 0) {
-            uint8_t *sbuf_gz = conn_send_buf(&w->pool, cid);
-            const uint8_t *hend_gz = (const uint8_t *)FIND_HDR_END(sbuf_gz, (size_t)n);
-            if (hend_gz) {
-                size_t hdr_end_off = (size_t)(hend_gz - sbuf_gz);
-                size_t body_off    = hdr_end_off + 4; /* past \r\n\r\n */
-                size_t body_len    = (size_t)n - body_off;
-
-                /* Verify Content-Length matches body in buffer (complete response) */
-                bool cl_match = false;
-                if (body_len >= COMPRESS_MIN_BODY) {
-                    const char *clh2 = (const char *)memmem(
-                        sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
-                    if (!clh2) clh2 = (const char *)memmem(
-                        sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
-                    if (clh2) {
-                        const char *cv2 = clh2 + 17;
-                        while (*cv2 == ' ') cv2++;
-                        cl_match = ((size_t)atol(cv2) == body_len);
-                    }
-                }
-
-                /* Check Content-Type is compressible and not already encoded */
-                if (cl_match) {
-                    const uint8_t *cth = (const uint8_t *)memmem(
-                        sbuf_gz, hdr_end_off + 4, "\r\nContent-Type:", 15);
-                    if (!cth) cth = (const uint8_t *)memmem(
-                        sbuf_gz, hdr_end_off + 4, "\r\ncontent-type:", 15);
-                    bool already_encoded =
-                        memmem(sbuf_gz, hdr_end_off + 4, "\r\nContent-Encoding:", 19) ||
-                        memmem(sbuf_gz, hdr_end_off + 4, "\r\ncontent-encoding:", 19);
-
-                    if (cth && !already_encoded) {
-                        const uint8_t *ct_val = cth + 15;
-                        while (*ct_val == ' ') ct_val++;
-                        size_t ct_remaining = (size_t)(sbuf_gz + hdr_end_off + 4 - ct_val);
-
-                        if (is_compressible_type(ct_val, ct_remaining)) {
-                            /* Pick algorithm: prefer brotli, fall back to gzip */
-                            bool use_br = (h->flags & CONN_FLAG_CLIENT_BR) != 0;
-                            uint8_t *scratch = conn_recv_buf(&w->pool, cid);
-                            size_t clen = use_br
-                                ? brotli_compress(sbuf_gz + body_off, body_len,
-                                                  scratch, w->pool.buf_size)
-                                : gzip_compress(sbuf_gz + body_off, body_len,
-                                                scratch, w->pool.buf_size);
-                            /* Fall back to gzip if brotli failed or didn't shrink */
-                            if (use_br && (clen == 0 || clen >= body_len)) {
-                                use_br = false;
-                                clen = gzip_compress(sbuf_gz + body_off, body_len,
-                                                     scratch, w->pool.buf_size);
-                            }
-
-                            /* Only proceed if compression reduced size */
-                            if (clen > 0 && clen < body_len) {
-                                /* 1. Update Content-Length in-place */
-                                uint8_t *clh3 = (uint8_t *)memmem(
-                                    sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
-                                if (!clh3) clh3 = (uint8_t *)memmem(
-                                    sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
-                                if (clh3) {
-                                    uint8_t *vs = clh3 + 17;
-                                    while (*vs == ' ') vs++;
-                                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                                        (size_t)(sbuf_gz + hdr_end_off - vs));
-                                    if (ve) {
-                                        char new_cl[20];
-                                        int ncl = snprintf(new_cl, sizeof(new_cl), "%zu", clen);
-                                        int delta = ncl - (int)(ve - vs);
-                                        memmove(vs + ncl, ve,
-                                            (size_t)(sbuf_gz + hdr_end_off + 4 - ve));
-                                        memcpy(vs, new_cl, (size_t)ncl);
-                                        hdr_end_off = (size_t)((int)hdr_end_off + delta);
-                                    }
-                                }
-
-                                /* 2. Insert Content-Encoding header before \r\n\r\n */
-                                const char *ce_hdr = use_br
-                                    ? "\r\nContent-Encoding: br"
-                                    : "\r\nContent-Encoding: gzip";
-                                int ce_len = use_br ? 22 : 24;
-                                memmove(sbuf_gz + hdr_end_off + ce_len,
-                                        sbuf_gz + hdr_end_off, 4);
-                                memcpy(sbuf_gz + hdr_end_off, ce_hdr, (size_t)ce_len);
-                                size_t new_body_off = hdr_end_off + (size_t)ce_len + 4;
-
-                                /* 3. Copy compressed body after headers */
-                                if (new_body_off + clen <= w->pool.buf_size) {
-                                    memcpy(sbuf_gz + new_body_off, scratch, clen);
-                                    n = (int)(new_body_off + clen);
-                                    log_debug("compress", "conn=%u %s %zu→%zu bytes",
-                                              cid, use_br ? "br" : "gzip", body_len, clen);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Forward backend data to client */
-        h->send_buf_off = 0;
-        h->send_buf_len = (uint32_t)n;
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); break; }
-        if (w->uring.bufs_registered && !(h->flags & CONN_FLAG_KTLS_TX)) {
-            /* Zero-copy: kernel reads directly from pinned registered buffer.
-             * send_zc is incompatible with kTLS TX (like splice) — the kernel
-             * cannot handle zero-copy sends through the kTLS record layer.
-             * Two CQEs: completion (bytes transferred) + notification (buffer released).
-             * We arm next recv only after the notification — see SEND_CLIENT_ZC handler. */
-            h->zc_notif_count++;
-            io_uring_prep_send_zc_fixed(sqe, h->client_fd,
-                conn_send_buf(&w->pool, cid), (size_t)n,
-                MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
-            if (w->uring.files_registered) sqe->flags |= IOSQE_FIXED_FILE;
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
-        } else {
-            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-        }
-        uring_submit(&w->uring);
+        handle_backend_read_result(w, cid, cqe->res);
         break;
     }
 
@@ -1593,7 +1599,8 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
          * the client connection itself closes (see conn_close). */
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
             int ri = h->route_idx, bi = h->backend_idx;
-            int ps = w->cfg->routes[ri].backends[bi].pool_size;
+            int ps = (h->flags & CONN_FLAG_BACKEND_TLS) ? 0
+                     : w->cfg->routes[ri].backends[bi].pool_size;
             if (ps > 0) {
                 struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
                 if (cold->backend_content_length > 0 &&
@@ -1609,6 +1616,15 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         }
 
         if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+            if (backend_uses_tls(w, cid)) {
+                int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+                if (rn < 0) {
+                    send_bad_gateway_and_close(w, cid);
+                    break;
+                }
+                handle_backend_read_result(w, cid, rn);
+                break;
+            }
             /* Zero-copy splice: only safe for non-compressible types (images, video,
              * already-compressed media), and only without kTLS TX.  Splicing into a
              * kTLS-TX socket causes ERR_CONTENT_LENGTH_MISMATCH on kernel 6.8–6.12
@@ -1735,6 +1751,7 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
     case VORTEX_OP_CONNECT: {
         /* Async backend connect completed */
+        const struct backend_config *bcfg = &w->cfg->routes[h->route_idx].backends[h->backend_idx];
         h->flags &= ~CONN_FLAG_BACKEND_CONNECTING;
         {
             int _ri = h->route_idx, _bi = h->backend_idx;
@@ -1760,6 +1777,13 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             break;
         }
         log_debug("connect_cqe", "conn=%u backend_fd=%d connected", cid, h->backend_fd);
+        if (bcfg->tls) {
+            if (backend_tls_handshake(w, bcfg, cid) != 0) {
+                log_warn("connect_cqe", "conn=%u backend TLS handshake failed", cid);
+                send_bad_gateway_and_close(w, cid);
+                break;
+            }
+        }
 
         h->state = CONN_STATE_PROXYING;
 
@@ -1817,6 +1841,22 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
                         fwd_n += 19;
                     }
                 }
+            }
+            if (backend_uses_tls(w, cid)) {
+                if (backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n) < 0) {
+                    send_bad_gateway_and_close(w, cid);
+                    break;
+                }
+                backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+                {
+                    int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+                    if (rn < 0) {
+                        send_bad_gateway_and_close(w, cid);
+                        break;
+                    }
+                    handle_backend_read_result(w, cid, rn);
+                }
+                break;
             }
 
             struct io_uring_sqe *sqe_s = io_uring_get_sqe(&w->uring.ring);

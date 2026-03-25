@@ -30,8 +30,12 @@ typedef enum {
 
 struct backend_config {
     char     address[256];
+    char     sni[256];
     uint16_t weight;
     int      pool_size;
+    bool     tls;
+    bool     verify_peer;
+    bool     verify_peer_set;
     /* Pre-resolved at config load — eliminates blocking getaddrinfo on hot path */
     struct sockaddr_storage resolved_addr;
     socklen_t               resolved_addrlen; /* 0 = not resolved */

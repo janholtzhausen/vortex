@@ -117,6 +117,22 @@ python3 tools/vortex-passwd.py admin
 - `-b <path>` — path to BPF object file (default: must be supplied alongside `-b`)
 - Environment variable expansion in config values: `${VAR}` and `$VAR`
 
+### Public-Origin Benchmarking
+- Vortex can now proxy HTTPS origins on the backend leg for HTTP/1.1 routes.
+- A dedicated benchmark config lives at `config/public-benchmark.yaml`.
+- A repeatable local benchmark helper lives at `tools/benchmark_public_origins.sh`.
+- The current public HTTPS benchmark set is:
+  - `https://httpbingo.org:443` for API-style request/response behavior
+  - `https://www.wikipedia.org:443` for a larger production HTML site
+  - `https://speed.hetzner.de:443` for larger transfer/throughput checks
+- Backend TLS verifies origin certificates by default and sends SNI derived from the backend hostname.
+- Current limitation: WebSocket upgrades are still plain-HTTP-origin only; HTTPS-origin WebSocket passthrough is not implemented yet.
+- Run the benchmark with:
+
+```sh
+bash tools/benchmark_public_origins.sh
+```
+
 ---
 
 ## Architecture

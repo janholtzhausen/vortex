@@ -209,7 +209,7 @@ int vortex_xdp_main(struct xdp_md *ctx)
             } else {
                 /* Refill tokens for elapsed time, then consume one */
                 __u64 elapsed  = now - rle->last_refill_ns;
-                __u64 add      = (elapsed / 1000) * tps / 1000000 * RATE_SCALE;
+                __u64 add      = (elapsed * tps * RATE_SCALE) / 1000000000ULL;
                 __u64 max_tok  = burst * RATE_SCALE;
 
                 rle->tokens += add;

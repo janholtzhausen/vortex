@@ -316,6 +316,14 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
     w->cache     = shared_cache;
 #ifdef VORTEX_PHASE_TLS
     w->tls       = tls;
+    w->backend_tls_client_ctx = SSL_CTX_new(TLS_client_method());
+    if (!w->backend_tls_client_ctx) {
+        log_error("worker_init", "SSL_CTX_new(TLS_client_method) failed");
+        return -1;
+    }
+    SSL_CTX_set_min_proto_version(w->backend_tls_client_ctx, cfg->tls.min_version);
+    SSL_CTX_set_max_proto_version(w->backend_tls_client_ctx, cfg->tls.max_version);
+    SSL_CTX_set_default_verify_paths(w->backend_tls_client_ctx);
 #else
     (void)tls;
 #endif
@@ -347,11 +355,23 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
         log_warn("worker_init", "cannot open tarpit log: %s", strerror(errno));
 
     if (conn_pool_init(&w->pool, capacity, WORKER_BUF_SIZE, cfg->hugepages) != 0) {
+#ifdef VORTEX_PHASE_TLS
+        if (w->backend_tls_client_ctx) {
+            SSL_CTX_free(w->backend_tls_client_ctx);
+            w->backend_tls_client_ctx = NULL;
+        }
+#endif
         return -1;
     }
 
     if (router_init(&w->router, cfg) != 0) {
         conn_pool_destroy(&w->pool);
+#ifdef VORTEX_PHASE_TLS
+        if (w->backend_tls_client_ctx) {
+            SSL_CTX_free(w->backend_tls_client_ctx);
+            w->backend_tls_client_ctx = NULL;
+        }
+#endif
         return -1;
     }
 
@@ -434,6 +454,12 @@ void worker_destroy(struct worker *w)
     if (w->tls_done_pipe_rd >= 0) { close(w->tls_done_pipe_rd); w->tls_done_pipe_rd = -1; }
     if (w->tls_done_pipe_wr >= 0) { close(w->tls_done_pipe_wr); w->tls_done_pipe_wr = -1; }
     if (w->tarpit_log)  { fclose(w->tarpit_log); w->tarpit_log = NULL; }
+#ifdef VORTEX_PHASE_TLS
+    if (w->backend_tls_client_ctx) {
+        SSL_CTX_free(w->backend_tls_client_ctx);
+        w->backend_tls_client_ctx = NULL;
+    }
+#endif
 
     router_destroy(&w->router);
     conn_pool_destroy(&w->pool);

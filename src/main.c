@@ -124,12 +124,21 @@ static int                   g_dns01_inited = 0;
 /* Renewal background thread */
 static pthread_t g_renewal_thread;
 static int       g_renewal_running = 0;
+static pthread_mutex_t g_renewal_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_renewal_cv = PTHREAD_COND_INITIALIZER;
 
 static void *renewal_thread_fn(void *arg)
 {
     (void)arg;
     while (g_renewal_running) {
-        sleep(3600); /* check every hour */
+        pthread_mutex_lock(&g_renewal_mu);
+        if (g_renewal_running) {
+            struct timespec wake;
+            clock_gettime(CLOCK_REALTIME, &wake);
+            wake.tv_sec += 3600;
+            pthread_cond_timedwait(&g_renewal_cv, &g_renewal_mu, &wake);
+        }
+        pthread_mutex_unlock(&g_renewal_mu);
         if (!g_renewal_running) break;
 
         if (!g_acme_inited) continue;
@@ -685,9 +694,13 @@ int main(int argc, char *argv[])
 #ifdef VORTEX_PHASE_TLS
     /* Stop renewal thread and HTTP-01 server */
     if (g_renewal_running) {
+        pthread_mutex_lock(&g_renewal_mu);
         g_renewal_running = 0;
-        pthread_cancel(g_renewal_thread);
+        pthread_cond_signal(&g_renewal_cv);
+        pthread_mutex_unlock(&g_renewal_mu);
         pthread_join(g_renewal_thread, NULL);
+        pthread_mutex_destroy(&g_renewal_mu);
+        pthread_cond_destroy(&g_renewal_cv);
     }
     if (g_http01_started) {
         acme_http01_stop(&g_http01_srv);

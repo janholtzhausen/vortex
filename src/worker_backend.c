@@ -8,6 +8,241 @@
  */
 #include "worker_internal.h"
 
+#ifdef VORTEX_PHASE_TLS
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+
+static void log_backend_ssl_errors(const char *tag)
+{
+    unsigned long err;
+    while ((err = ERR_get_error()) != 0) {
+        char buf[256];
+        ERR_error_string_n(err, buf, sizeof(buf));
+        log_error(tag, "OpenSSL: %s", buf);
+    }
+}
+
+static uint32_t backend_timeout_ms_for(struct worker *w, uint32_t cid)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    uint32_t tmo_ms = w->cfg->routes[h->route_idx].backend_timeout_ms;
+    return tmo_ms ? tmo_ms : 30000;
+}
+
+static int backend_ssl_wait(int fd, bool want_read, uint32_t timeout_ms)
+{
+    fd_set rset, wset;
+    struct timeval tv;
+
+    FD_ZERO(&rset);
+    FD_ZERO(&wset);
+    if (want_read)
+        FD_SET(fd, &rset);
+    else
+        FD_SET(fd, &wset);
+
+    tv.tv_sec = (int)(timeout_ms / 1000);
+    tv.tv_usec = (int)((timeout_ms % 1000) * 1000);
+    return select(fd + 1, want_read ? &rset : NULL, want_read ? NULL : &wset,
+                  NULL, &tv);
+}
+
+static const char *backend_server_name(const struct backend_config *bcfg,
+                                       char *fallback, size_t fallback_sz)
+{
+    if (bcfg->sni[0])
+        return bcfg->sni;
+
+    const char *addr = bcfg->address;
+    const char *colon = strrchr(addr, ':');
+    size_t host_len = colon ? (size_t)(colon - addr) : strlen(addr);
+    if (host_len >= fallback_sz)
+        host_len = fallback_sz - 1;
+    memcpy(fallback, addr, host_len);
+    fallback[host_len] = '\0';
+    return fallback;
+}
+#endif
+
+bool backend_uses_tls(struct worker *w, uint32_t cid)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    return (h->flags & CONN_FLAG_BACKEND_TLS) != 0;
+}
+
+int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
+                          uint32_t cid)
+{
+#ifdef VORTEX_PHASE_TLS
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    SSL *ssl;
+    char sni_buf[256];
+    const char *server_name;
+    uint32_t timeout_ms;
+
+    if (!bcfg->tls)
+        return 0;
+    if (!w->backend_tls_client_ctx || h->backend_fd < 0)
+        return -1;
+
+    ssl = SSL_new(w->backend_tls_client_ctx);
+    if (!ssl) {
+        log_backend_ssl_errors("backend_tls_new");
+        return -1;
+    }
+    if (SSL_set_fd(ssl, h->backend_fd) != 1) {
+        log_backend_ssl_errors("backend_tls_set_fd");
+        SSL_free(ssl);
+        return -1;
+    }
+
+    server_name = backend_server_name(bcfg, sni_buf, sizeof(sni_buf));
+    if (server_name[0]) {
+        SSL_set_tlsext_host_name(ssl, server_name);
+        if (bcfg->verify_peer || !bcfg->verify_peer_set) {
+            X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+            if (X509_VERIFY_PARAM_set1_host(param, server_name, 0) != 1) {
+                log_backend_ssl_errors("backend_tls_set_host");
+                SSL_free(ssl);
+                return -1;
+            }
+        }
+    }
+
+    SSL_set_verify(ssl,
+        (bcfg->verify_peer || !bcfg->verify_peer_set) ? SSL_VERIFY_PEER : SSL_VERIFY_NONE,
+        NULL);
+
+    timeout_ms = backend_timeout_ms_for(w, cid);
+    ERR_clear_error();
+    for (;;) {
+        int ret = SSL_connect(ssl);
+        if (ret == 1)
+            break;
+        {
+            int err = SSL_get_error(ssl, ret);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
+                if (sel > 0)
+                    continue;
+                log_warn("backend_tls_handshake",
+                         "conn=%u fd=%d wait timeout/error during SSL_connect", cid, h->backend_fd);
+            } else {
+                log_backend_ssl_errors("backend_tls_handshake");
+            }
+        }
+        SSL_free(ssl);
+        return -1;
+    }
+
+    if ((bcfg->verify_peer || !bcfg->verify_peer_set) &&
+        SSL_get_verify_result(ssl) != X509_V_OK) {
+        log_warn("backend_tls_handshake", "conn=%u certificate verification failed", cid);
+        SSL_free(ssl);
+        return -1;
+    }
+
+    cold->backend_ssl = ssl;
+    h->flags |= CONN_FLAG_BACKEND_TLS;
+    h->flags &= ~CONN_FLAG_BACKEND_POOLED;
+    return 0;
+#else
+    (void)w; (void)bcfg; (void)cid;
+    return -1;
+#endif
+}
+
+int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, size_t len)
+{
+#ifdef VORTEX_PHASE_TLS
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    SSL *ssl = (SSL *)cold->backend_ssl;
+    uint32_t timeout_ms = backend_timeout_ms_for(w, cid);
+    size_t off = 0;
+
+    if (!ssl)
+        return -1;
+
+    while (off < len) {
+        int ret;
+        ERR_clear_error();
+        ret = SSL_write(ssl, buf + off, (int)(len - off));
+        if (ret > 0) {
+            off += (size_t)ret;
+            continue;
+        }
+        {
+            int err = SSL_get_error(ssl, ret);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
+                if (sel > 0)
+                    continue;
+                log_warn("backend_tls_send", "conn=%u fd=%d wait timeout/error", cid, h->backend_fd);
+            } else {
+                log_backend_ssl_errors("backend_tls_send");
+            }
+        }
+        return -1;
+    }
+    return (int)off;
+#else
+    (void)w; (void)cid; (void)buf; (void)len;
+    return -1;
+#endif
+}
+
+int backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t len)
+{
+#ifdef VORTEX_PHASE_TLS
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    SSL *ssl = (SSL *)cold->backend_ssl;
+    uint32_t timeout_ms = backend_timeout_ms_for(w, cid);
+
+    if (!ssl)
+        return -1;
+
+    for (;;) {
+        int ret;
+        ERR_clear_error();
+        ret = SSL_read(ssl, buf, (int)len);
+        if (ret > 0)
+            return ret;
+        if (ret == 0) {
+            int err = SSL_get_error(ssl, ret);
+            if (err == SSL_ERROR_ZERO_RETURN)
+                return 0;
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
+                if (sel > 0)
+                    continue;
+                log_warn("backend_tls_recv", "conn=%u fd=%d wait timeout/error", cid, h->backend_fd);
+            } else {
+                log_backend_ssl_errors("backend_tls_recv");
+            }
+            return -1;
+        }
+        {
+            int err = SSL_get_error(ssl, ret);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
+                if (sel > 0)
+                    continue;
+                log_warn("backend_tls_recv", "conn=%u fd=%d wait timeout/error", cid, h->backend_fd);
+            } else {
+                log_backend_ssl_errors("backend_tls_recv");
+            }
+        }
+        return -1;
+    }
+#else
+    (void)w; (void)cid; (void)buf; (void)len;
+    return -1;
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* Circuit breaker helpers                                             */
 /* ------------------------------------------------------------------ */
@@ -111,19 +346,28 @@ int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
         host[hlen] = '\0';
         snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
-        struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+        struct addrinfo hints = {
+            .ai_family = AF_UNSPEC,
+            .ai_socktype = SOCK_STREAM,
+            .ai_flags = AI_ADDRCONFIG,
+        };
         struct addrinfo *res = NULL;
         if (getaddrinfo(host, port_str, &hints, &res) != 0) {
             log_error("async_connect", "getaddrinfo(%s) failed: %s", addr_str, strerror(errno));
             return -1;
         }
         bool got = false;
-        for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
-            if (rp->ai_addrlen <= sizeof(cold->backend_addr)) {
-                memcpy(&cold->backend_addr, rp->ai_addr, rp->ai_addrlen);
-                cold->backend_addrlen = (socklen_t)rp->ai_addrlen;
-                got = true;
-                break;
+        for (int pass = 0; pass < 2 && !got; pass++) {
+            int family = (pass == 0) ? AF_INET : AF_UNSPEC;
+            for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
+                if (family != AF_UNSPEC && rp->ai_family != family)
+                    continue;
+                if (rp->ai_addrlen <= sizeof(cold->backend_addr)) {
+                    memcpy(&cold->backend_addr, rp->ai_addr, rp->ai_addrlen);
+                    cold->backend_addrlen = (socklen_t)rp->ai_addrlen;
+                    got = true;
+                    break;
+                }
             }
         }
         freeaddrinfo(res);

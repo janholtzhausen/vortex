@@ -49,8 +49,8 @@ struct __attribute__((aligned(64))) conn_hot {
     uint16_t      route_idx;
     uint16_t      backend_idx;
     uint32_t      conn_id;         /* Pool slot index */
-    uint16_t      recv_window;     /* Dynamic recv size: starts at buf_init, doubles on full read */
-    uint8_t       _pad[14];
+    uint32_t      recv_window;     /* Dynamic recv size: starts at buf_init, doubles on full read */
+    uint8_t       _pad[12];
     /* --- cache line boundary --- */
     void         *ssl;             /* SSL* — NULL after kTLS install */
     void         *uring_data;
@@ -104,6 +104,9 @@ struct conn_cold {
 
     /* HTTP/2 session — non-NULL for H2 client connections */
     struct h2_session *h2;
+
+    /* Backend TLS state for HTTPS origins */
+    void           *backend_ssl; /* SSL* */
 };
 
 /* Per-worker connection pool */

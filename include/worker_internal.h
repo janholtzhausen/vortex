@@ -164,6 +164,10 @@ void cb_record_success(struct worker *w, int ri, int bi);
 int  select_available_backend(struct worker *w, int ri, uint32_t client_ip);
 void backend_deadline_set(struct worker *w, uint32_t cid, uint32_t timeout_ms);
 int  begin_async_connect(struct worker *w, const struct backend_config *bcfg, uint32_t cid);
+bool backend_uses_tls(struct worker *w, uint32_t cid);
+int  backend_tls_handshake(struct worker *w, const struct backend_config *bcfg, uint32_t cid);
+int  backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, size_t len);
+int  backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t len);
 
 /* worker_cache.c */
 void make_cache_key(const uint8_t *req_buf, size_t req_len,

@@ -40,6 +40,7 @@ struct worker {
 
 #ifdef VORTEX_PHASE_TLS
     struct tls_ctx  *tls;             /* Shared TLS context (NULL = plain HTTP) */
+    SSL_CTX         *backend_tls_client_ctx; /* Per-worker client SSL_CTX for HTTPS origins */
 #endif
 
     struct vortex_config *cfg;        /* Shared, atomic ptr swap for reload */
@@ -56,6 +57,7 @@ struct worker {
 
     /* Tarpit: unrecognised-SNI connections held with window=1 */
     int              tarpit_fds[WORKER_TARPIT_MAX];
+    uint32_t         tarpit_ips[WORKER_TARPIT_MAX]; /* IPv4 addr in host byte order, 0 = unknown */
     uint32_t         tarpit_head;   /* FIFO: head is the eviction index (oldest fd), wraps via %WORKER_TARPIT_MAX */
     uint32_t         tarpit_count;  /* number of live tarpit fds */
     uint64_t         tarpit_total;  /* cumulative tarpit count */

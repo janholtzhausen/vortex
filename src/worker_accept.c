@@ -19,7 +19,7 @@
  */
 int peek_client_hello_sni(int fd, char *out, size_t out_max)
 {
-    uint8_t buf[1024];
+    uint8_t buf[4096];
     ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
     if (n < 5) return 0;
 
@@ -89,6 +89,8 @@ int peek_client_hello_sni(int fd, char *out, size_t out_max)
  */
 void tarpit_conn(struct worker *w, int fd)
 {
+    uint32_t stored_ip = 0;
+
     /* Clamp receive window to 1 — attacker can only send 1 byte at a time */
     int clamp = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &clamp, sizeof(clamp));
@@ -99,12 +101,14 @@ void tarpit_conn(struct worker *w, int fd)
         socklen_t slen = sizeof(ss);
         if (getpeername(fd, (struct sockaddr *)&ss, &slen) == 0) {
             char ipstr[64] = {0};
-            if (ss.ss_family == AF_INET)
+            if (ss.ss_family == AF_INET) {
+                stored_ip = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
                 inet_ntop(AF_INET,
                     &((struct sockaddr_in *)&ss)->sin_addr, ipstr, sizeof(ipstr));
-            else
+            } else {
                 inet_ntop(AF_INET6,
                     &((struct sockaddr_in6 *)&ss)->sin6_addr, ipstr, sizeof(ipstr));
+            }
 
             log_info("tarpit", "fd=%d ip=%s total=%llu",
                 fd, ipstr, (unsigned long long)(w->tarpit_total + 1));
@@ -133,35 +137,33 @@ void tarpit_conn(struct worker *w, int fd)
     if (w->tarpit_count == WORKER_TARPIT_MAX) {
         /* Evict oldest — move its IP into the XDP blocklist for 60 minutes */
         int evict_fd = w->tarpit_fds[w->tarpit_head];
+        uint32_t evict_ip = w->tarpit_ips[w->tarpit_head];
         if (evict_fd >= 0) {
-            struct sockaddr_storage evict_ss;
-            socklen_t evict_len = sizeof(evict_ss);
-            if (getpeername(evict_fd, (struct sockaddr *)&evict_ss, &evict_len) == 0 &&
-                evict_ss.ss_family == AF_INET) {
-                uint32_t ip_host =
-                    ntohl(((struct sockaddr_in *)&evict_ss)->sin_addr.s_addr);
-                if (bpf_blocklist_add(ip_host) == 0 &&
+            if (evict_ip != 0) {
+                if (bpf_blocklist_add(evict_ip) == 0 &&
                     w->blocked_count < WORKER_BLOCKED_MAX) {
                     struct blocked_entry *be =
                         &w->blocked_list[w->blocked_tail];
-                    be->ip_host   = ip_host;
+                    be->ip_host   = evict_ip;
                     be->expire_at = time(NULL) + WORKER_BLOCK_TTL_SECS;
                     w->blocked_tail =
                         (w->blocked_tail + 1) % WORKER_BLOCKED_MAX;
                     w->blocked_count++;
-                    char evict_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &((struct sockaddr_in *)&evict_ss)->sin_addr,
-                              evict_ip, sizeof(evict_ip));
+                    struct in_addr a = { .s_addr = htonl(evict_ip) };
+                    char evict_ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &a, evict_ip_str, sizeof(evict_ip_str));
                     log_info("tarpit_block", "ip=%s blocked for %ds",
-                             evict_ip, WORKER_BLOCK_TTL_SECS);
+                             evict_ip_str, WORKER_BLOCK_TTL_SECS);
                 }
             }
             close(evict_fd);
         }
         w->tarpit_fds[w->tarpit_head] = fd;
+        w->tarpit_ips[w->tarpit_head] = stored_ip;
         w->tarpit_head = (w->tarpit_head + 1) % WORKER_TARPIT_MAX;
     } else {
         w->tarpit_fds[slot] = fd;
+        w->tarpit_ips[slot] = stored_ip;
         w->tarpit_count++;
     }
     w->tarpit_total++;
@@ -173,6 +175,7 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
     struct conn_cold *cc = conn_cold_ptr(&w->pool, cid);
     if (h->state == CONN_STATE_FREE) return;
 #ifdef VORTEX_PHASE_TLS
+    if (cc->backend_ssl) { SSL_free((SSL *)cc->backend_ssl); cc->backend_ssl = NULL; }
     if (h->ssl) { tls_ssl_free((SSL *)h->ssl); h->ssl = NULL; }
 #endif
     if (h->client_fd  >= 0) {
@@ -183,7 +186,8 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
         /* On a clean close with an idle (non-streaming) backend, return the fd
          * to the global pool for reuse by future connections. */
-        if (!is_error && !(h->flags & CONN_FLAG_STREAMING_BACKEND)) {
+        if (!is_error && !(h->flags & CONN_FLAG_STREAMING_BACKEND) &&
+            !(h->flags & CONN_FLAG_BACKEND_TLS)) {
             int ri = h->route_idx, bi = h->backend_idx;
             int ps = (ri >= 0 && ri < VORTEX_MAX_ROUTES &&
                       bi >= 0 && bi < VORTEX_MAX_BACKENDS)
