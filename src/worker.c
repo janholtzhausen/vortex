@@ -39,12 +39,10 @@ static void *worker_thread(void *arg)
             free(iovecs);
         }
 
-        /* Register sparse fixed file table: slot 0 = server_fd,
-         * slots [1..cap] = client_fd per cid,
-         * slots [cap+1..2*cap] = backend_fd per cid.
-         * Eliminates fdget/fdput on every recv/send SQE. */
-        if (uring_register_files_sparse(&w->uring, 1 + 2 * cap) == 0)
-            uring_install_fd(&w->uring, FIXED_FD_SERVER, w->listen_fd);
+        /* Fixed-file registration is intentionally disabled for now.
+         * The hot path already falls back to normal fds when
+         * files_registered=false, and teardown has been hanging in kernel
+         * fixed-file unregister quiescing during service restarts. */
 
         /* Multishot recv buf ring — used for H2 client recv.
          * One buffer per connection slot (ring count = next power-of-two ≥ cap).
