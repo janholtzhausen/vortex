@@ -1,4 +1,5 @@
 #include "config.h"
+#include "auth.h"
 #include "log.h"
 
 #include <stdio.h>
@@ -151,6 +152,7 @@ typedef struct {
     int                  backend_idx;
     int                  depth;          /* mapping depth */
     int                  seq_depth;      /* sequence depth */
+    int                  error;
 } parser_ctx_t;
 
 static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
@@ -285,13 +287,23 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
     case P_ROUTE_AUTH: {
         struct route_auth_config *a = &c->routes[ctx->route_idx].auth;
         if (!strcmp(k, "enabled")) a->enabled = !strcmp(val, "true");
+        else if (!strcmp(k, "file")) snprintf(a->file, sizeof(a->file), "%s", val);
         break;
     }
     case P_ROUTE_AUTH_USERS: {
-        /* Each scalar in this sequence is a "user:pass" credential */
+        /* Each scalar in this sequence is a "username:$scrypt$..." verifier */
         struct route_auth_config *a = &c->routes[ctx->route_idx].auth;
         if (a->credential_count < VORTEX_MAX_AUTH_USERS) {
-            snprintf(a->credentials[a->credential_count], sizeof(a->credentials[0]), "%s", val);
+            if (!auth_parse_verifier(&a->verifiers[a->credential_count], val)) {
+                log_error("config_load",
+                          "route=%s invalid auth verifier for user entry %d",
+                          c->routes[ctx->route_idx].hostname[0]
+                              ? c->routes[ctx->route_idx].hostname
+                              : "<unknown>",
+                          a->credential_count);
+                ctx->error = -1;
+                break;
+            }
             a->credential_count++;
         }
         break;
@@ -476,8 +488,35 @@ int config_load(const char *path, struct vortex_config *cfg)
     yaml_parser_delete(&parser);
     fclose(f);
 
-    if (ret == 0) {
+    if (ret == 0 && ctx.error == 0) {
+        for (int i = 0; i < cfg->route_count; i++) {
+            struct route_config *route = &cfg->routes[i];
+            if (route->auth.file[0]) {
+                if (!auth_load_verifiers_file(&route->auth,
+                                              route->auth.file,
+                                              route->hostname)) {
+                    log_error("config_load",
+                              "route=%s failed to load auth file %s",
+                              route->hostname[0] ? route->hostname : "<unknown>",
+                              route->auth.file);
+                    ret = -1;
+                    break;
+                }
+            }
+            if (route->auth.enabled && route->auth.credential_count == 0) {
+                log_error("config_load",
+                          "route=%s auth enabled but no verifiers configured",
+                          route->hostname[0] ? route->hostname : "<unknown>");
+                ret = -1;
+                break;
+            }
+        }
+    }
+
+    if (ret == 0 && ctx.error == 0) {
         log_info("config_loaded", "path=%s routes=%d", path, cfg->route_count);
+    } else if (ret == 0) {
+        ret = -1;
     }
     return ret;
 }

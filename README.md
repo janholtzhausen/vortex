@@ -81,9 +81,17 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
   - `Alt-Svc: h3=":443"; ma=86400` injected when HTTP/3 is compiled in
 
 ### HTTP Basic Auth
-- Per-route, per-user credential list in config (`user:password` entries)
+- Per-route hashed verifier list, either inline under `users:` or loaded from `auth.file`
+- Verifier format: `username:$scrypt$ln=...,r=...,p=...$salt_b64$hash_b64`
+- Startup fails if `auth.enabled: true` is set without at least one verifier
 - 401 response with `WWW-Authenticate: Basic realm="vortex"`
 - `Authorization` header stripped before forwarding to backend
+
+Generate verifiers with:
+
+```bash
+python3 tools/vortex-passwd.py admin
+```
 
 ### Observability
 - **Prometheus metrics** on a separate HTTP server (default `127.0.0.1:9090/metrics`)
@@ -97,8 +105,9 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - XDP metrics logged every second at `debug` level in the main loop
 
 ### Operations
-- Daemonises by default; `-f` to stay in foreground
-- PID file written to `/run/vortex.pid` (configurable)
+- Foreground by default; `systemd` should supervise the process directly
+- `-d` enables background daemonisation for non-`systemd` use
+- PID file written only in daemon mode to `/run/vortex.pid` (configurable)
 - **SIGHUP** — hot-reload config, refresh XDP blocklist and rate-limit config, re-read static certs from disk
 - **SIGTERM / SIGINT** — graceful shutdown: stops workers, closes connections, detaches XDP, removes PID file
 - `-t` — test config and exit
@@ -313,7 +322,12 @@ sudo systemctl restart vortex
 
 ```sh
 # Foreground, debug logging, custom config and BPF object
-sudo ./build-release/vortex -f -v \
+sudo ./build-release/vortex -v \
+  -c /etc/vortex/vortex.yaml \
+  -b ./build-release/vortex_xdp.bpf.o
+
+# Legacy daemon mode outside systemd
+sudo ./build-release/vortex -d \
   -c /etc/vortex/vortex.yaml \
   -b ./build-release/vortex_xdp.bpf.o
 
@@ -321,10 +335,10 @@ sudo ./build-release/vortex -f -v \
 ./build-release/vortex -t -c /etc/vortex/vortex.yaml
 
 # Reload config (blocklist, rate limits, static certs)
-kill -HUP $(cat /run/vortex.pid)
+sudo systemctl reload vortex
 
 # Graceful shutdown
-kill -TERM $(cat /run/vortex.pid)
+sudo systemctl stop vortex
 ```
 
 **Root is required** to attach XDP programs and create BPF maps. Running without
@@ -407,9 +421,9 @@ routes:
       ttl: 60
     auth:
       enabled: false
+      file: "/etc/vortex/auth/api-users.auth"
       users:
-        - "alice:secret"
-        - "bob:hunter2"
+        - "alice:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc="
 ```
 
 ### Environment variable expansion
@@ -504,8 +518,8 @@ The codebase was developed in phases; `VORTEX_PHASE=7` is the current build targ
 - Wildcard hostname matching (`*.example.com`)
 - Environment variable expansion in config
 - Config hot-reload on SIGHUP (blocklist, rate limits, static certs)
-- Daemonisation with `-f` foreground flag
-- PID file management
+- Foreground-by-default runtime with optional `-d` daemon mode
+- PID file management in daemon mode
 - `-X` / `-T` runtime flags to disable XDP / TLS
 - DNS-01 ACME challenge with Cloudflare provider
 - TLS cert expiry in Prometheus metrics

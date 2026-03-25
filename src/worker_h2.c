@@ -96,7 +96,7 @@ static bool h2_auth_failed(struct h2_session *sess, struct h2_stream *st)
     if (ri < 0 || ri >= sess->w->cfg->route_count)
         return false;
     const struct route_auth_config *auth = &sess->w->cfg->routes[ri].auth;
-    if (!auth->enabled || auth->credential_count == 0)
+    if (!auth->enabled)
         return false;
     return !(st->auth_seen && st->auth_ok);
 }
@@ -1748,10 +1748,11 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
                     st->is_chunked_resp = true;
             }
 
-            /* Static assets are safer on the buffered path. Incremental H2
-             * streaming is still used for large dynamic responses, but assets
-             * that benefit from caching or are sensitive to framing/encoding
-             * mismatches are buffered to EOF and then submitted complete. */
+            /* Static assets and JSON API payloads are safer on the buffered
+             * path. Incremental H2 streaming is still used for large dynamic
+             * responses, but assets and app API calls that are sensitive to
+             * framing/encoding mismatches are buffered to EOF and submitted
+             * complete. */
             const uint8_t *ct = (const uint8_t *)memmem(
                 st->resp_buf, st->resp_hdr_end, "Content-Type:", 13);
             if (!ct) ct = (const uint8_t *)memmem(
@@ -1766,7 +1767,8 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
                     if ((vlen >= 6 && memcmp(v, "image/", 6) == 0) ||
                         memmem(v, vlen, "font", 4) != NULL ||
                         (vlen >= 8 && memcmp(v, "text/css", 8) == 0) ||
-                        memmem(v, vlen, "javascript", 10) != NULL) {
+                        memmem(v, vlen, "javascript", 10) != NULL ||
+                        (vlen >= 16 && memcmp(v, "application/json", 16) == 0)) {
                         st->prefer_buffered_resp = true;
                     }
                 }

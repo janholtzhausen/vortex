@@ -390,6 +390,22 @@ int worker_start(struct worker *w)
 void worker_stop(struct worker *w)
 {
     w->stop = 1;
+
+    /* Wake the worker immediately instead of waiting for the 1s timeout.
+     * This also cancels the multishot accept / TLS-done pipe SQEs before
+     * uring_destroy(), avoiding stop-time hangs on still-open fds. */
+    if (w->listen_fd >= 0) {
+        close(w->listen_fd);
+        w->listen_fd = -1;
+    }
+    if (w->tls_done_pipe_rd >= 0) {
+        close(w->tls_done_pipe_rd);
+        w->tls_done_pipe_rd = -1;
+    }
+    if (w->tls_done_pipe_wr >= 0) {
+        close(w->tls_done_pipe_wr);
+        w->tls_done_pipe_wr = -1;
+    }
 }
 
 void worker_join(struct worker *w)

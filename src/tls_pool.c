@@ -109,6 +109,12 @@ void tls_pool_destroy(void)
         return;
     pthread_mutex_lock(&g_tls_pool.mu);
     g_tls_pool.shutdown = true;
+    while (g_tls_pool.count > 0) {
+        struct tls_handshake_job job = g_tls_pool.queue[g_tls_pool.head];
+        g_tls_pool.head = (g_tls_pool.head + 1) % TLS_POOL_QUEUE;
+        g_tls_pool.count--;
+        close(job.client_fd);
+    }
     pthread_cond_broadcast(&g_tls_pool.cv);
     pthread_mutex_unlock(&g_tls_pool.mu);
 

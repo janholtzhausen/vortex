@@ -5,15 +5,12 @@ After=network.target
 Wants=network.target
 
 [Service]
-Type=forking
-PIDFile=/run/vortex/vortex.pid
-RuntimeDirectory=vortex
+Type=simple
 Environment=LD_LIBRARY_PATH=/usr/lib/vortex
 ExecStart=/usr/bin/vortex \
     -c /etc/vortex/vortex.yaml \
     -b /usr/share/vortex/vortex_xdp.bpf.o
 ExecReload=/bin/kill -HUP $MAINPID
-KillMode=mixed
 Restart=always
 RestartSec=5
 

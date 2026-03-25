@@ -4,8 +4,8 @@
 #include <assert.h>
 #include <unistd.h>
 
-#include "../src/config.h"
-#include "../src/log.h"
+#include "../include/config.h"
+#include "../include/log.h"
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -58,9 +58,24 @@ static void write_test_yaml(const char *path)
         "    cert_provider: \"static_file\"\n"
         "    cert_path: \"/tmp/cert.pem\"\n"
         "    key_path: \"/tmp/key.pem\"\n"
+        "    auth:\n"
+        "      enabled: true\n"
+        "      users:\n"
+        "        - \"admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc=\"\n"
         "    cache:\n"
         "      enabled: true\n"
         "      ttl: 60\n"
+    );
+    fclose(f);
+}
+
+static void write_auth_file(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    assert(f);
+    fprintf(f,
+        "# vortex auth verifier file\n"
+        "admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc=\n"
     );
     fclose(f);
 }
@@ -112,6 +127,9 @@ int main(void)
         ASSERT(cfg.routes[0].backend_count == 1, "backend_count=1");
         ASSERT(!strcmp(cfg.routes[0].backends[0].address, "10.0.0.1:8080"), "backend address");
         ASSERT(cfg.routes[0].cert_provider == CERT_PROVIDER_STATIC, "cert_provider=static");
+        ASSERT(cfg.routes[0].auth.enabled == true, "route auth.enabled");
+        ASSERT(cfg.routes[0].auth.credential_count == 1, "route auth verifier count=1");
+        ASSERT(!strcmp(cfg.routes[0].auth.verifiers[0].username, "admin"), "route auth username");
         ASSERT(cfg.routes[0].cache.enabled == true, "route cache.enabled");
         ASSERT(cfg.routes[0].cache.ttl == 60, "route cache.ttl=60");
 
@@ -145,6 +163,74 @@ int main(void)
         struct vortex_config cfg;
         int ret = config_load("/nonexistent/path/vortex.yaml", &cfg);
         ASSERT(ret == -1, "nonexistent config returns -1");
+    }
+
+    /* Test 5: enabled auth with no verifiers fails */
+    {
+        const char *tmpfile = "/tmp/vortex_auth_missing.yaml";
+        FILE *f = fopen(tmpfile, "w");
+        fprintf(f,
+            "routes:\n"
+            "  - hostname: \"auth.example.com\"\n"
+            "    backends:\n"
+            "      - address: \"10.0.0.1:8080\"\n"
+            "    auth:\n"
+            "      enabled: true\n"
+        );
+        fclose(f);
+
+        struct vortex_config cfg;
+        int ret = config_load(tmpfile, &cfg);
+        ASSERT(ret == -1, "enabled auth without verifiers returns -1");
+        unlink(tmpfile);
+    }
+
+    /* Test 6: invalid verifier format fails */
+    {
+        const char *tmpfile = "/tmp/vortex_auth_invalid.yaml";
+        FILE *f = fopen(tmpfile, "w");
+        fprintf(f,
+            "routes:\n"
+            "  - hostname: \"auth.example.com\"\n"
+            "    backends:\n"
+            "      - address: \"10.0.0.1:8080\"\n"
+            "    auth:\n"
+            "      enabled: true\n"
+            "      users:\n"
+            "        - \"admin:plaintext\"\n"
+        );
+        fclose(f);
+
+        struct vortex_config cfg;
+        int ret = config_load(tmpfile, &cfg);
+        ASSERT(ret == -1, "invalid auth verifier returns -1");
+        unlink(tmpfile);
+    }
+
+    /* Test 7: auth.file loads verifier entries */
+    {
+        const char *cfgfile = "/tmp/vortex_auth_file.yaml";
+        const char *authfile = "/tmp/vortex_auth_file.auth";
+        write_auth_file(authfile);
+        FILE *f = fopen(cfgfile, "w");
+        fprintf(f,
+            "routes:\n"
+            "  - hostname: \"auth.example.com\"\n"
+            "    backends:\n"
+            "      - address: \"10.0.0.1:8080\"\n"
+            "    auth:\n"
+            "      enabled: true\n"
+            "      file: \"%s\"\n",
+            authfile);
+        fclose(f);
+
+        struct vortex_config cfg;
+        int ret = config_load(cfgfile, &cfg);
+        ASSERT(ret == 0, "auth.file config loads");
+        ASSERT(cfg.routes[0].auth.credential_count == 1, "auth.file verifier count=1");
+        ASSERT(!strcmp(cfg.routes[0].auth.verifiers[0].username, "admin"), "auth.file username");
+        unlink(cfgfile);
+        unlink(authfile);
     }
 
     printf("\n=== ALL TESTS PASSED ===\n");

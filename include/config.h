@@ -44,10 +44,25 @@ struct cache_route_config {
 };
 
 #define VORTEX_MAX_AUTH_USERS 32
+#define VORTEX_AUTH_MAX_USERNAME 64
+#define VORTEX_AUTH_MAX_SALT_LEN 32
+#define VORTEX_AUTH_MAX_HASH_LEN 64
+
+struct auth_verifier {
+    char     username[VORTEX_AUTH_MAX_USERNAME];
+    uint32_t log_n;
+    uint32_t r;
+    uint32_t p;
+    uint8_t  salt[VORTEX_AUTH_MAX_SALT_LEN];
+    uint8_t  hash[VORTEX_AUTH_MAX_HASH_LEN];
+    uint8_t  salt_len;
+    uint8_t  hash_len;
+};
 
 struct route_auth_config {
     bool enabled;
-    char credentials[VORTEX_MAX_AUTH_USERS][320]; /* "username:password" each */
+    char file[PATH_MAX];
+    struct auth_verifier verifiers[VORTEX_MAX_AUTH_USERS];
     int  credential_count;
 };
 

@@ -36,6 +36,7 @@ static volatile sig_atomic_t g_running  = 1;
 static volatile sig_atomic_t g_reload   = 0;
 static const char            *g_config_path = NULL;
 static struct vortex_config   g_cfg;
+static int                    g_pid_file_written = 0;
 
 static void sig_handler(int sig)
 {
@@ -80,7 +81,8 @@ static void usage(const char *prog)
     fprintf(stderr,
         "Usage: %s [options]\n"
         "  -c <config>   Path to config file (default: /etc/vortex/vortex.yaml)\n"
-        "  -f            Foreground (do not daemonise)\n"
+        "  -d            Daemonise into the background\n"
+        "  -f            Foreground (default; accepted for compatibility)\n"
         "  -t            Test config and exit\n"
         "  -v            Verbose (debug logging)\n"
         "  -h            Show this help\n",
@@ -345,14 +347,16 @@ static void cert_manager_reload_static(void)
 int main(int argc, char *argv[])
 {
     const char *config_path = "/etc/vortex/vortex.yaml";
-    int foreground  = 0;
+    int foreground  = 1;
     int test_config = 0;
     int verbose     = 0;
+    int daemonize   = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:ftb:XTvh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:dftb:XTvh")) != -1) {
         switch (opt) {
         case 'c': config_path = optarg; break;
+        case 'd': daemonize   = 1;      break;
         case 'f': foreground  = 1;      break;
         case 't': test_config = 1;      break;
         case 'b': snprintf(g_bpf_obj_path, sizeof(g_bpf_obj_path), "%s", optarg); break;
@@ -394,6 +398,8 @@ int main(int argc, char *argv[])
 
     setup_signals();
 
+    foreground = !daemonize;
+
     if (!foreground) {
         /* Daemonise */
         pid_t pid = fork();
@@ -410,7 +416,10 @@ int main(int argc, char *argv[])
         }
     }
 
-    write_pid_file(g_cfg.pid_file);
+    if (!foreground) {
+        if (write_pid_file(g_cfg.pid_file) == 0)
+            g_pid_file_written = 1;
+    }
 
     /* Phase 1: Load XDP program if interface and BPF obj are configured */
     int xdp_loaded = 0;
@@ -700,7 +709,8 @@ int main(int argc, char *argv[])
         bpf_loader_detach();
     }
 
-    unlink(g_cfg.pid_file);
+    if (g_pid_file_written)
+        unlink(g_cfg.pid_file);
     log_close();
     return 0;
 }

@@ -91,6 +91,11 @@ routes:
     cert_provider: "static_file"
     cert_path: "/etc/vortex/certs/api.example.com/fullchain.pem"
     key_path: "/etc/vortex/certs/api.example.com/privkey.pem"
+    # auth:
+    #   enabled: true
+    #   file: "/etc/vortex/auth/api-users.auth"
+    #   users:
+    #     - "admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc="
     cache:
       enabled: true
       ttl: 60
