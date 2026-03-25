@@ -62,10 +62,11 @@ void uring_destroy(struct uring_ctx *ctx)
         ctx->recv_ring     = NULL;
         ctx->recv_ring_mem = NULL;
     }
-    if (ctx->files_registered)
-        io_uring_unregister_files(&ctx->ring);
-    if (ctx->bufs_registered)
-        io_uring_unregister_buffers(&ctx->ring);
+    /* queue_exit tears down registered files/buffers along with the ring.
+     * Avoid explicit unregister calls here: they can block during shutdown if
+     * the kernel still considers some operations in flight. */
+    ctx->files_registered = false;
+    ctx->bufs_registered = false;
     io_uring_queue_exit(&ctx->ring);
 }
 
