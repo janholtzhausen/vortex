@@ -45,6 +45,15 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
         "vortex_worker_threads", "Number of worker threads",
         (uint64_t)ms->num_workers);
 
+    pos += snprintf(buf + pos, bufsz - pos,
+        "# HELP vortex_worker_pool_exhausted Pool exhaustion events per worker\n"
+        "# TYPE vortex_worker_pool_exhausted counter\n");
+    for (int i = 0; i < ms->num_workers; i++) {
+        pos += snprintf(buf + pos, bufsz - pos,
+            "vortex_worker_pool_exhausted{worker=\"%d\"} %llu\n",
+            i, (unsigned long long)ms->workers[i]->pool_exhausted);
+    }
+
     /* Aggregate worker stats */
     uint64_t total_accepted  = 0, total_completed = 0, total_errors = 0;
     uint64_t total_active    = 0;

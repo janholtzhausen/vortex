@@ -118,7 +118,10 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                 if (clh) {
                     const char *cv = clh + 17;
                     while (*cv == ' ') cv++;
-                    cold_main->backend_content_length = (uint32_t)atol(cv);
+                    char *endp;
+                    unsigned long cl = strtoul(cv, &endp, 10);
+                    if (cl > UINT32_MAX) cl = UINT32_MAX;
+                    cold_main->backend_content_length = (uint32_t)cl;
                 }
             }
             /* Count body bytes (after \r\n\r\n header terminator) */
@@ -782,7 +785,13 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
             socklen_t salen = sizeof(cold->client_addr);
             getpeername(client_fd, (struct sockaddr *)&cold->client_addr, &salen);
         }
-        if (new_cid == CONN_INVALID) { close(client_fd); return; }
+        if (new_cid == CONN_INVALID) {
+            w->pool_exhausted++;
+            log_warn("accept", "pool exhausted - dropping connection (total=%llu)",
+                     (unsigned long long)w->pool_exhausted);
+            close(client_fd);
+            return;
+        }
 
         struct conn_hot *nh = conn_hot(&w->pool, new_cid);
         nh->client_fd = client_fd;

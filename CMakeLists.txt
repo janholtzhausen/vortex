@@ -240,7 +240,7 @@ endif()
 target_compile_definitions(vortex PRIVATE VORTEX_PHASE=7)
 
 # ---- Tests ----
-add_subdirectory(tests EXCLUDE_FROM_ALL)
+add_subdirectory(tests)
 
 # ---- Install ----
 install(TARGETS vortex RUNTIME DESTINATION bin)

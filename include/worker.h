@@ -49,6 +49,7 @@ struct worker {
     uint64_t         accepted;
     uint64_t         completed;
     uint64_t         errors;
+    uint64_t         pool_exhausted;
     uint64_t         tls12_count;   /* TLS 1.2 handshakes */
     uint64_t         tls13_count;   /* TLS 1.3 handshakes */
     uint64_t         ktls_count;    /* connections using kTLS */
