@@ -3,7 +3,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "../src/log.h"
+#include "../include/log.h"
 
 #define ASSERT(cond, msg) do { \
     if (!(cond)) { \

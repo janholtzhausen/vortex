@@ -154,6 +154,11 @@ struct h2_stream {
     uint8_t *req_http11;
     uint32_t req_http11_len;
 
+    /* Backend io_uring CQEs can arrive after a stream is reset/closed. Keep
+     * buffers alive until the outstanding send/recv completions drain. */
+    bool     backend_send_in_flight;
+    bool     backend_recv_in_flight;
+
     uint8_t  slot;              /* index in h2_session.streams[] */
     uint32_t cid;               /* parent connection id */
 

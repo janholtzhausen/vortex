@@ -5,6 +5,8 @@ set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+enable_testing()
+
 # ---- Build type flags ----
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -237,7 +239,7 @@ endif()
 # Define build phase for conditional compilation
 target_compile_definitions(vortex PRIVATE VORTEX_PHASE=7)
 
-# ---- Tests (Phase 1: config + log) ----
+# ---- Tests ----
 add_subdirectory(tests EXCLUDE_FROM_ALL)
 
 # ---- Install ----

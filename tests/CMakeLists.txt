@@ -27,7 +27,10 @@ add_executable(test_log
     test_log.c
     ../src/log.c
 )
-target_include_directories(test_log PRIVATE ../src)
+target_include_directories(test_log PRIVATE
+    ../include
+    ../src
+)
 target_link_libraries(test_log pthread)
 
 add_executable(test_cache
@@ -35,10 +38,12 @@ add_executable(test_cache
     ../src/cache.c
     ../src/log.c
 )
-target_include_directories(test_cache PRIVATE ../src)
+target_include_directories(test_cache PRIVATE
+    ../include
+    ../src
+)
 target_link_libraries(test_cache pthread)
 
-enable_testing()
-add_test(NAME test_config COMMAND test_config)
-add_test(NAME test_log    COMMAND test_log)
-add_test(NAME test_cache  COMMAND test_cache)
+add_test(NAME test_config COMMAND $<TARGET_FILE:test_config>)
+add_test(NAME test_log    COMMAND $<TARGET_FILE:test_log>)
+add_test(NAME test_cache  COMMAND $<TARGET_FILE:test_cache>)

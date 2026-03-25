@@ -272,6 +272,15 @@ static void h2_stream_cleanup(struct h2_session *sess, struct h2_stream *st)
     if (sess->active_streams > 0) sess->active_streams--;
 }
 
+static void h2_stream_maybe_cleanup(struct h2_session *sess, struct h2_stream *st)
+{
+    if (st->state != H2_STREAM_CLOSING)
+        return;
+    if (st->backend_send_in_flight || st->backend_recv_in_flight)
+        return;
+    h2_stream_cleanup(sess, st);
+}
+
 /* RST_STREAM + clean up the slot */
 static void h2_stream_rst(struct h2_session *sess, struct h2_stream *st,
                            uint32_t error_code)
@@ -279,7 +288,12 @@ static void h2_stream_rst(struct h2_session *sess, struct h2_stream *st,
     if (st->stream_id > 0)
         nghttp2_submit_rst_stream(sess->ngh2, NGHTTP2_FLAG_NONE,
                                   st->stream_id, error_code);
-    h2_stream_cleanup(sess, st);
+    if (st->backend_fd >= 0) {
+        close(st->backend_fd);
+        st->backend_fd = -1;
+    }
+    st->state = H2_STREAM_CLOSING;
+    h2_stream_maybe_cleanup(sess, st);
     h2_send_pending(sess);
 }
 
@@ -313,6 +327,7 @@ static void h2_arm_backend_recv(struct h2_session *sess, struct h2_stream *st)
     io_uring_prep_recv(sqe, st->backend_fd,
         st->resp_buf + st->resp_buf_len, space, 0);
     sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_RECV_BACKEND, st->slot, sess->cid);
+    st->backend_recv_in_flight = true;
     uring_submit(&sess->w->uring);
 }
 
@@ -1011,7 +1026,8 @@ static int on_stream_close_cb(nghttp2_session *ngh2,
             sess->streams[i].stream_id == stream_id) {
             log_debug("h2_stream", "cid=%u stream=%d CLOSED err=%u",
                       sess->cid, stream_id, error_code);
-            h2_stream_cleanup(sess, &sess->streams[i]);
+            sess->streams[i].state = H2_STREAM_CLOSING;
+            h2_stream_maybe_cleanup(sess, &sess->streams[i]);
             return 0;
         }
     }
@@ -1244,6 +1260,7 @@ static void h2_grpc_send_pending(struct h2_session *sess, struct h2_stream *st)
         grpc->send_buf, grpc->send_len, MSG_NOSIGNAL);
     sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_GRPC_SEND_BACKEND, st->slot, sess->cid);
     grpc->send_in_flight = true;
+    st->backend_send_in_flight = true;
     uring_submit(&sess->w->uring);
 }
 
@@ -1254,6 +1271,7 @@ static void h2_grpc_arm_backend_recv(struct h2_session *sess, struct h2_stream *
     io_uring_prep_recv(sqe, st->backend_fd,
         st->grpc->recv_buf, sizeof(st->grpc->recv_buf), 0);
     sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_GRPC_RECV_BACKEND, st->slot, sess->cid);
+    st->backend_recv_in_flight = true;
     uring_submit(&sess->w->uring);
 }
 
@@ -1484,10 +1502,26 @@ static void h2_grpc_backend_init(struct h2_session *sess, struct h2_stream *st)
     if (!nvs) { h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR); return; }
 
     int idx = 0;
-    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":method",    7, (uint8_t *)st->method,    strlen(st->method),    NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
-    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":path",      5, (uint8_t *)st->path,      strlen(st->path),      NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
-    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":authority", 10,(uint8_t *)st->authority, strlen(st->authority), NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
-    nvs[idx++] = (nghttp2_nv){ (uint8_t *)":scheme",    7, (uint8_t *)"http",        4,                     NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE };
+    nvs[idx++] = (nghttp2_nv){
+        .name = (uint8_t *)":method", .namelen = 7,
+        .value = (uint8_t *)st->method, .valuelen = strlen(st->method),
+        .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+    };
+    nvs[idx++] = (nghttp2_nv){
+        .name = (uint8_t *)":path", .namelen = 5,
+        .value = (uint8_t *)st->path, .valuelen = strlen(st->path),
+        .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+    };
+    nvs[idx++] = (nghttp2_nv){
+        .name = (uint8_t *)":authority", .namelen = 10,
+        .value = (uint8_t *)st->authority, .valuelen = strlen(st->authority),
+        .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+    };
+    nvs[idx++] = (nghttp2_nv){
+        .name = (uint8_t *)":scheme", .namelen = 7,
+        .value = (uint8_t *)"http", .valuelen = 4,
+        .flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+    };
 
     /* Parse req_hdr_buf ("Name: Value\r\n") → nghttp2_nv (values live in req_hdr_buf) */
     uint8_t *p = st->req_hdr_buf, *end = p + st->req_hdr_len;
@@ -1546,9 +1580,15 @@ void h2_on_grpc_backend_send(struct worker *w, uint32_t cid, uint32_t slot, int 
 
     struct h2_grpc_backend *grpc = st->grpc;
     grpc->send_in_flight = false;
+    st->backend_send_in_flight = false;
 
     if (sent <= 0) {
         h2_stream_rst(sess, st, NGHTTP2_INTERNAL_ERROR);
+        return;
+    }
+
+    if (st->state == H2_STREAM_CLOSING) {
+        h2_stream_maybe_cleanup(sess, st);
         return;
     }
 
@@ -1568,11 +1608,19 @@ void h2_on_grpc_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int 
     struct h2_stream *st = &sess->streams[slot];
     if (!st->is_grpc || !st->grpc) return;
     struct h2_grpc_backend *grpc = st->grpc;
+    st->backend_recv_in_flight = false;
 
     if (n <= 0) {
         /* Backend closed connection — if we already submitted, ignore */
         if (!st->resp_submitted)
             h2_stream_rst(sess, st, n < 0 ? NGHTTP2_INTERNAL_ERROR : NGHTTP2_REFUSED_STREAM);
+        else if (st->state == H2_STREAM_CLOSING)
+            h2_stream_maybe_cleanup(sess, st);
+        return;
+    }
+
+    if (st->state == H2_STREAM_CLOSING) {
+        h2_stream_maybe_cleanup(sess, st);
         return;
     }
 
@@ -1633,6 +1681,7 @@ void h2_on_backend_connect(struct worker *w, uint32_t cid, uint32_t slot, int re
         st->req_http11 + st->req_send_off,
         st->req_http11_len - st->req_send_off, MSG_NOSIGNAL);
     sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_SEND_BACKEND, slot, cid);
+    st->backend_send_in_flight = true;
     uring_submit(&w->uring);
 }
 
@@ -1644,6 +1693,11 @@ void h2_on_backend_send(struct worker *w, uint32_t cid, uint32_t slot, int sent)
     if (slot >= H2_STREAM_SLOTS) return;
 
     struct h2_stream *st = &sess->streams[slot];
+    st->backend_send_in_flight = false;
+    if (st->state == H2_STREAM_CLOSING) {
+        h2_stream_maybe_cleanup(sess, st);
+        return;
+    }
     if (st->state != H2_STREAM_SENDING_REQ) return;
 
     if (sent <= 0) {
@@ -1661,6 +1715,7 @@ void h2_on_backend_send(struct worker *w, uint32_t cid, uint32_t slot, int sent)
             st->req_http11 + st->req_send_off,
             st->req_http11_len - st->req_send_off, MSG_NOSIGNAL);
         sqe->user_data = URING_UD_H2_ENCODE(VORTEX_OP_H2_SEND_BACKEND, slot, cid);
+        st->backend_send_in_flight = true;
         uring_submit(&w->uring);
         return;
     }
@@ -1683,6 +1738,11 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
     if (slot >= H2_STREAM_SLOTS) return;
 
     struct h2_stream *st = &sess->streams[slot];
+    st->backend_recv_in_flight = false;
+    if (st->state == H2_STREAM_CLOSING) {
+        h2_stream_maybe_cleanup(sess, st);
+        return;
+    }
     if (st->state != H2_STREAM_WAITING_RESP &&
         st->state != H2_STREAM_STREAMING) return;
 
