@@ -121,10 +121,17 @@ uint32_t cache_ttl_for_url(const char *url);
 /* Evict one entry (LRU) — returns 1 if evicted */
 int cache_evict_one(struct cache *c);
 
+static inline uint32_t coarse_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return (uint32_t)ts.tv_sec;
+}
+
 /* Check if entry is still valid */
 static inline bool cache_entry_valid(const struct cache_index_entry *e)
 {
     if (!(e->flags & CACHE_FLAG_VALID)) return false;
-    uint32_t now = (uint32_t)time(NULL);
+    uint32_t now = coarse_now();
     return (now - e->created_ts) < e->ttl_seconds;
 }

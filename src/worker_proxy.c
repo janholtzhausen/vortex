@@ -1348,7 +1348,7 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
             size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
 
             /* Build inject block */
-            char inj[640];
+            char inj[HEADER_INJ_BUF_SIZE];
             int inj_len = 0;
 
             /* NOTE: intentionally do NOT inject X-Forwarded-Proto: https.

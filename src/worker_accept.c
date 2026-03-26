@@ -19,7 +19,7 @@
  */
 int peek_client_hello_sni(int fd, char *out, size_t out_max)
 {
-    uint8_t buf[4096];
+    uint8_t buf[SNI_PEEK_BUF_SIZE];
     ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
     if (n < 5) return 0;
 
@@ -128,7 +128,7 @@ void tarpit_conn(struct worker *w, int fd)
 
     /* Send an immediate burst of garbage — scanner gets garbage, not silence */
     if (w->urandom_fd >= 0) {
-        uint8_t noise[256];
+        uint8_t noise[TARPIT_NOISE_INITIAL];
         ssize_t r = read(w->urandom_fd, noise, sizeof(noise));
         if (r > 0) send(fd, noise, (size_t)r, MSG_NOSIGNAL | MSG_DONTWAIT);
     }

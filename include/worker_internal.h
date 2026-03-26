@@ -65,6 +65,13 @@
 /* Minimum body size (bytes) for compression to be worthwhile */
 #define COMPRESS_MIN_BODY 512
 
+/* Shared worker buffer sizes */
+#define TARPIT_NOISE_INITIAL 256
+#define TARPIT_NOISE_DRIP    64
+#define SNI_PEEK_BUF_SIZE    4096
+/* Preserve the current header injection capacity during naming cleanup. */
+#define HEADER_INJ_BUF_SIZE  640
+
 /* Base64-encode src (len bytes) into dst (must hold ceil(len/3)*4 + 1 bytes).
  * Returns the number of characters written (excluding NUL). */
 static inline size_t b64_encode(const char *src, size_t slen, char *dst, size_t dsz)

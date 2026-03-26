@@ -86,7 +86,7 @@ static void *worker_thread(void *arg)
         if (ret == -ETIME) {
             /* Periodic: drip more urandom garbage into tarpitted connections */
             if (w->urandom_fd >= 0 && w->tarpit_count > 0) {
-                uint8_t noise[64];
+                uint8_t noise[TARPIT_NOISE_DRIP];
                 if (read(w->urandom_fd, noise, sizeof(noise)) == (ssize_t)sizeof(noise)) {
                     for (uint32_t ti = 0; ti < w->tarpit_count; ti++) {
                         int slot = (int)((w->tarpit_head + ti) % WORKER_TARPIT_MAX);

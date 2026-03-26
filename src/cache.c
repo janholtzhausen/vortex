@@ -195,7 +195,7 @@ static struct cache_index_entry *cache_lookup_locked(struct cache *c,
                 c->misses++;
                 return NULL;
             }
-            e->last_accessed_ts = (uint32_t)time(NULL);
+            e->last_accessed_ts = coarse_now();
             e->hit_count = e->hit_count < 0xFF ? e->hit_count + 1 : 0xFF;
             c->hits++;
             return e;
@@ -300,7 +300,7 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
     uint64_t hash = xxhash64(url, url_len);
     uint32_t confirm = fnv1a(url, url_len);
     size_t   slot = hash & c->index_mask;
-    uint32_t now  = (uint32_t)time(NULL);
+    uint32_t now  = coarse_now();
 
     uint8_t klen = (uint8_t)(url_len > 16 ? 16 : url_len);
     struct cache_index_entry new_entry = {

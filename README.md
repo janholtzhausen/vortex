@@ -12,7 +12,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **io_uring async I/O** — multishot accept, zero-syscall-per-packet data path
 - **Per-CPU worker threads** — one io_uring ring per thread, auto-scales to CPU count (max 64)
 - **SNI-based routing** — TLS Server Name Indication routes connections to named backends before the full handshake completes
-- **Wildcard hostname matching** — `*.example.com` style routes via `fnmatch`
+- **Wildcard hostname matching** — planned but not yet implemented; current matching is exact (case-insensitive)
 - **Load balancing** — round-robin, weighted round-robin, least-connections (falls back to round-robin), IP-hash
 - **HTTP/1.1 keep-alive** — backend `Connection: close` forced; client side rewritten to `keep-alive`; backend reconnect on next request
 - **WebSocket passthrough** — detects `Upgrade: websocket` and `101 Switching Protocols`; hands off to a dedicated relay thread for full-duplex streaming
@@ -420,7 +420,7 @@ metrics:
   path: "/metrics"
 
 routes:
-  - hostname: "api.example.com"   # Exact match; *.example.com for wildcard
+  - hostname: "api.example.com"   # Exact match (case-insensitive)
     load_balancing: "round_robin" # round_robin | weighted_round_robin | least_conn | ip_hash
     cert_provider: "static_file"  # static_file | acme_http01 | acme_dns01
     cert_path: "/etc/ssl/api.crt"
@@ -531,7 +531,7 @@ The codebase was developed in phases; `VORTEX_PHASE=7` is the current build targ
 - Authorization header stripping before backend forward
 - Server header masquerade
 - X-Api-Key injection per route
-- Wildcard hostname matching (`*.example.com`)
+- Wildcard hostname matching planned; current routing is exact and case-insensitive
 - Environment variable expansion in config
 - Config hot-reload on SIGHUP (blocklist, rate limits, static certs)
 - Foreground-by-default runtime with optional `-d` daemon mode

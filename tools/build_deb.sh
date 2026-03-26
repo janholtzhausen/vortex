@@ -7,7 +7,36 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$REPO_ROOT/build-release"
-VERSION="${1:-$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")}"
+
+latest_local_pkg_version() {
+    find "$REPO_ROOT" -maxdepth 1 -type f -name 'vortex_*_amd64.deb' -printf '%f\n' 2>/dev/null \
+        | sed -n 's/^vortex_\(.*\)_amd64\.deb$/\1/p' \
+        | sort -V \
+        | tail -n 1
+}
+
+default_version() {
+    local git_version=""
+    local pkg_version=""
+
+    git_version="$(git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null \
+        | sed 's/^v//')"
+    pkg_version="$(latest_local_pkg_version)"
+
+    if [ -n "$git_version" ] && [ -n "$pkg_version" ]; then
+        printf '%s\n%s\n' "$git_version" "$pkg_version" | sort -V | tail -n 1
+    elif [ -n "$pkg_version" ]; then
+        printf '%s\n' "$pkg_version"
+    elif [ -n "$git_version" ]; then
+        printf '%s\n' "$git_version"
+    else
+        echo "Unable to determine package version." >&2
+        echo "Pass an explicit version: bash tools/build_deb.sh <version>" >&2
+        exit 1
+    fi
+}
+
+VERSION="${1:-$(default_version)}"
 PKG="vortex_${VERSION}_amd64"
 STAGING="/tmp/${PKG}"
 OPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR:-/opt/openssl-4.0}"
@@ -15,12 +44,14 @@ NGTCP2_BUILD_DIR="${NGTCP2_BUILD_DIR:-/opt/ngtcp2/build}"
 NGHTTP3_BUILD_DIR="${NGHTTP3_BUILD_DIR:-/opt/nghttp3/build}"
 NGTCP2_SRC_DIR="${NGTCP2_SRC_DIR:-/tmp/ngtcp2-1.16.0}"
 NGHTTP3_SRC_DIR="${NGHTTP3_SRC_DIR:-/tmp/nghttp3-1.8.0}"
+VORTEX_DEB_MARCH="${VORTEX_DEB_MARCH:-znver3}"
 
-echo "==> Building vortex .deb  version=${VERSION}"
+echo "==> Building vortex .deb  version=${VERSION} march=${VORTEX_DEB_MARCH}"
 
 # ---- 1. Compile ----
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DVORTEX_MARCH="$VORTEX_DEB_MARCH" \
     -DFORCE_OPENSSL_BUNDLED=ON \
     -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
     -DNGTCP2_BUILD_DIR="$NGTCP2_BUILD_DIR" \
