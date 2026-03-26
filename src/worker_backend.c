@@ -9,6 +9,7 @@
 #include "worker_internal.h"
 
 #ifdef VORTEX_PHASE_TLS
+#include <poll.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
 
@@ -31,20 +32,11 @@ static uint32_t backend_timeout_ms_for(struct worker *w, uint32_t cid)
 
 static int backend_ssl_wait(int fd, bool want_read, uint32_t timeout_ms)
 {
-    fd_set rset, wset;
-    struct timeval tv;
-
-    FD_ZERO(&rset);
-    FD_ZERO(&wset);
-    if (want_read)
-        FD_SET(fd, &rset);
-    else
-        FD_SET(fd, &wset);
-
-    tv.tv_sec = (int)(timeout_ms / 1000);
-    tv.tv_usec = (int)((timeout_ms % 1000) * 1000);
-    return select(fd + 1, want_read ? &rset : NULL, want_read ? NULL : &wset,
-                  NULL, &tv);
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = want_read ? POLLIN : POLLOUT,
+    };
+    return poll(&pfd, 1, (int)timeout_ms);
 }
 
 static const char *backend_server_name(const struct backend_config *bcfg,

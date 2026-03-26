@@ -69,6 +69,10 @@ static void send_service_unavailable_and_close(struct worker *w, uint32_t cid)
 static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool has_pending_data)
 {
     struct conn_hot *h = conn_hot(&w->pool, cid);
+    /* When has_pending_data is true, the caller already incremented w->accepted
+     * and the connection is already in CONN_STATE_PROXYING — we must not
+     * re-increment or re-set the state. Request data sits in recv_buf and
+     * will be forwarded by the CONNECT completion handler. */
     int backend_idx = select_available_backend(w, route_idx, 0);
     if (backend_idx < 0) {
         send_service_unavailable_and_close(w, cid);
@@ -319,7 +323,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
             if (hdr_end && ttl > 0) {
                 /* Build the value we want */
                 char cc_val[64];
-                if (ttl >= 3600) snprintf(cc_val, sizeof(cc_val), "public, max-age=%u", ttl);
+                if (ttl >= 3600) snprintf(cc_val, sizeof(cc_val), "public, max-age=%u, immutable", ttl);
                 else             snprintf(cc_val, sizeof(cc_val), "public, max-age=%u", ttl);
 
                 uint8_t *cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nCache-Control:", 16);
@@ -1665,11 +1669,7 @@ static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t 
     if (cqe->res < 0) {
         log_warn("connect_cqe", "conn=%u backend connect failed: %s",
             cid, strerror(-cqe->res));
-        const char *r502 =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-        send(h->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-        conn_close(w, cid, false);
+        send_bad_gateway_and_close(w, cid);
         return;
     }
     log_debug("connect_cqe", "conn=%u backend_fd=%d connected", cid, h->backend_fd);

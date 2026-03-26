@@ -579,6 +579,7 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 - **IPv4 only** in the XDP program — IPv6 packets are passed without filtering or conntrack
 - **Load balancer — least_conn** falls back to round-robin (per-backend active connection tracking not yet implemented)
 - **Backend connections** are synchronous blocking connects (set non-blocking after connect); async io_uring CONNECT is planned
+- **Backend TLS** (`https://` origins) performs blocking `SSL_connect`/`SSL_write`/`SSL_read` in the worker thread. A slow or unresponsive HTTPS backend will stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Connection pooling is disabled for TLS backends (each request performs a full TCP+TLS handshake).
 - **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
 - **WebSocket relay** uses `select(2)` in a dedicated thread rather than io_uring
 - **Config reload** does a full in-memory replace (`memcpy`); live connections use the old route/backend config until they close

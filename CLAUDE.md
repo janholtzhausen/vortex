@@ -35,3 +35,4 @@ All 6 tests must pass before pushing.
 - send_zc is similarly gated on `!CONN_FLAG_KTLS_TX` — do not remove
 - XDP/tarpit blocklist is IPv4-only regardless of `ipv4_only` setting
 - TLS handshakes are offloaded to `tls_pool` (4 threads) — do not block the io_uring loop with SSL_accept
+- Backend TLS (`https://` origins) blocks the io_uring worker thread during `SSL_connect`/read/write — keep `backend_timeout_ms` low for TLS routes
