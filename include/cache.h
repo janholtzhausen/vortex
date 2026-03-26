@@ -28,16 +28,18 @@ struct __attribute__((packed, aligned(64))) cache_index_entry {
     uint32_t header_len;
     uint32_t created_ts;
     uint32_t last_accessed_ts;
-    uint32_t ttl_seconds;
+    uint16_t ttl_seconds;
     uint16_t status_code;
-    uint16_t flags;
-    uint16_t hit_count;
+    uint8_t  flags;
+    uint8_t  hit_count;
     uint8_t  content_type;
-    /* Collision guard: first min(key_len,16) bytes of the cache key.
-     * Combined with the 64-bit hash this makes a false-positive
-     * essentially impossible.  Fills the 17 bytes of tail padding so
-     * sizeof stays at 64.  8+8+4+4+4+4+4+4+2+2+2+1+1+16 = 64 */
     uint8_t  url_key_len;     /* bytes stored (0..16) */
+    uint32_t url_hash_confirm;/* FNV-1a of full URL — secondary collision check */
+    /* Collision guard: first min(key_len,16) bytes of the cache key.
+     * Combined with the 64-bit hash and secondary FNV-1a confirm hash
+     * this makes a false-positive essentially impossible while keeping
+     * the entry at 64 bytes.
+     * 8+8+4+4+4+4+4+2+2+1+1+1+1+4+16 = 64 */
     char     url_key[16];     /* first 16 bytes of "host|path" key */
 };
 _Static_assert(sizeof(struct cache_index_entry) == 64,

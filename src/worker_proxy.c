@@ -53,6 +53,77 @@ static void send_bad_gateway_and_close(struct worker *w, uint32_t cid)
     conn_close(w, cid, false);
 }
 
+static void send_service_unavailable_and_close(struct worker *w, uint32_t cid)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    static const char r503[] =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
+        "Service Unavailable";
+    send(h->client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
+    conn_close(w, cid, false);
+}
+
+/* Route to a backend and establish or reuse a connection.
+ * Returns 0 on success (recv armed or CONNECT in flight), -1 on failure. */
+static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool has_pending_data)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    int backend_idx = select_available_backend(w, route_idx, 0);
+    if (backend_idx < 0) {
+        send_service_unavailable_and_close(w, cid);
+        return -1;
+    }
+
+    h->route_idx = (uint16_t)route_idx;
+    h->backend_idx = (uint16_t)backend_idx;
+
+    const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
+    if (!addr) {
+        send_bad_gateway_and_close(w, cid);
+        return -1;
+    }
+
+    const struct backend_config *bcfg = &w->cfg->routes[route_idx].backends[backend_idx];
+    int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
+    int pooled_fd = (cfg_pool > 0) ? global_pool_get(route_idx, backend_idx) : -1;
+    if (pooled_fd >= 0) {
+        h->backend_fd = pooled_fd;
+        h->flags |= CONN_FLAG_BACKEND_POOLED;
+        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid), pooled_fd);
+
+        if (!has_pending_data) {
+            h->state = CONN_STATE_PROXYING;
+            h->last_active_tsc = rdtsc();
+            w->accepted++;
+
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); return -1; }
+            PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            uring_submit(&w->uring);
+        }
+        return 0;
+    }
+
+    h->backend_fd = begin_async_connect(w, bcfg, cid);
+    if (h->backend_fd >= 0)
+        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid), h->backend_fd);
+    if (h->backend_fd < 0) {
+        send_bad_gateway_and_close(w, cid);
+        return -1;
+    }
+
+    h->flags |= CONN_FLAG_BACKEND_CONNECTING;
+    h->state = CONN_STATE_BACKEND_CONNECT;
+    if (!has_pending_data) {
+        h->last_active_tsc = rdtsc();
+        w->accepted++;
+    }
+    return 0;
+}
+
 static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
 {
     struct conn_hot *h = conn_hot(&w->pool, cid);
@@ -686,68 +757,1167 @@ static void process_tls_result(struct worker *w,
     {
         int route_idx = res->tls_route_idx;
         if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
-            int backend_idx = select_available_backend(w, route_idx, 0);
-            if (backend_idx < 0) {
-                static const char r503[] =
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
-                    "Service Unavailable";
-                send(res->client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
-                close(res->client_fd);
-                conn_free(&w->pool, hcid);
+            if (route_and_connect(w, hcid, route_idx, false) < 0)
                 return;
-            }
-            const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
-            th->route_idx = (uint16_t)route_idx;
-            th->backend_idx = (uint16_t)backend_idx;
-            if (addr) {
-                const struct backend_config *bcfg = &w->cfg->routes[route_idx].backends[backend_idx];
-                int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
-                int pooled_fd = (cfg_pool > 0) ? global_pool_get(route_idx, backend_idx) : -1;
-                if (pooled_fd >= 0) {
-                    th->backend_fd = pooled_fd;
-                    th->flags |= CONN_FLAG_BACKEND_POOLED;
-                    uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid), pooled_fd);
-                } else {
-                    th->backend_fd = begin_async_connect(w, bcfg, hcid);
-                    if (th->backend_fd >= 0)
-                        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, hcid), th->backend_fd);
-                    if (th->backend_fd < 0) {
-                        const char *r502 =
-                            "HTTP/1.1 502 Bad Gateway\r\n"
-                            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-                        send(res->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-                        close(res->client_fd);
-                        conn_free(&w->pool, hcid);
-                        return;
-                    }
-                    th->flags |= CONN_FLAG_BACKEND_CONNECTING;
-                    th->state = CONN_STATE_BACKEND_CONNECT;
-                    th->last_active_tsc = rdtsc();
-                    w->accepted++;
-                    return;
-                }
-            }
+            if (th->flags & CONN_FLAG_BACKEND_CONNECTING)
+                return;
         }
     }
     if (th->backend_fd < 0) {
+        send_bad_gateway_and_close(w, hcid);
+        return;
+    }
+}
+#endif
+
+static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
+{
+    int client_fd = cqe->res;
+    log_debug("accept_cqe", "worker=%d res=%d flags=0x%x",
+        w->worker_id, cqe->res, cqe->flags);
+    if (client_fd < 0) {
+        /* Multishot accept will continue unless !IORING_CQE_F_MORE */
+        return;
+    }
+
+    int one = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Correct-SNI connections: explicitly remove any window clamp so the OS
+     * can grow the receive window progressively to its configured maximum. */
+    int zero_clamp = 0;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &zero_clamp, sizeof(zero_clamp));
+    /* Don't queue more unsent data than one buffer — prevents slow clients
+     * from accumulating a backlog of 16KB chunks in the kernel send buffer. */
+    int lowat = WORKER_BUF_SIZE;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
+
+    uint32_t new_cid = conn_alloc(&w->pool);
+    if (new_cid != CONN_INVALID) {
+        /* Record client address for X-Forwarded-For */
+        struct conn_cold *cold = conn_cold_ptr(&w->pool, new_cid);
+        socklen_t salen = sizeof(cold->client_addr);
+        getpeername(client_fd, (struct sockaddr *)&cold->client_addr, &salen);
+    }
+    if (new_cid == CONN_INVALID) {
+        w->pool_exhausted++;
+        log_warn("accept", "pool exhausted - dropping connection (total=%llu)",
+                 (unsigned long long)w->pool_exhausted);
+        close(client_fd);
+        return;
+    }
+
+    struct conn_hot *nh = conn_hot(&w->pool, new_cid);
+    nh->client_fd = client_fd;
+    nh->recv_window = WORKER_BUF_INIT;
+    uring_install_fd(&w->uring, (unsigned)FIXED_FD_CLIENT(w, new_cid), client_fd);
+
+    int tls_route_idx = 0;
+#ifdef VORTEX_PHASE_TLS
+    /* TLS handshake — blocking but bounded by select timeout in tls_accept */
+    if (w->tls && w->tls->route_count > 0) {
+        /* Peek at SNI before the handshake — tarpit unrecognised clients immediately */
+        char peek_sni_buf[256] = {0};
+        if (peek_client_hello_sni(client_fd, peek_sni_buf, sizeof(peek_sni_buf))) {
+            int matched = 0;
+            for (int ri = 0; ri < w->cfg->route_count; ri++) {
+                if (strcasecmp(peek_sni_buf, w->cfg->routes[ri].hostname) == 0) {
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) {
+                log_info("tarpit", "fd=%d sni=%s total=%llu",
+                    client_fd, peek_sni_buf,
+                    (unsigned long long)(w->tarpit_total + 1));
+                tarpit_conn(w, client_fd);
+                conn_free(&w->pool, new_cid);
+                return;
+            }
+        }
+
+        /* Offload blocking SSL_accept to the TLS handshake pool.
+         * The worker returns immediately; when the pool thread finishes it
+         * writes a tls_handshake_result to tls_done_pipe_wr which wakes the
+         * io_uring VORTEX_OP_TLS_DONE handler below. */
+        if (w->tls_done_pipe_wr >= 0) {
+            struct tls_handshake_job job = {
+                .client_fd      = client_fd,
+                .cid            = new_cid,
+                .tls            = w->tls,
+                .result_pipe_wr = w->tls_done_pipe_wr,
+            };
+            if (!tls_pool_submit(job)) {
+                /* Queue full — drop the connection */
+                close(client_fd);
+                conn_free(&w->pool, new_cid);
+            }
+            /* Return: VORTEX_OP_TLS_DONE will continue this connection */
+            return;
+        }
+        /* Fallback (no pipe): blocking path — should not normally happen */
+        char sni_fb[256] = {0};
+        SSL *ssl_fb = tls_accept(w->tls, client_fd, &tls_route_idx, sni_fb, sizeof(sni_fb));
+        if (!ssl_fb) { close(client_fd); conn_free(&w->pool, new_cid); return; }
+        if (SSL_version(ssl_fb) == TLS1_3_VERSION) w->tls13_count++; else w->tls12_count++;
+        if (tls_ktls_tx_active(ssl_fb) && tls_ktls_rx_active(ssl_fb)) {
+            nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
+            tls_ssl_free(ssl_fb); nh->ssl = NULL; w->ktls_count++;
+        } else { nh->ssl = ssl_fb; }
+        int fl = fcntl(client_fd, F_GETFL);
+        fcntl(client_fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+#endif
+
+    /* Route selection: TLS SNI route takes priority */
+    int route_idx = tls_route_idx;
+    if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
+        if (route_and_connect(w, new_cid, route_idx, false) < 0)
+            return;
+        if (nh->flags & CONN_FLAG_BACKEND_CONNECTING)
+            return;
+        if (nh->flags & CONN_FLAG_BACKEND_POOLED) {
+            log_debug("accept_pool", "conn=%u reused backend fd=%d",
+                (unsigned)new_cid, nh->backend_fd);
+        }
+    }
+
+    if (nh->backend_fd < 0) {
+        send_bad_gateway_and_close(w, new_cid);
+        return;
+    }
+
+    log_debug("accept_arm", "conn=%u client_fd=%d backend_fd=%d (pooled)",
+        (unsigned)new_cid, client_fd, nh->backend_fd);
+}
+
+#ifdef VORTEX_PHASE_TLS
+static void handle_tls_done(struct worker *w, struct io_uring_cqe *cqe)
+{
+    /* Re-arm pipe read for the next result before processing this one */
+    struct io_uring_sqe *rpsqe = io_uring_get_sqe(&w->uring.ring);
+    if (rpsqe) {
+        io_uring_prep_read(rpsqe, w->tls_done_pipe_rd,
+                           w->tls_pipe_buf, sizeof(w->tls_pipe_buf), 0);
+        rpsqe->user_data = URING_UD_ENCODE(VORTEX_OP_TLS_DONE, 0);
+    }
+    uring_submit(&w->uring);
+
+    if (cqe->res != (int)sizeof(struct tls_handshake_result)) {
+        /* Partial or error read — nothing we can do, pipe stays armed */
+        return;
+    }
+
+    struct tls_handshake_result res;
+    memcpy(&res, w->tls_pipe_buf, sizeof(res));
+    process_tls_result(w, &res);
+
+    /* Drain any additional results queued in the pipe */
+    for (;;) {
+        struct tls_handshake_result extra;
+        ssize_t nr = read(w->tls_done_pipe_rd, &extra, sizeof(extra));
+        if (nr != (ssize_t)sizeof(extra)) break;
+        process_tls_result(w, &extra);
+    }
+}
+#endif
+
+#ifdef VORTEX_H2
+static bool handle_h2_backend_ops(struct worker *w, struct io_uring_cqe *cqe, uint32_t op)
+{
+    /* H2 backend ops encode (slot << 12) | cid in the lower 32 bits —
+     * extract the real cid with URING_UD_H2_CID before the pool capacity check. */
+    if (op != VORTEX_OP_H2_CONNECT        && op != VORTEX_OP_H2_SEND_BACKEND &&
+        op != VORTEX_OP_H2_RECV_BACKEND   &&
+        op != VORTEX_OP_H2_GRPC_SEND_BACKEND &&
+        op != VORTEX_OP_H2_GRPC_RECV_BACKEND) {
+        return false;
+    }
+
+    uint32_t h2_cid  = URING_UD_H2_CID(cqe->user_data);
+    uint32_t h2_slot = URING_UD_H2_SLOT(cqe->user_data);
+    if (h2_cid >= w->pool.capacity) return true;
+    struct conn_hot *hh = conn_hot(&w->pool, h2_cid);
+    if (hh->state == CONN_STATE_FREE) return true;
+    if (op == VORTEX_OP_H2_CONNECT)
+        h2_on_backend_connect(w, h2_cid, h2_slot, cqe->res);
+    else if (op == VORTEX_OP_H2_SEND_BACKEND)
+        h2_on_backend_send(w, h2_cid, h2_slot, cqe->res);
+    else if (op == VORTEX_OP_H2_RECV_BACKEND)
+        h2_on_backend_recv(w, h2_cid, h2_slot, cqe->res);
+    else if (op == VORTEX_OP_H2_GRPC_SEND_BACKEND)
+        h2_on_grpc_backend_send(w, h2_cid, h2_slot, cqe->res);
+    else
+        h2_on_grpc_backend_recv(w, h2_cid, h2_slot, cqe->res);
+    return true;
+}
+#endif
+
+static void handle_error(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    uint32_t op = URING_UD_OP(cqe->user_data);
+
+    (void)h;
+
+    /* EIO on kTLS = TLS close_notify or alert — treat as normal close */
+    bool is_error = true;
+    if (cqe->res == -ECONNRESET || cqe->res == -EPIPE ||
+        cqe->res == -EBADF     || cqe->res == -ECANCELED ||
+        cqe->res == -EIO       || cqe->res == -ENOBUFS) {
+        if (cqe->res == -ENOBUFS)
+            log_warn("recv_ring",
+                "conn=%u op=%u recv buf ring exhausted — closing connection",
+                cid, op);
+        is_error = false; /* expected close conditions */
+    } else {
+        log_debug("proxy_err", "conn=%u op=%u err=%s", cid, op, strerror(-cqe->res));
+    }
+    conn_close(w, cid, is_error);
+}
+
+static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int n = cqe->res;
+    log_debug("recv_client", "conn=%u n=%d", cid, n);
+    if (n == 0) { conn_close(w, cid, false); return; } /* Client EOF */
+    RECV_WINDOW_GROW(h, n, w->pool.buf_size);
+    h->bytes_in += (uint32_t)n;
+
+    /* Reconnect to backend if previous response consumed the connection */
+    if (h->backend_fd < 0) {
+        int ri = h->route_idx;
+        /* Async reconnect: data already in recv_buf — save it so CONNECT can forward it. */
+        h->send_buf_len = (uint32_t)n;
+        if (route_and_connect(w, cid, ri, true) < 0)
+            return;
+        if (h->flags & CONN_FLAG_BACKEND_CONNECTING)
+            return;
+    }
+
+    /* Per-route rate limit (token bucket).
+     * Only enforced when the connection pool is ≥75% full — i.e. when a
+     * noisy route could actually starve other origins.  Below that
+     * threshold every route runs uncapped regardless of config. */
+    {
+        const struct route_config *rc = &w->cfg->routes[h->route_idx];
+        if (rc->rate_limit.enabled && rc->rate_limit.rps > 0 &&
+            (uint64_t)w->pool.active * 4 >= (uint64_t)w->pool.capacity * 3) {
+            int ri = h->route_idx;
+            uint32_t max_tokens = rc->rate_limit.burst ? rc->rate_limit.burst
+                                                       : rc->rate_limit.rps;
+            struct timespec _rl_ts;
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &_rl_ts);
+            uint64_t now_ns = (uint64_t)_rl_ts.tv_sec * 1000000000ULL + _rl_ts.tv_nsec;
+
+            if (w->route_rl[ri].last_ns == 0) {
+                /* First request — fill to burst */
+                w->route_rl[ri].tokens  = max_tokens;
+                w->route_rl[ri].last_ns = now_ns;
+            } else {
+                uint64_t elapsed_ns   = now_ns - w->route_rl[ri].last_ns;
+                uint64_t ns_per_token = 1000000000ULL / rc->rate_limit.rps;
+                uint32_t new_tokens   = (uint32_t)(elapsed_ns / ns_per_token);
+                if (new_tokens > max_tokens) new_tokens = max_tokens; /* cap before add */
+                if (new_tokens > 0) {
+                    w->route_rl[ri].tokens += new_tokens;
+                    if (w->route_rl[ri].tokens > max_tokens)
+                        w->route_rl[ri].tokens = max_tokens;
+                    /* Advance by whole intervals to preserve fractional remainder */
+                    w->route_rl[ri].last_ns += (uint64_t)new_tokens * ns_per_token;
+                }
+            }
+
+            if (w->route_rl[ri].tokens == 0) {
+                static const char r429[] =
+                    "HTTP/1.1 429 Too Many Requests\r\n"
+                    "Content-Length: 0\r\n"
+                    "Retry-After: 1\r\n"
+                    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+                    "Connection: keep-alive\r\n\r\n";
+                struct io_uring_sqe *sqe429  = io_uring_get_sqe(&w->uring.ring);
+                struct io_uring_sqe *sqe429r = io_uring_get_sqe(&w->uring.ring);
+                if (!sqe429 || !sqe429r) { conn_close(w, cid, false); return; }
+                uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+                size_t r429_len = sizeof(r429) - 1;
+                memcpy(sbuf, r429, r429_len);
+                h->send_buf_off = 0;
+                h->send_buf_len = (uint32_t)r429_len;
+                h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                PREP_SEND(w, sqe429, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    sbuf, r429_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                sqe429->user_data  = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+                sqe429->flags     |= IOSQE_IO_LINK;
+                PREP_RECV(w, sqe429r, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+                sqe429r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+                uring_submit(&w->uring);
+                return;
+            }
+            w->route_rl[ri].tokens--;
+        }
+    }
+
+    /* Basic Auth check */
+    {
+        const struct route_config *rc = &w->cfg->routes[h->route_idx];
+        if (!auth_check_request(&rc->auth, conn_recv_buf(&w->pool, cid), n)) {
+            /* Send 401 and re-arm for next request */
+            static const char r401[] =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "WWW-Authenticate: Basic realm=\"vortex\"\r\n"
+                "Content-Length: 0\r\n"
+                "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+                "Connection: keep-alive\r\n\r\n";
+            struct io_uring_sqe *sqe401 = io_uring_get_sqe(&w->uring.ring);
+            struct io_uring_sqe *sqe401r = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe401 || !sqe401r) { conn_close(w, cid, false); return; }
+            /* Copy 401 to send buf */
+            uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+            size_t r401_len = sizeof(r401) - 1;
+            memcpy(sbuf, r401, r401_len);
+            h->send_buf_off = 0;
+            h->send_buf_len = (uint32_t)r401_len;
+            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+            PREP_SEND(w, sqe401, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                sbuf, r401_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+            sqe401->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+            sqe401->flags |= IOSQE_IO_LINK;
+            /* Pre-arm RECV_CLIENT as linked SQE — kernel starts it immediately after send */
+            PREP_RECV(w, sqe401r, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+            sqe401r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            uring_submit(&w->uring);
+            return;
+        }
+    }
+
+    /* Detect WebSocket upgrade request */
+    {
+        const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        if (memmem(rbuf, (size_t)n, "Upgrade: websocket", 18) != NULL ||
+            memmem(rbuf, (size_t)n, "upgrade: websocket", 18) != NULL) {
+            h->flags |= CONN_FLAG_WEBSOCKET_ACTIVE;
+            if (w->cfg->routes[h->route_idx].backends[h->backend_idx].tls) {
+                send_bad_gateway_and_close(w, cid);
+                return;
+            }
+        }
+    }
+
+    /* Detect client compression acceptance — cleared each request for keepalive correctness.
+     * Prefer brotli (br) over gzip when both are advertised. */
+    h->flags &= ~(CONN_FLAG_CLIENT_GZIP | CONN_FLAG_CLIENT_BR);
+    {
+        const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        const uint8_t *ae = (const uint8_t *)memmem(rbuf, (size_t)n, "Accept-Encoding:", 16);
+        if (!ae) ae = (const uint8_t *)memmem(rbuf, (size_t)n, "accept-encoding:", 16);
+        if (ae) {
+            const uint8_t *eol = (const uint8_t *)FIND_CRLF(ae + 16,
+                (size_t)n - (size_t)(ae + 16 - rbuf));
+            if (eol) {
+                size_t ae_val_len = (size_t)(eol - ae - 16);
+                if (memmem(ae + 16, ae_val_len, "br", 2))
+                    h->flags |= CONN_FLAG_CLIENT_BR;
+                if (memmem(ae + 16, ae_val_len, "gzip", 4))
+                    h->flags |= CONN_FLAG_CLIENT_GZIP;
+            }
+        }
+    }
+
+    /* Cache check: only for GET requests */
+    if (w->cache && w->cache->index) {
+        char method[16], url[512];
+        const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        if (parse_http_request_line(rbuf, n,
+                                    method, sizeof(method),
+                                    url, sizeof(url)) == 0
+            && strcmp(method, "GET") == 0) {
+
+            char cache_key[640];
+            make_cache_key(rbuf, (size_t)n, url, cache_key, sizeof(cache_key));
+            struct cached_response cached;
+            if (cache_fetch_copy(w->cache, cache_key, strlen(cache_key), &cached) == 0) {
+                /* Check If-None-Match for conditional GET */
+                char req_etag[64] = {0};
+                const uint8_t *inm = (const uint8_t *)memmem(rbuf, (size_t)n,
+                                                               "\r\nIf-None-Match:", 16);
+                if (!inm)
+                    inm = (const uint8_t *)memmem(rbuf, (size_t)n,
+                                                   "\r\nif-none-match:", 16);
+                if (inm) {
+                    const uint8_t *vs = inm + 16;
+                    while (vs < rbuf + n && (*vs == ' ' || *vs == '\t')) vs++;
+                    if (*vs == '"') vs++;
+                    const uint8_t *ve = vs;
+                    while (ve < rbuf + n && *ve != '"' && *ve != '\r') ve++;
+                    size_t el = (size_t)(ve - vs);
+                    if (el < sizeof(req_etag)) memcpy(req_etag, vs, el);
+                }
+
+                char etag_str[20];
+                snprintf(etag_str, sizeof(etag_str), "%016llx",
+                         (unsigned long long)cached.body_etag);
+
+                if (req_etag[0] && strcmp(req_etag, etag_str) == 0) {
+                    /* ETag matches → 304 Not Modified */
+                    char r304[128];
+                    int r304_len = snprintf(r304, sizeof(r304),
+                        "HTTP/1.1 304 Not Modified\r\n"
+                        "ETag: \"%s\"\r\n"
+                        "Connection: keep-alive\r\n\r\n", etag_str);
+                    uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+                    memcpy(sbuf, r304, (size_t)r304_len);
+                    struct io_uring_sqe *sqe  = io_uring_get_sqe(&w->uring.ring);
+                    struct io_uring_sqe *sqer = io_uring_get_sqe(&w->uring.ring);
+                    if (sqe && sqer) {
+                        h->send_buf_off = 0;
+                        h->send_buf_len = (uint32_t)r304_len;
+                        h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                        PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                            sbuf, (size_t)r304_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+                        sqe->flags |= IOSQE_IO_LINK;
+                        /* Pre-arm RECV_CLIENT — kernel queues it right after send */
+                        PREP_RECV(w, sqer, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+                        sqer->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+                        uring_submit(&w->uring);
+                        cache_cached_response_free(&cached);
+                        log_debug("cache_304", "conn=%u url=%s", cid, url);
+                        return;
+                    }
+                }
+
+                /* Full cache HIT — serve stored response + inject ETag / X-Cache */
+                /* Extra headers to splice before the final \r\n\r\n */
+                char extra[128];
+                int extra_len = snprintf(extra, sizeof(extra),
+                    "ETag: \"%s\"\r\nX-Cache: HIT\r\n", etag_str);
+
+                uint32_t stored_total = cached.header_len + cached.body_len;
+                size_t serve_len = stored_total + (size_t)extra_len;
+                uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+
+                if (serve_len <= w->pool.buf_size && cached.header_len >= 4) {
+                    /* Copy headers minus the blank-line terminator (\r\n).
+                     * The last header's own \r\n stays so extra headers
+                     * splice in cleanly without merging onto the same line. */
+                    size_t hdr_body = cached.header_len - 2;
+                    memcpy(sbuf, cached.data, hdr_body);
+                    memcpy(sbuf + hdr_body, extra, (size_t)extra_len);
+                    memcpy(sbuf + hdr_body + extra_len, "\r\n", 2);
+                    memcpy(sbuf + cached.header_len + extra_len,
+                           cached.data + cached.header_len, cached.body_len);
+
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+                    if (sqe) {
+                        h->send_buf_off = 0;
+                        h->send_buf_len = (uint32_t)serve_len;
+                        h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                        PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                            sbuf, serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+                        uring_submit(&w->uring);
+                        cache_cached_response_free(&cached);
+                        log_debug("cache_hit", "conn=%u url=%s", cid, url);
+                        return;
+                    }
+                }
+                cache_cached_response_free(&cached);
+                /* Fall through to backend if response too large or no sqe */
+            }
+        }
+    }
+
+    /* Rewrite backend request headers. All injections go right after the
+     * request line so they appear before any client-supplied headers.
+     * We build the inject block in one shot to minimise memmoves. */
+    const struct route_config *rc_fwd = &w->cfg->routes[h->route_idx];
+    int fwd_n = n;
+    {
+        uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        bool is_ws = (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) != 0;
+
+        /* ---- Rewrite Accept-Encoding for backend leg ----
+         * The client→proxy leg is WAN; the proxy→backend leg is LAN where
+         * bandwidth is cheap and body inspection/caching requires plain text.
+         * Rewrite to "identity" so the backend sends uncompressed responses. */
+        bool ae_present = false;
+        {
+            uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
+            if (!ae)
+                ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
+            if (ae) {
+                ae_present = true;
+                /* Replace the header value in-place with "identity" */
+                uint8_t *vs = ae + 18;
+                while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
+                uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
+                if (ve && ve > vs) {
+                    const char *id = "identity";
+                    size_t id_len  = 8;
+                    int delta = (int)id_len - (int)(ve - vs);
+                    if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
+                        memmove(vs + id_len, ve, (size_t)(rbuf + fwd_n - ve));
+                        memcpy(vs, id, id_len);
+                        fwd_n += delta;
+                    }
+                }
+            }
+            /* When absent: injected in the inject block below */
+        }
+
+        /* ---- Strip Authorization header ----
+         * The proxy consumed it for its own auth check; never forward
+         * our proxy credentials to the backend. */
+        {
+            uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
+            if (!ah)
+                ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
+            if (ah) {
+                uint8_t *line_end = (uint8_t *)FIND_CRLF(ah + 2,
+                    (size_t)(rbuf + fwd_n - ah - 2));
+                if (line_end) {
+                    line_end += 2; /* include the \r\n */
+                    size_t remove = (size_t)(line_end - ah - 2); /* bytes between \r\n's */
+                    /* We want to remove "\r\nAuthorization: ...\r\n" → replace with "\r\n" */
+                    /* i.e., shift everything after the line's \r\n back by (remove) bytes */
+                    memmove(ah + 2, ah + 2 + remove,
+                        (size_t)(rbuf + fwd_n - (ah + 2 + remove)));
+                    fwd_n -= (int)remove;
+                }
+            }
+        }
+
+        /* ---- Connection header ----
+         * For WebSocket: pass through as-is (must stay "Upgrade").
+         * For pooled backends (pool_size > 0): use keep-alive so we can
+         * reuse the connection.  For all others: force "close" so the
+         * backend signals response completion with EOF. */
+        if (!is_ws) {
+            bool backend_tls = backend_uses_tls(w, cid);
+            bool use_ka = !backend_tls && ((h->flags & CONN_FLAG_BACKEND_POOLED) != 0
+                          || (w->cfg->routes[h->route_idx]
+                                 .backends[h->backend_idx].pool_size > 0));
+            const char *conn_val = use_ka ? "keep-alive" : "close";
+            size_t      conn_val_len = use_ka ? 10 : 5;
+
+            uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
+            if (!ch)
+                ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
+            if (ch) {
+                uint8_t *vs = ch + 13;
+                while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
+                uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
+                if (ve && ve > vs) {
+                    size_t old_len = (size_t)(ve - vs);
+                    int delta = (int)conn_val_len - (int)old_len;
+                    if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
+                        memmove(vs + conn_val_len, ve, (size_t)(rbuf + fwd_n - ve));
+                        memcpy(vs, conn_val, conn_val_len);
+                        fwd_n += delta;
+                    }
+                }
+            } else {
+                /* No Connection header — inject one */
+                const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
+                if (eol0) {
+                    size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
+                    char inj0[32];
+                    int il0 = snprintf(inj0, sizeof(inj0),
+                        "Connection: %s\r\n", conn_val);
+                    if (fwd_n + il0 <= (int)w->pool.buf_size) {
+                        memmove(rbuf + le + il0, rbuf + le, (size_t)fwd_n - le);
+                        memcpy(rbuf + le, inj0, (size_t)il0);
+                        fwd_n += il0;
+                    }
+                }
+            }
+
+            /* Reset per-response body tracking for this request */
+            if (use_ka) {
+                struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+                cold->backend_content_length = 0;
+                cold->backend_body_recv      = 0;
+            }
+        }
+
+        /* ---- Inject proxy headers after request line ----
+         * X-Forwarded-Proto, X-Forwarded-For, X-Real-IP, X-Api-Key */
+        const char *eol = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
+        if (eol) {
+            size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
+
+            /* Build inject block */
+            char inj[640];
+            int inj_len = 0;
+
+            /* NOTE: intentionally do NOT inject X-Forwarded-Proto: https.
+             * ASP.NET Core / Kestrel disables ResponseCompression when it
+             * sees X-Forwarded-Proto: https (BREACH/CRIME mitigation).
+             * We terminate TLS at the proxy; the backend speaks plain HTTP.
+             * Sonarr's SPA uses relative URLs so the scheme doesn't matter
+             * for link generation. */
+
+            /* X-Real-IP / X-Forwarded-For from stored client address */
+            {
+                char ipstr[64] = {0};
+                struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+                const struct sockaddr *sa = (const struct sockaddr *)&cold->client_addr;
+                if (sa->sa_family == AF_INET)
+                    inet_ntop(AF_INET,
+                        &((const struct sockaddr_in *)sa)->sin_addr,
+                        ipstr, sizeof(ipstr));
+                else if (sa->sa_family == AF_INET6)
+                    inet_ntop(AF_INET6,
+                        &((const struct sockaddr_in6 *)sa)->sin6_addr,
+                        ipstr, sizeof(ipstr));
+                if (ipstr[0]) {
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "X-Real-IP: %s\r\nX-Forwarded-For: %s\r\n", ipstr, ipstr);
+                }
+            }
+
+            /* Accept-Encoding: identity — only when not already rewritten above */
+            if (!ae_present)
+                inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                    "Accept-Encoding: identity\r\n");
+
+            /* X-Api-Key if configured */
+            if (rc_fwd->x_api_key[0])
+                inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                    "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
+
+            /* Backend Basic Auth credentials if configured — inject after
+             * the proxy-level Authorization header has been stripped. */
+            if (rc_fwd->backend_credentials[0]) {
+                char b64[512];
+                b64_encode(rc_fwd->backend_credentials,
+                           strlen(rc_fwd->backend_credentials), b64, sizeof(b64));
+                inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                    "Authorization: Basic %s\r\n", b64);
+            }
+
+            if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
+                memmove(rbuf + line_end + inj_len,
+                        rbuf + line_end, (size_t)fwd_n - line_end);
+                memcpy(rbuf + line_end, inj, (size_t)inj_len);
+                fwd_n += inj_len;
+            }
+        }
+    }
+
+    /* Forward client data to backend */
+    if (backend_uses_tls(w, cid)) {
+        if (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) {
+            send_bad_gateway_and_close(w, cid);
+            return;
+        }
+        if (backend_tls_send_all(w, cid, conn_recv_buf(&w->pool, cid), (size_t)fwd_n) < 0) {
+            send_bad_gateway_and_close(w, cid);
+            return;
+        }
+        backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+        {
+            int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+            if (rn < 0) {
+                send_bad_gateway_and_close(w, cid);
+                return;
+            }
+            handle_backend_read_result(w, cid, rn);
+        }
+        return;
+    }
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe) { conn_close(w, cid, true); return; }
+    PREP_SEND(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+        conn_recv_buf(&w->pool, cid), fwd_n, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
+    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_send_backend(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int n = cqe->res;
+    log_debug("send_backend", "conn=%u n=%d", cid, n);
+    if (n < 0) { conn_close(w, cid, true); return; }
+    /* All client data forwarded — arm deadline then wait for backend response */
+    backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+    if (backend_uses_tls(w, cid)) {
+        int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+        if (rn < 0) {
+            send_bad_gateway_and_close(w, cid);
+            return;
+        }
+        handle_backend_read_result(w, cid, rn);
+        return;
+    }
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe) { conn_close(w, cid, true); return; }
+    PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+        conn_send_buf(&w->pool, cid), h->recv_window, 0, SEND_IDX_SEND(w, cid));
+    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_recv_backend(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    (void)h;
+    handle_backend_read_result(w, cid, cqe->res);
+}
+
+static void handle_send_client(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int sent = cqe->res;
+    log_debug("send_client", "conn=%u sent=%d", cid, sent);
+    if (sent < 0) { conn_close(w, cid, true); return; }
+    h->send_buf_off += (uint32_t)sent;
+
+    if (h->send_buf_off < h->send_buf_len) {
+        /* Partial send (kTLS record boundary) — flush remaining bytes */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_send_buf(&w->pool, cid) + h->send_buf_off,
+            h->send_buf_len - h->send_buf_off, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+        uring_submit(&w->uring);
+        return;
+    }
+
+    /* Full chunk sent */
+    h->send_buf_off = 0;
+    h->send_buf_len = 0;
+
+    /* Check if a poolable backend response is now complete.
+     * When it is, keep the fd installed in the fixed slot (sticky backend):
+     * the same client connection will reuse it for its next request with
+     * zero pool operations.  We only release the fd to the global pool when
+     * the client connection itself closes (see conn_close). */
+    if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+        int ri = h->route_idx, bi = h->backend_idx;
+        int ps = (h->flags & CONN_FLAG_BACKEND_TLS) ? 0
+                 : w->cfg->routes[ri].backends[bi].pool_size;
+        if (ps > 0) {
+            struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+            if (cold->backend_content_length > 0 &&
+                cold->backend_body_recv >= cold->backend_content_length) {
+                /* Full response forwarded — mark backend idle, keep fd pinned */
+                h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_BACKEND_POOLED);
+                cold->backend_content_length = 0;
+                cold->backend_body_recv      = 0;
+                log_debug("backend_sticky", "conn=%u route=%d backend=%d fd=%d",
+                    cid, ri, bi, h->backend_fd);
+            }
+        }
+    }
+
+    if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+        if (backend_uses_tls(w, cid)) {
+            int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+            if (rn < 0) {
+                send_bad_gateway_and_close(w, cid);
+                return;
+            }
+            handle_backend_read_result(w, cid, rn);
+            return;
+        }
+        /* Zero-copy splice: only safe for non-compressible types (images, video,
+         * already-compressed media), and only without kTLS TX.  Splicing into a
+         * kTLS-TX socket causes ERR_CONTENT_LENGTH_MISMATCH on kernel 6.8–6.12
+         * (kTLS mis-accounts spliced bytes against the Content-Length already sent).
+         * Compressible types also skip splice — compression of the first chunk
+         * changes the payload length, but splice delivers subsequent chunks raw. */
+        if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
+            !(h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) &&
+            !h->ct_compressible &&
+            !(h->flags & CONN_FLAG_KTLS_TX)) {
+            begin_splice(w, cid, h);
+            return;
+        }
+        /* Still reading backend response — get next chunk */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+            conn_send_buf(&w->pool, cid), h->recv_window, 0, SEND_IDX_SEND(w, cid));
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+        uring_submit(&w->uring);
+    } else {
+        /* Response complete (cache hit, single chunk, or pool return) — next request */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        uring_submit(&w->uring);
+    }
+}
+
+static void handle_send_client_linked(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    /* SEND completed; RECV_CLIENT was pre-armed as a linked SQE.
+     * On success the kernel has already queued the recv — nothing more to do.
+     * On partial send the client won't pipeline the next request until it
+     * receives the full response, so the pre-armed recv is still safe; just
+     * flush the remaining bytes via a regular (non-linked) SEND_CLIENT. */
+    int sent = cqe->res;
+    log_debug("send_client_linked", "conn=%u sent=%d", cid, sent);
+    if (sent < 0) {
+        /* Send error — linked recv will arrive with -ECANCELED; conn_close
+         * is idempotent so the RECV_CLIENT handler can call it again safely. */
+        conn_close(w, cid, true);
+        return;
+    }
+    h->send_buf_off += (uint32_t)sent;
+    if (h->send_buf_off < h->send_buf_len) {
+        /* Partial send — flush remainder; pre-armed recv is still in flight */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_send_buf(&w->pool, cid) + h->send_buf_off,
+            h->send_buf_len - h->send_buf_off, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+        uring_submit(&w->uring);
+    }
+    /* Full send: recv already queued by kernel — nothing else to submit */
+    h->send_buf_off = 0;
+    h->send_buf_len = 0;
+}
+
+static void handle_splice_backend(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    /* Kernel spliced n bytes from backend_fd into splice_pipe[1] */
+    int n = cqe->res;
+    log_debug("splice_backend", "conn=%u n=%d", cid, n);
+    if (n < 0) { conn_close(w, cid, true); return; }
+    if (n == 0) {
+        /* Backend EOF — done streaming */
+        h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_SPLICE_MODE);
+        if (h->backend_fd >= 0) {
+            uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
+            close(h->backend_fd); h->backend_fd = -1;
+        }
+        h->flags &= ~CONN_FLAG_BACKEND_POOLED;
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, false); return; }
+        PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        uring_submit(&w->uring);
+        return;
+    }
+    /* Bytes are in the pipe — splice pipe[0] → client_fd */
+    h->bytes_out += (uint32_t)n;
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe) { conn_close(w, cid, true); return; }
+    io_uring_prep_splice(sqe, cold->splice_pipe[0], -1,
+                         h->client_fd, -1,
+                         (unsigned int)n, SPLICE_F_MOVE);
+    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_CLIENT, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_splice_client(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    /* Kernel spliced bytes from pipe → client_fd */
+    int sent = cqe->res;
+    log_debug("splice_client", "conn=%u sent=%d", cid, sent);
+    if (sent < 0) { conn_close(w, cid, true); return; }
+    /* Loop: splice next chunk from backend into pipe */
+    if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+        struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        io_uring_prep_splice(sqe, h->backend_fd, -1,
+                             cold->splice_pipe[1], -1,
+                             (unsigned int)(1u << 20), SPLICE_F_MOVE);
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_BACKEND, cid);
+        uring_submit(&w->uring);
+    } else {
+        /* Streaming flag cleared elsewhere (shouldn't normally reach here) */
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, false); return; }
+        PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        uring_submit(&w->uring);
+    }
+}
+
+static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    /* Async backend connect completed */
+    const struct backend_config *bcfg = &w->cfg->routes[h->route_idx].backends[h->backend_idx];
+    h->flags &= ~CONN_FLAG_BACKEND_CONNECTING;
+    {
+        int _ri = h->route_idx, _bi = h->backend_idx;
+        struct timespec _cb_ts;
+        clock_gettime(CLOCK_MONOTONIC_COARSE, &_cb_ts);
+        uint64_t _now = (uint64_t)_cb_ts.tv_sec * 1000000000ULL + _cb_ts.tv_nsec;
+        if (cqe->res < 0) {
+            cb_record_failure(w, _ri, _bi, _now,
+                w->cfg->routes[_ri].health.fail_threshold,
+                w->cfg->routes[_ri].health.open_ms);
+        } else {
+            cb_record_success(w, _ri, _bi);
+        }
+    }
+    if (cqe->res < 0) {
+        log_warn("connect_cqe", "conn=%u backend connect failed: %s",
+            cid, strerror(-cqe->res));
         const char *r502 =
             "HTTP/1.1 502 Bad Gateway\r\n"
             "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-        send(res->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-        close(res->client_fd);
-        conn_free(&w->pool, hcid);
+        send(h->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
+        conn_close(w, cid, false);
         return;
     }
-    th->state = CONN_STATE_PROXYING;
-    th->last_active_tsc = rdtsc();
-    w->accepted++;
-    struct io_uring_sqe *ts1 = io_uring_get_sqe(&w->uring.ring);
-    if (!ts1) { conn_close(w, hcid, true); return; }
-    PREP_RECV(w, ts1, res->client_fd, FIXED_FD_CLIENT(w, hcid),
-        conn_recv_buf(&w->pool, hcid), th->recv_window, 0, hcid);
-    ts1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, hcid);
+    log_debug("connect_cqe", "conn=%u backend_fd=%d connected", cid, h->backend_fd);
+    if (bcfg->tls) {
+        if (backend_tls_handshake(w, bcfg, cid) != 0) {
+            log_warn("connect_cqe", "conn=%u backend TLS handshake failed", cid);
+            send_bad_gateway_and_close(w, cid);
+            return;
+        }
+    }
+
+    h->state = CONN_STATE_PROXYING;
+
+    if (h->send_buf_len > 0) {
+        /* Reconnect case: request already buffered in recv_buf.
+         * Strip the Authorization header (security) then forward. */
+        uint32_t saved_n = h->send_buf_len;
+        h->send_buf_len = 0;
+        uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        int fwd_n = (int)saved_n;
+
+        /* Strip Authorization so proxy credentials don't reach backend */
+        uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
+        if (!ah)
+            ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
+        if (ah) {
+            uint8_t *le = (uint8_t *)FIND_CRLF(ah + 2,
+                (size_t)(rbuf + fwd_n - ah - 2));
+            if (le) {
+                le += 2;
+                size_t rm = (size_t)(le - ah - 2);
+                memmove(ah + 2, ah + 2 + rm,
+                    (size_t)(rbuf + fwd_n - (ah + 2 + rm)));
+                fwd_n -= (int)rm;
+            }
+        }
+
+        /* Rewrite Connection: keep-alive → close so the backend signals
+         * response completion with EOF, allowing RECV_CLIENT to re-arm. */
+        {
+            uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
+            if (!ch)
+                ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
+            if (ch) {
+                uint8_t *vs = ch + 13;
+                while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
+                uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
+                    (size_t)(rbuf + fwd_n - vs));
+                if (ve && ve > vs) {
+                    size_t old_len = (size_t)(ve - vs);
+                    int delta = 5 - (int)old_len; /* "close" = 5 bytes */
+                    if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
+                        memmove(vs + 5, ve, (size_t)(rbuf + fwd_n - ve));
+                        memcpy(vs, "close", 5);
+                        fwd_n += delta;
+                    }
+                }
+            } else {
+                /* No Connection header — inject one after the request line */
+                const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
+                if (eol0 && fwd_n + 19 <= (int)w->pool.buf_size) {
+                    size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
+                    memmove(rbuf + le + 19, rbuf + le, (size_t)fwd_n - le);
+                    memcpy(rbuf + le, "Connection: close\r\n", 19);
+                    fwd_n += 19;
+                }
+            }
+        }
+        if (backend_uses_tls(w, cid)) {
+            if (backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n) < 0) {
+                send_bad_gateway_and_close(w, cid);
+                return;
+            }
+            backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+            {
+                int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+                if (rn < 0) {
+                    send_bad_gateway_and_close(w, cid);
+                    return;
+                }
+                handle_backend_read_result(w, cid, rn);
+            }
+            return;
+        }
+
+        struct io_uring_sqe *sqe_s = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe_s) { conn_close(w, cid, true); return; }
+        PREP_SEND(w, sqe_s, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+            rbuf, (size_t)fwd_n, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
+        sqe_s->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
+    } else {
+        /* Initial connect: arm RECV_CLIENT to get the first request */
+        struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe_c) { conn_close(w, cid, true); return; }
+        PREP_RECV(w, sqe_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+        sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+    }
     uring_submit(&w->uring);
+}
+
+static void handle_recv_client_ws(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int n = cqe->res;
+    if (n <= 0) { conn_close(w, cid, false); return; }
+    h->recv_buf_off = 0;
+    h->recv_buf_len = (uint32_t)n;
+    struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe_ws_c) { conn_close(w, cid, false); return; }
+    PREP_SEND(w, sqe_ws_c, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+        conn_recv_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
+    sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND_WS, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_send_backend_ws(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int sent = cqe->res;
+    if (sent <= 0) { conn_close(w, cid, false); return; }
+    h->recv_buf_off += (uint32_t)sent;
+    if (h->recv_buf_off < h->recv_buf_len) {
+        struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe_ws_c) { conn_close(w, cid, false); return; }
+        PREP_SEND(w, sqe_ws_c, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+            conn_recv_buf(&w->pool, cid) + h->recv_buf_off,
+            (size_t)(h->recv_buf_len - h->recv_buf_off),
+            MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
+        sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND_WS, cid);
+        uring_submit(&w->uring);
+        return;
+    }
+    h->recv_buf_off = 0;
+    h->recv_buf_len = 0;
+    struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe_ws_c) { conn_close(w, cid, false); return; }
+    PREP_RECV(w, sqe_ws_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
+        conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_RECV(w, cid));
+    sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT_WS, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_recv_backend_ws(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int n = cqe->res;
+    if (n <= 0) { conn_close(w, cid, false); return; }
+    h->send_buf_off = 0;
+    h->send_buf_len = (uint32_t)n;
+    struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe_ws_b) { conn_close(w, cid, false); return; }
+    PREP_SEND(w, sqe_ws_b, h->client_fd, FIXED_FD_CLIENT(w, cid),
+        conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+    sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_WS, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_send_client_ws(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    int sent = cqe->res;
+    if (sent <= 0) { conn_close(w, cid, false); return; }
+    h->send_buf_off += (uint32_t)sent;
+    if (h->send_buf_off < h->send_buf_len) {
+        struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe_ws_b) { conn_close(w, cid, false); return; }
+        PREP_SEND(w, sqe_ws_b, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_send_buf(&w->pool, cid) + h->send_buf_off,
+            (size_t)(h->send_buf_len - h->send_buf_off),
+            MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+        sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_WS, cid);
+        uring_submit(&w->uring);
+        return;
+    }
+    h->send_buf_off = 0;
+    h->send_buf_len = 0;
+    struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe_ws_b) { conn_close(w, cid, false); return; }
+    PREP_RECV(w, sqe_ws_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+        conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+    sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
+    uring_submit(&w->uring);
+}
+
+static void handle_send_client_zc(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    /*
+     * Two CQEs per send_zc_fixed operation:
+     *
+     * 1. Completion CQE (IORING_CQE_F_MORE set, IORING_CQE_F_NOTIF clear):
+     *    res = bytes transferred. Process partial sends here.
+     *    Buffer is still pinned — do NOT arm next recv yet.
+     *
+     * 2. Notification CQE (IORING_CQE_F_NOTIF set):
+     *    res = 0. Kernel has released the buffer. Safe to arm next recv.
+     *
+     * zc_notif_count tracks outstanding notifications so we handle partial
+     * sends (multiple in-flight ZC ops) and stale NOTIFs on reused slots.
+     */
+    if (cqe->flags & IORING_CQE_F_NOTIF) {
+        /* Buffer released — decrement counter and arm next recv if all done */
+        if (h->zc_notif_count > 0) h->zc_notif_count--;
+        if (h->zc_notif_count == 0) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) { conn_close(w, cid, true); return; }
+            if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
+                /* More backend data expected — re-arm backend recv */
+                PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+                    conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
+            } else {
+                /* Response complete — arm next client request (keep-alive) */
+                PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            }
+            uring_submit(&w->uring);
+        }
+        return;
+    }
+
+    /* Completion CQE */
+    int zc_sent = cqe->res;
+    if (zc_sent <= 0) { conn_close(w, cid, true); return; }
+    h->bytes_out += (uint32_t)zc_sent;
+    /* Note: do NOT arm next recv here — wait for the NOTIF CQE */
+}
+
+#ifdef VORTEX_H2
+static void handle_h2_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    (void)h;
+
+    /* Multishot: IORING_CQE_F_MORE means the recv SQE is still armed.
+     * When not set (ring empty, fd closed, etc.) we must re-arm. */
+    bool ms_active = (cqe->flags & IORING_CQE_F_MORE) != 0;
+    const uint8_t *data;
+    uint16_t buf_id = 0;
+    if (w->uring.recv_ring && (cqe->flags & IORING_CQE_F_BUFFER)) {
+        buf_id = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+        data   = uring_recv_ring_buf(&w->uring, buf_id, w->pool.buf_size);
+    } else {
+        data = conn_recv_buf(&w->pool, cid);
+    }
+    h2_on_recv(w, cid, cqe->res, data, buf_id, ms_active);
+}
+
+static void handle_h2_send_client(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
+{
+    (void)h;
+    h2_on_send_client(w, cid, cqe->res);
 }
 #endif
 
@@ -759,239 +1929,20 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
 
     /* Accept completions have cid=0 — special handling */
     if (op == VORTEX_OP_ACCEPT) {
-        int client_fd = cqe->res;
-        log_debug("accept_cqe", "worker=%d res=%d flags=0x%x",
-            w->worker_id, cqe->res, cqe->flags);
-        if (client_fd < 0) {
-            /* Multishot accept will continue unless !IORING_CQE_F_MORE */
-            return;
-        }
-
-        int one = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        /* Correct-SNI connections: explicitly remove any window clamp so the OS
-         * can grow the receive window progressively to its configured maximum. */
-        int zero_clamp = 0;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_WINDOW_CLAMP, &zero_clamp, sizeof(zero_clamp));
-        /* Don't queue more unsent data than one buffer — prevents slow clients
-         * from accumulating a backlog of 16KB chunks in the kernel send buffer. */
-        int lowat = WORKER_BUF_SIZE;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
-
-        uint32_t new_cid = conn_alloc(&w->pool);
-        if (new_cid != CONN_INVALID) {
-            /* Record client address for X-Forwarded-For */
-            struct conn_cold *cold = conn_cold_ptr(&w->pool, new_cid);
-            socklen_t salen = sizeof(cold->client_addr);
-            getpeername(client_fd, (struct sockaddr *)&cold->client_addr, &salen);
-        }
-        if (new_cid == CONN_INVALID) {
-            w->pool_exhausted++;
-            log_warn("accept", "pool exhausted - dropping connection (total=%llu)",
-                     (unsigned long long)w->pool_exhausted);
-            close(client_fd);
-            return;
-        }
-
-        struct conn_hot *nh = conn_hot(&w->pool, new_cid);
-        nh->client_fd = client_fd;
-        nh->recv_window = WORKER_BUF_INIT;
-        uring_install_fd(&w->uring, (unsigned)FIXED_FD_CLIENT(w, new_cid), client_fd);
-
-        int tls_route_idx = 0;
-#ifdef VORTEX_PHASE_TLS
-        /* TLS handshake — blocking but bounded by select timeout in tls_accept */
-        if (w->tls && w->tls->route_count > 0) {
-            /* Peek at SNI before the handshake — tarpit unrecognised clients immediately */
-            char peek_sni_buf[256] = {0};
-            if (peek_client_hello_sni(client_fd, peek_sni_buf, sizeof(peek_sni_buf))) {
-                int matched = 0;
-                for (int ri = 0; ri < w->cfg->route_count; ri++) {
-                    if (strcasecmp(peek_sni_buf, w->cfg->routes[ri].hostname) == 0) {
-                        matched = 1;
-                        break;
-                    }
-                }
-                if (!matched) {
-                    log_info("tarpit", "fd=%d sni=%s total=%llu",
-                        client_fd, peek_sni_buf,
-                        (unsigned long long)(w->tarpit_total + 1));
-                    tarpit_conn(w, client_fd);
-                    conn_free(&w->pool, new_cid);
-                    return;
-                }
-            }
-
-            /* Offload blocking SSL_accept to the TLS handshake pool.
-             * The worker returns immediately; when the pool thread finishes it
-             * writes a tls_handshake_result to tls_done_pipe_wr which wakes the
-             * io_uring VORTEX_OP_TLS_DONE handler below. */
-            if (w->tls_done_pipe_wr >= 0) {
-                struct tls_handshake_job job = {
-                    .client_fd      = client_fd,
-                    .cid            = new_cid,
-                    .tls            = w->tls,
-                    .result_pipe_wr = w->tls_done_pipe_wr,
-                };
-                if (!tls_pool_submit(job)) {
-                    /* Queue full — drop the connection */
-                    close(client_fd);
-                    conn_free(&w->pool, new_cid);
-                }
-                /* Return: VORTEX_OP_TLS_DONE will continue this connection */
-                return;
-            }
-            /* Fallback (no pipe): blocking path — should not normally happen */
-            char sni_fb[256] = {0};
-            SSL *ssl_fb = tls_accept(w->tls, client_fd, &tls_route_idx, sni_fb, sizeof(sni_fb));
-            if (!ssl_fb) { close(client_fd); conn_free(&w->pool, new_cid); return; }
-            if (SSL_version(ssl_fb) == TLS1_3_VERSION) w->tls13_count++; else w->tls12_count++;
-            if (tls_ktls_tx_active(ssl_fb) && tls_ktls_rx_active(ssl_fb)) {
-                nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
-                tls_ssl_free(ssl_fb); nh->ssl = NULL; w->ktls_count++;
-            } else { nh->ssl = ssl_fb; }
-            int fl = fcntl(client_fd, F_GETFL);
-            fcntl(client_fd, F_SETFL, fl & ~O_NONBLOCK);
-        }
-#endif
-
-        /* Route selection: TLS SNI route takes priority */
-        int route_idx = tls_route_idx;
-        if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
-            int backend_idx = select_available_backend(w, route_idx, 0);
-            if (backend_idx < 0) {
-                /* All backends have open circuits — fast-reject with 503 */
-                static const char r503[] =
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
-                    "Service Unavailable";
-                send(client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
-                close(client_fd);
-                conn_free(&w->pool, new_cid);
-                return;
-            }
-            const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
-            nh->route_idx   = (uint16_t)route_idx;
-            nh->backend_idx = (uint16_t)backend_idx;
-
-            if (addr) {
-                /* Try idle pool first */
-                const struct backend_config *bcfg =
-                    &w->cfg->routes[route_idx].backends[backend_idx];
-                int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
-                int pooled_fd = (cfg_pool > 0)
-                                ? global_pool_get(route_idx, backend_idx) : -1;
-                if (pooled_fd >= 0) {
-                    nh->backend_fd = pooled_fd;
-                    nh->flags |= CONN_FLAG_BACKEND_POOLED;
-                    uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, new_cid), pooled_fd);
-                    log_debug("accept_pool", "conn=%u reused backend fd=%d",
-                        (unsigned)new_cid, pooled_fd);
-                } else {
-                    /* Async connect — CONNECT completion arms RECV_CLIENT */
-                    nh->backend_fd = begin_async_connect(w, bcfg, new_cid);
-                    if (nh->backend_fd >= 0)
-                        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, new_cid), nh->backend_fd);
-                    if (nh->backend_fd < 0) {
-                        const char *r502 =
-                            "HTTP/1.1 502 Bad Gateway\r\n"
-                            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-                        send(client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-                        close(client_fd);
-                        conn_free(&w->pool, new_cid);
-                        return;
-                    }
-                    nh->flags |= CONN_FLAG_BACKEND_CONNECTING;
-                    nh->state = CONN_STATE_BACKEND_CONNECT;
-                    nh->last_active_tsc = rdtsc();
-                    w->accepted++;
-                    /* RECV_CLIENT will be armed by VORTEX_OP_CONNECT handler */
-                    return;
-                }
-            }
-        }
-
-        if (nh->backend_fd < 0) {
-            const char *r502 =
-                "HTTP/1.1 502 Bad Gateway\r\n"
-                "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-            send(client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-            close(client_fd);
-            conn_free(&w->pool, new_cid);
-            return;
-        }
-
-        nh->state = CONN_STATE_PROXYING;
-        nh->last_active_tsc = rdtsc();
-        w->accepted++;
-
-        /* Backend came from pool — arm RECV_CLIENT immediately */
-        struct io_uring_sqe *s1 = io_uring_get_sqe(&w->uring.ring);
-        if (!s1) { conn_close(w, new_cid, true); return; }
-        PREP_RECV(w, s1, client_fd, FIXED_FD_CLIENT(w, new_cid),
-            conn_recv_buf(&w->pool, new_cid), nh->recv_window, 0, new_cid);
-        s1->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, new_cid);
-        log_debug("accept_arm", "conn=%u client_fd=%d backend_fd=%d (pooled)",
-            (unsigned)new_cid, client_fd, nh->backend_fd);
-        uring_submit(&w->uring);
+        handle_accept(w, cqe);
         return;
     }
 
 #ifdef VORTEX_PHASE_TLS
     if (op == VORTEX_OP_TLS_DONE) {
-        /* Re-arm pipe read for the next result before processing this one */
-        struct io_uring_sqe *rpsqe = io_uring_get_sqe(&w->uring.ring);
-        if (rpsqe) {
-            io_uring_prep_read(rpsqe, w->tls_done_pipe_rd,
-                               w->tls_pipe_buf, sizeof(w->tls_pipe_buf), 0);
-            rpsqe->user_data = URING_UD_ENCODE(VORTEX_OP_TLS_DONE, 0);
-        }
-        uring_submit(&w->uring);
-
-        if (cqe->res != (int)sizeof(struct tls_handshake_result)) {
-            /* Partial or error read — nothing we can do, pipe stays armed */
-            return;
-        }
-
-        struct tls_handshake_result res;
-        memcpy(&res, w->tls_pipe_buf, sizeof(res));
-        process_tls_result(w, &res);
-
-        /* Drain any additional results queued in the pipe */
-        for (;;) {
-            struct tls_handshake_result extra;
-            ssize_t nr = read(w->tls_done_pipe_rd, &extra, sizeof(extra));
-            if (nr != (ssize_t)sizeof(extra)) break;
-            process_tls_result(w, &extra);
-        }
+        handle_tls_done(w, cqe);
         return;
     }
 #endif
 
 #ifdef VORTEX_H2
-    /* H2 backend ops encode (slot << 12) | cid in the lower 32 bits —
-     * extract the real cid with URING_UD_H2_CID before the pool capacity check. */
-    if (op == VORTEX_OP_H2_CONNECT        || op == VORTEX_OP_H2_SEND_BACKEND ||
-        op == VORTEX_OP_H2_RECV_BACKEND   ||
-        op == VORTEX_OP_H2_GRPC_SEND_BACKEND ||
-        op == VORTEX_OP_H2_GRPC_RECV_BACKEND) {
-        uint32_t h2_cid  = URING_UD_H2_CID(cqe->user_data);
-        uint32_t h2_slot = URING_UD_H2_SLOT(cqe->user_data);
-        if (h2_cid >= w->pool.capacity) return;
-        struct conn_hot *hh = conn_hot(&w->pool, h2_cid);
-        if (hh->state == CONN_STATE_FREE) return;
-        if (op == VORTEX_OP_H2_CONNECT)
-            h2_on_backend_connect(w, h2_cid, h2_slot, cqe->res);
-        else if (op == VORTEX_OP_H2_SEND_BACKEND)
-            h2_on_backend_send(w, h2_cid, h2_slot, cqe->res);
-        else if (op == VORTEX_OP_H2_RECV_BACKEND)
-            h2_on_backend_recv(w, h2_cid, h2_slot, cqe->res);
-        else if (op == VORTEX_OP_H2_GRPC_SEND_BACKEND)
-            h2_on_grpc_backend_send(w, h2_cid, h2_slot, cqe->res);
-        else
-            h2_on_grpc_backend_recv(w, h2_cid, h2_slot, cqe->res);
+    if (handle_h2_backend_ops(w, cqe, op))
         return;
-    }
 #endif
 
     /* For all other ops, validate cid */
@@ -1000,1048 +1951,59 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
     if (h->state == CONN_STATE_FREE) return;
 
     if (cqe->res < 0 && op != VORTEX_OP_CONNECT) {
-        /* EIO on kTLS = TLS close_notify or alert — treat as normal close */
-        bool is_error = true;
-        if (cqe->res == -ECONNRESET || cqe->res == -EPIPE ||
-            cqe->res == -EBADF     || cqe->res == -ECANCELED ||
-            cqe->res == -EIO       || cqe->res == -ENOBUFS) {
-            if (cqe->res == -ENOBUFS)
-                log_warn("recv_ring",
-                    "conn=%u op=%u recv buf ring exhausted — closing connection",
-                    cid, op);
-            is_error = false; /* expected close conditions */
-        } else {
-            log_debug("proxy_err", "conn=%u op=%u err=%s", cid, op, strerror(-cqe->res));
-        }
-        conn_close(w, cid, is_error);
+        handle_error(w, cqe, cid, h);
         return;
     }
 
     switch (op) {
-    case VORTEX_OP_RECV_CLIENT: {
-        int n = cqe->res;
-        log_debug("recv_client", "conn=%u n=%d", cid, n);
-        if (n == 0) { conn_close(w, cid, false); break; } /* Client EOF */
-        RECV_WINDOW_GROW(h, n, w->pool.buf_size);
-        h->bytes_in += (uint32_t)n;
-
-        /* Reconnect to backend if previous response consumed the connection */
-        if (h->backend_fd < 0) {
-            int ri = h->route_idx;
-            /* Re-select backend respecting circuit breaker state */
-            int bi = select_available_backend(w, ri, 0);
-            if (bi < 0) {
-                static const char r503[] =
-                    "HTTP/1.1 503 Service Unavailable\r\n"
-                    "Content-Length: 19\r\nRetry-After: 5\r\nConnection: close\r\n\r\n"
-                    "Service Unavailable";
-                send(h->client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL);
-                conn_close(w, cid, false);
-                break;
-            }
-            h->backend_idx = (uint16_t)bi;
-            const char *addr = router_backend_addr(&w->router, ri, bi);
-            if (!addr) {
-                const char *r502 =
-                    "HTTP/1.1 502 Bad Gateway\r\n"
-                    "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-                send(h->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-                conn_close(w, cid, false);
-                break;
-            }
-            /* Prefer the sticky backend fd pinned from the previous request.
-             * This avoids pool operations (uring_install_fd/remove_fd) on every
-             * request for long-lived client connections. */
-            const struct backend_config *bcfg = &w->cfg->routes[ri].backends[bi];
-            int cfg_pool = bcfg->tls ? 0 : bcfg->pool_size;
-            if (h->backend_fd >= 0 && h->backend_idx == (uint16_t)bi) {
-                /* Reuse existing connection — already installed in fixed slot */
-                log_debug("backend_reuse", "conn=%u fd=%d", cid, h->backend_fd);
-            } else {
-                /* Release any fd for a different backend (route switch) */
-                if (h->backend_fd >= 0) {
-                    int old_ps = w->cfg->routes[h->route_idx].backends[h->backend_idx].pool_size;
-                    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                    uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-                    if (cold->backend_ssl) {
-#ifdef VORTEX_PHASE_TLS
-                        SSL_free((SSL *)cold->backend_ssl);
-#endif
-                        cold->backend_ssl = NULL;
-                    }
-                    if (old_ps > 0 && !(h->flags & CONN_FLAG_BACKEND_TLS))
-                        global_pool_put(h->route_idx, h->backend_idx, h->backend_fd, old_ps);
-                    else
-                        close(h->backend_fd);
-                    h->backend_fd = -1;
-                    h->flags &= ~(CONN_FLAG_BACKEND_POOLED | CONN_FLAG_BACKEND_TLS);
-                }
-                /* Try global pool, then async connect */
-                int pfd = (cfg_pool > 0) ? global_pool_get(ri, bi) : -1;
-                if (pfd >= 0) {
-                    h->backend_fd = pfd;
-                    h->flags |= CONN_FLAG_BACKEND_POOLED;
-                    uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid), pfd);
-                } else {
-                    /* Async reconnect: data already in recv_buf — save it and
-                     * arm CONNECT; the CONNECT handler will re-arm RECV_CLIENT
-                     * which will trigger resend of the buffered request.
-                     * We pass n as hint via send_buf_len so CONNECT can forward it. */
-                    h->send_buf_len = (uint32_t)n;  /* stash the byte count */
-                    h->backend_fd = begin_async_connect(w, bcfg, cid);
-                    if (h->backend_fd >= 0)
-                        uring_install_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid), h->backend_fd);
-                    if (h->backend_fd < 0) {
-                        const char *r502 =
-                            "HTTP/1.1 502 Bad Gateway\r\n"
-                            "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-                        send(h->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-                        conn_close(w, cid, false);
-                        break;
-                    }
-                    h->flags |= CONN_FLAG_BACKEND_CONNECTING;
-                    h->state = CONN_STATE_BACKEND_CONNECT;
-                    /* Do not fall through — wait for CONNECT completion */
-                    break;
-                }
-            }
-        }
-
-        /* Per-route rate limit (token bucket).
-         * Only enforced when the connection pool is ≥75% full — i.e. when a
-         * noisy route could actually starve other origins.  Below that
-         * threshold every route runs uncapped regardless of config. */
-        {
-            const struct route_config *rc = &w->cfg->routes[h->route_idx];
-            if (rc->rate_limit.enabled && rc->rate_limit.rps > 0 &&
-                (uint64_t)w->pool.active * 4 >= (uint64_t)w->pool.capacity * 3) {
-                int ri = h->route_idx;
-                uint32_t max_tokens = rc->rate_limit.burst ? rc->rate_limit.burst
-                                                           : rc->rate_limit.rps;
-                struct timespec _rl_ts;
-                clock_gettime(CLOCK_MONOTONIC_COARSE, &_rl_ts);
-                uint64_t now_ns = (uint64_t)_rl_ts.tv_sec * 1000000000ULL + _rl_ts.tv_nsec;
-
-                if (w->route_rl[ri].last_ns == 0) {
-                    /* First request — fill to burst */
-                    w->route_rl[ri].tokens  = max_tokens;
-                    w->route_rl[ri].last_ns = now_ns;
-                } else {
-                    uint64_t elapsed_ns   = now_ns - w->route_rl[ri].last_ns;
-                    uint64_t ns_per_token = 1000000000ULL / rc->rate_limit.rps;
-                    uint32_t new_tokens   = (uint32_t)(elapsed_ns / ns_per_token);
-                    if (new_tokens > max_tokens) new_tokens = max_tokens; /* cap before add */
-                    if (new_tokens > 0) {
-                        w->route_rl[ri].tokens += new_tokens;
-                        if (w->route_rl[ri].tokens > max_tokens)
-                            w->route_rl[ri].tokens = max_tokens;
-                        /* Advance by whole intervals to preserve fractional remainder */
-                        w->route_rl[ri].last_ns += (uint64_t)new_tokens * ns_per_token;
-                    }
-                }
-
-                if (w->route_rl[ri].tokens == 0) {
-                    static const char r429[] =
-                        "HTTP/1.1 429 Too Many Requests\r\n"
-                        "Content-Length: 0\r\n"
-                        "Retry-After: 1\r\n"
-                        "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
-                        "Connection: keep-alive\r\n\r\n";
-                    struct io_uring_sqe *sqe429  = io_uring_get_sqe(&w->uring.ring);
-                    struct io_uring_sqe *sqe429r = io_uring_get_sqe(&w->uring.ring);
-                    if (!sqe429 || !sqe429r) { conn_close(w, cid, false); break; }
-                    uint8_t *sbuf = conn_send_buf(&w->pool, cid);
-                    size_t r429_len = sizeof(r429) - 1;
-                    memcpy(sbuf, r429, r429_len);
-                    h->send_buf_off = 0;
-                    h->send_buf_len = (uint32_t)r429_len;
-                    h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                    PREP_SEND(w, sqe429, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                        sbuf, r429_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                    sqe429->user_data  = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
-                    sqe429->flags     |= IOSQE_IO_LINK;
-                    PREP_RECV(w, sqe429r, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                        conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-                    sqe429r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-                    uring_submit(&w->uring);
-                    break;
-                }
-                w->route_rl[ri].tokens--;
-            }
-        }
-
-        /* Basic Auth check */
-        {
-            const struct route_config *rc = &w->cfg->routes[h->route_idx];
-            if (!auth_check_request(&rc->auth, conn_recv_buf(&w->pool, cid), n)) {
-                /* Send 401 and re-arm for next request */
-                static const char r401[] =
-                    "HTTP/1.1 401 Unauthorized\r\n"
-                    "WWW-Authenticate: Basic realm=\"vortex\"\r\n"
-                    "Content-Length: 0\r\n"
-                    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
-                    "Connection: keep-alive\r\n\r\n";
-                struct io_uring_sqe *sqe401 = io_uring_get_sqe(&w->uring.ring);
-                struct io_uring_sqe *sqe401r = io_uring_get_sqe(&w->uring.ring);
-                if (!sqe401 || !sqe401r) { conn_close(w, cid, false); break; }
-                /* Copy 401 to send buf */
-                uint8_t *sbuf = conn_send_buf(&w->pool, cid);
-                size_t r401_len = sizeof(r401) - 1;
-                memcpy(sbuf, r401, r401_len);
-                h->send_buf_off = 0;
-                h->send_buf_len = (uint32_t)r401_len;
-                h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                PREP_SEND(w, sqe401, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                    sbuf, r401_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                sqe401->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
-                sqe401->flags |= IOSQE_IO_LINK;
-                /* Pre-arm RECV_CLIENT as linked SQE — kernel starts it immediately after send */
-                PREP_RECV(w, sqe401r, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                    conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-                sqe401r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-                uring_submit(&w->uring);
-                break;
-            }
-        }
-
-        /* Detect WebSocket upgrade request */
-        {
-            const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-            if (memmem(rbuf, (size_t)n, "Upgrade: websocket", 18) != NULL ||
-                memmem(rbuf, (size_t)n, "upgrade: websocket", 18) != NULL) {
-                h->flags |= CONN_FLAG_WEBSOCKET_ACTIVE;
-                if (w->cfg->routes[h->route_idx].backends[h->backend_idx].tls) {
-                    send_bad_gateway_and_close(w, cid);
-                    break;
-                }
-            }
-        }
-
-        /* Detect client compression acceptance — cleared each request for keepalive correctness.
-         * Prefer brotli (br) over gzip when both are advertised. */
-        h->flags &= ~(CONN_FLAG_CLIENT_GZIP | CONN_FLAG_CLIENT_BR);
-        {
-            const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-            const uint8_t *ae = (const uint8_t *)memmem(rbuf, (size_t)n, "Accept-Encoding:", 16);
-            if (!ae) ae = (const uint8_t *)memmem(rbuf, (size_t)n, "accept-encoding:", 16);
-            if (ae) {
-                const uint8_t *eol = (const uint8_t *)FIND_CRLF(ae + 16,
-                    (size_t)n - (size_t)(ae + 16 - rbuf));
-                if (eol) {
-                    size_t ae_val_len = (size_t)(eol - ae - 16);
-                    if (memmem(ae + 16, ae_val_len, "br", 2))
-                        h->flags |= CONN_FLAG_CLIENT_BR;
-                    if (memmem(ae + 16, ae_val_len, "gzip", 4))
-                        h->flags |= CONN_FLAG_CLIENT_GZIP;
-                }
-            }
-        }
-
-        /* Cache check: only for GET requests */
-        if (w->cache && w->cache->index) {
-            char method[16], url[512];
-            const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-            if (parse_http_request_line(rbuf, n,
-                                        method, sizeof(method),
-                                        url, sizeof(url)) == 0
-                && strcmp(method, "GET") == 0) {
-
-                char cache_key[640];
-                make_cache_key(rbuf, (size_t)n, url, cache_key, sizeof(cache_key));
-                struct cached_response cached;
-                if (cache_fetch_copy(w->cache, cache_key, strlen(cache_key), &cached) == 0) {
-                    /* Check If-None-Match for conditional GET */
-                    char req_etag[64] = {0};
-                    const uint8_t *inm = (const uint8_t *)memmem(rbuf, (size_t)n,
-                                                                   "\r\nIf-None-Match:", 16);
-                    if (!inm)
-                        inm = (const uint8_t *)memmem(rbuf, (size_t)n,
-                                                       "\r\nif-none-match:", 16);
-                    if (inm) {
-                        const uint8_t *vs = inm + 16;
-                        while (vs < rbuf + n && (*vs == ' ' || *vs == '\t')) vs++;
-                        if (*vs == '"') vs++;
-                        const uint8_t *ve = vs;
-                        while (ve < rbuf + n && *ve != '"' && *ve != '\r') ve++;
-                        size_t el = (size_t)(ve - vs);
-                        if (el < sizeof(req_etag)) memcpy(req_etag, vs, el);
-                    }
-
-                    char etag_str[20];
-                    snprintf(etag_str, sizeof(etag_str), "%016llx",
-                             (unsigned long long)cached.body_etag);
-
-                    if (req_etag[0] && strcmp(req_etag, etag_str) == 0) {
-                        /* ETag matches → 304 Not Modified */
-                        char r304[128];
-                        int r304_len = snprintf(r304, sizeof(r304),
-                            "HTTP/1.1 304 Not Modified\r\n"
-                            "ETag: \"%s\"\r\n"
-                            "Connection: keep-alive\r\n\r\n", etag_str);
-                        uint8_t *sbuf = conn_send_buf(&w->pool, cid);
-                        memcpy(sbuf, r304, (size_t)r304_len);
-                        struct io_uring_sqe *sqe  = io_uring_get_sqe(&w->uring.ring);
-                        struct io_uring_sqe *sqer = io_uring_get_sqe(&w->uring.ring);
-                        if (sqe && sqer) {
-                            h->send_buf_off = 0;
-                            h->send_buf_len = (uint32_t)r304_len;
-                            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                                sbuf, (size_t)r304_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
-                            sqe->flags |= IOSQE_IO_LINK;
-                            /* Pre-arm RECV_CLIENT — kernel queues it right after send */
-                            PREP_RECV(w, sqer, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-                            sqer->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-                            uring_submit(&w->uring);
-                            cache_cached_response_free(&cached);
-                            log_debug("cache_304", "conn=%u url=%s", cid, url);
-                            break;
-                        }
-                    }
-
-                    /* Full cache HIT — serve stored response + inject ETag / X-Cache */
-                    /* Extra headers to splice before the final \r\n\r\n */
-                    char extra[128];
-                    int extra_len = snprintf(extra, sizeof(extra),
-                        "ETag: \"%s\"\r\nX-Cache: HIT\r\n", etag_str);
-
-                    uint32_t stored_total = cached.header_len + cached.body_len;
-                    size_t serve_len = stored_total + (size_t)extra_len;
-                    uint8_t *sbuf = conn_send_buf(&w->pool, cid);
-
-                    if (serve_len <= w->pool.buf_size && cached.header_len >= 4) {
-                        /* Copy headers minus the blank-line terminator (\r\n).
-                         * The last header's own \r\n stays so extra headers
-                         * splice in cleanly without merging onto the same line. */
-                        size_t hdr_body = cached.header_len - 2;
-                        memcpy(sbuf, cached.data, hdr_body);
-                        memcpy(sbuf + hdr_body, extra, (size_t)extra_len);
-                        memcpy(sbuf + hdr_body + extra_len, "\r\n", 2);
-                        memcpy(sbuf + cached.header_len + extra_len,
-                               cached.data + cached.header_len, cached.body_len);
-
-                        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-                        if (sqe) {
-                            h->send_buf_off = 0;
-                            h->send_buf_len = (uint32_t)serve_len;
-                            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                                sbuf, serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-                            uring_submit(&w->uring);
-                            cache_cached_response_free(&cached);
-                            log_debug("cache_hit", "conn=%u url=%s", cid, url);
-                            break;
-                        }
-                    }
-                    cache_cached_response_free(&cached);
-                    /* Fall through to backend if response too large or no sqe */
-                }
-            }
-        }
-
-        /* Rewrite backend request headers. All injections go right after the
-         * request line so they appear before any client-supplied headers.
-         * We build the inject block in one shot to minimise memmoves. */
-        const struct route_config *rc_fwd = &w->cfg->routes[h->route_idx];
-        int fwd_n = n;
-        {
-            uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-            bool is_ws = (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) != 0;
-
-            /* ---- Rewrite Accept-Encoding for backend leg ----
-             * The client→proxy leg is WAN; the proxy→backend leg is LAN where
-             * bandwidth is cheap and body inspection/caching requires plain text.
-             * Rewrite to "identity" so the backend sends uncompressed responses. */
-            bool ae_present = false;
-            {
-                uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
-                if (!ae)
-                    ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
-                if (ae) {
-                    ae_present = true;
-                    /* Replace the header value in-place with "identity" */
-                    uint8_t *vs = ae + 18;
-                    while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
-                    if (ve && ve > vs) {
-                        const char *id = "identity";
-                        size_t id_len  = 8;
-                        int delta = (int)id_len - (int)(ve - vs);
-                        if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
-                            memmove(vs + id_len, ve, (size_t)(rbuf + fwd_n - ve));
-                            memcpy(vs, id, id_len);
-                            fwd_n += delta;
-                        }
-                    }
-                }
-                /* When absent: injected in the inject block below */
-            }
-
-            /* ---- Strip Authorization header ----
-             * The proxy consumed it for its own auth check; never forward
-             * our proxy credentials to the backend. */
-            {
-                uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
-                if (!ah)
-                    ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
-                if (ah) {
-                    uint8_t *line_end = (uint8_t *)FIND_CRLF(ah + 2,
-                        (size_t)(rbuf + fwd_n - ah - 2));
-                    if (line_end) {
-                        line_end += 2; /* include the \r\n */
-                        size_t remove = (size_t)(line_end - ah - 2); /* bytes between \r\n's */
-                        /* We want to remove "\r\nAuthorization: ...\r\n" → replace with "\r\n" */
-                        /* i.e., shift everything after the line's \r\n back by (remove) bytes */
-                        memmove(ah + 2, ah + 2 + remove,
-                            (size_t)(rbuf + fwd_n - (ah + 2 + remove)));
-                        fwd_n -= (int)remove;
-                    }
-                }
-            }
-
-            /* ---- Connection header ----
-             * For WebSocket: pass through as-is (must stay "Upgrade").
-             * For pooled backends (pool_size > 0): use keep-alive so we can
-             * reuse the connection.  For all others: force "close" so the
-             * backend signals response completion with EOF. */
-            if (!is_ws) {
-                bool backend_tls = backend_uses_tls(w, cid);
-                bool use_ka = !backend_tls && ((h->flags & CONN_FLAG_BACKEND_POOLED) != 0
-                              || (w->cfg->routes[h->route_idx]
-                                     .backends[h->backend_idx].pool_size > 0));
-                const char *conn_val = use_ka ? "keep-alive" : "close";
-                size_t      conn_val_len = use_ka ? 10 : 5;
-
-                uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
-                if (!ch)
-                    ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
-                if (ch) {
-                    uint8_t *vs = ch + 13;
-                    while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
-                    if (ve && ve > vs) {
-                        size_t old_len = (size_t)(ve - vs);
-                        int delta = (int)conn_val_len - (int)old_len;
-                        if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
-                            memmove(vs + conn_val_len, ve, (size_t)(rbuf + fwd_n - ve));
-                            memcpy(vs, conn_val, conn_val_len);
-                            fwd_n += delta;
-                        }
-                    }
-                } else {
-                    /* No Connection header — inject one */
-                    const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
-                    if (eol0) {
-                        size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
-                        char inj0[32];
-                        int il0 = snprintf(inj0, sizeof(inj0),
-                            "Connection: %s\r\n", conn_val);
-                        if (fwd_n + il0 <= (int)w->pool.buf_size) {
-                            memmove(rbuf + le + il0, rbuf + le, (size_t)fwd_n - le);
-                            memcpy(rbuf + le, inj0, (size_t)il0);
-                            fwd_n += il0;
-                        }
-                    }
-                }
-
-                /* Reset per-response body tracking for this request */
-                if (use_ka) {
-                    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                    cold->backend_content_length = 0;
-                    cold->backend_body_recv      = 0;
-                }
-            }
-
-            /* ---- Inject proxy headers after request line ----
-             * X-Forwarded-Proto, X-Forwarded-For, X-Real-IP, X-Api-Key */
-            const char *eol = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
-            if (eol) {
-                size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
-
-                /* Build inject block */
-                char inj[640];
-                int inj_len = 0;
-
-                /* NOTE: intentionally do NOT inject X-Forwarded-Proto: https.
-                 * ASP.NET Core / Kestrel disables ResponseCompression when it
-                 * sees X-Forwarded-Proto: https (BREACH/CRIME mitigation).
-                 * We terminate TLS at the proxy; the backend speaks plain HTTP.
-                 * Sonarr's SPA uses relative URLs so the scheme doesn't matter
-                 * for link generation. */
-
-                /* X-Real-IP / X-Forwarded-For from stored client address */
-                {
-                    char ipstr[64] = {0};
-                    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                    const struct sockaddr *sa = (const struct sockaddr *)&cold->client_addr;
-                    if (sa->sa_family == AF_INET)
-                        inet_ntop(AF_INET,
-                            &((const struct sockaddr_in *)sa)->sin_addr,
-                            ipstr, sizeof(ipstr));
-                    else if (sa->sa_family == AF_INET6)
-                        inet_ntop(AF_INET6,
-                            &((const struct sockaddr_in6 *)sa)->sin6_addr,
-                            ipstr, sizeof(ipstr));
-                    if (ipstr[0]) {
-                        inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                            "X-Real-IP: %s\r\nX-Forwarded-For: %s\r\n", ipstr, ipstr);
-                    }
-                }
-
-                /* Accept-Encoding: identity — only when not already rewritten above */
-                if (!ae_present)
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                        "Accept-Encoding: identity\r\n");
-
-                /* X-Api-Key if configured */
-                if (rc_fwd->x_api_key[0])
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                        "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
-
-                /* Backend Basic Auth credentials if configured — inject after
-                 * the proxy-level Authorization header has been stripped. */
-                if (rc_fwd->backend_credentials[0]) {
-                    char b64[512];
-                    b64_encode(rc_fwd->backend_credentials,
-                               strlen(rc_fwd->backend_credentials), b64, sizeof(b64));
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                        "Authorization: Basic %s\r\n", b64);
-                }
-
-                if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
-                    memmove(rbuf + line_end + inj_len,
-                            rbuf + line_end, (size_t)fwd_n - line_end);
-                    memcpy(rbuf + line_end, inj, (size_t)inj_len);
-                    fwd_n += inj_len;
-                }
-            }
-        }
-
-        /* Forward client data to backend */
-        if (backend_uses_tls(w, cid)) {
-            if (h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) {
-                send_bad_gateway_and_close(w, cid);
-                break;
-            }
-            if (backend_tls_send_all(w, cid, conn_recv_buf(&w->pool, cid), (size_t)fwd_n) < 0) {
-                send_bad_gateway_and_close(w, cid);
-                break;
-            }
-            backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
-            {
-                int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
-                if (rn < 0) {
-                    send_bad_gateway_and_close(w, cid);
-                    break;
-                }
-                handle_backend_read_result(w, cid, rn);
-            }
-            break;
-        }
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); break; }
-        PREP_SEND(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-            conn_recv_buf(&w->pool, cid), fwd_n, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
-        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_RECV_CLIENT:
+        handle_recv_client(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_SEND_BACKEND: {
-        int n = cqe->res;
-        log_debug("send_backend", "conn=%u n=%d", cid, n);
-        if (n < 0) { conn_close(w, cid, true); break; }
-        /* All client data forwarded — arm deadline then wait for backend response */
-        backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
-        if (backend_uses_tls(w, cid)) {
-            int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
-            if (rn < 0) {
-                send_bad_gateway_and_close(w, cid);
-                break;
-            }
-            handle_backend_read_result(w, cid, rn);
-            break;
-        }
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); break; }
-        PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-            conn_send_buf(&w->pool, cid), h->recv_window, 0, SEND_IDX_SEND(w, cid));
-        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_SEND_BACKEND:
+        handle_send_backend(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_RECV_BACKEND: {
-        handle_backend_read_result(w, cid, cqe->res);
+    case VORTEX_OP_RECV_BACKEND:
+        handle_recv_backend(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_SEND_CLIENT: {
-        int sent = cqe->res;
-        log_debug("send_client", "conn=%u sent=%d", cid, sent);
-        if (sent < 0) { conn_close(w, cid, true); break; }
-        h->send_buf_off += (uint32_t)sent;
-
-        if (h->send_buf_off < h->send_buf_len) {
-            /* Partial send (kTLS record boundary) — flush remaining bytes */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, true); break; }
-            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_send_buf(&w->pool, cid) + h->send_buf_off,
-                h->send_buf_len - h->send_buf_off, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-            uring_submit(&w->uring);
-            break;
-        }
-
-        /* Full chunk sent */
-        h->send_buf_off = 0;
-        h->send_buf_len = 0;
-
-        /* Check if a poolable backend response is now complete.
-         * When it is, keep the fd installed in the fixed slot (sticky backend):
-         * the same client connection will reuse it for its next request with
-         * zero pool operations.  We only release the fd to the global pool when
-         * the client connection itself closes (see conn_close). */
-        if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-            int ri = h->route_idx, bi = h->backend_idx;
-            int ps = (h->flags & CONN_FLAG_BACKEND_TLS) ? 0
-                     : w->cfg->routes[ri].backends[bi].pool_size;
-            if (ps > 0) {
-                struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                if (cold->backend_content_length > 0 &&
-                    cold->backend_body_recv >= cold->backend_content_length) {
-                    /* Full response forwarded — mark backend idle, keep fd pinned */
-                    h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_BACKEND_POOLED);
-                    cold->backend_content_length = 0;
-                    cold->backend_body_recv      = 0;
-                    log_debug("backend_sticky", "conn=%u route=%d backend=%d fd=%d",
-                        cid, ri, bi, h->backend_fd);
-                }
-            }
-        }
-
-        if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-            if (backend_uses_tls(w, cid)) {
-                int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
-                if (rn < 0) {
-                    send_bad_gateway_and_close(w, cid);
-                    break;
-                }
-                handle_backend_read_result(w, cid, rn);
-                break;
-            }
-            /* Zero-copy splice: only safe for non-compressible types (images, video,
-             * already-compressed media), and only without kTLS TX.  Splicing into a
-             * kTLS-TX socket causes ERR_CONTENT_LENGTH_MISMATCH on kernel 6.8–6.12
-             * (kTLS mis-accounts spliced bytes against the Content-Length already sent).
-             * Compressible types also skip splice — compression of the first chunk
-             * changes the payload length, but splice delivers subsequent chunks raw. */
-            if (!(h->flags & CONN_FLAG_BACKEND_POOLED) &&
-                !(h->flags & CONN_FLAG_WEBSOCKET_ACTIVE) &&
-                !h->ct_compressible &&
-                !(h->flags & CONN_FLAG_KTLS_TX)) {
-                begin_splice(w, cid, h);
-                break;
-            }
-            /* Still reading backend response — get next chunk */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, true); break; }
-            PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-                conn_send_buf(&w->pool, cid), h->recv_window, 0, SEND_IDX_SEND(w, cid));
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
-            uring_submit(&w->uring);
-        } else {
-            /* Response complete (cache hit, single chunk, or pool return) — next request */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, true); break; }
-            PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-            uring_submit(&w->uring);
-        }
+    case VORTEX_OP_SEND_CLIENT:
+        handle_send_client(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_SEND_CLIENT_LINKED: {
-        /* SEND completed; RECV_CLIENT was pre-armed as a linked SQE.
-         * On success the kernel has already queued the recv — nothing more to do.
-         * On partial send the client won't pipeline the next request until it
-         * receives the full response, so the pre-armed recv is still safe; just
-         * flush the remaining bytes via a regular (non-linked) SEND_CLIENT. */
-        int sent = cqe->res;
-        log_debug("send_client_linked", "conn=%u sent=%d", cid, sent);
-        if (sent < 0) {
-            /* Send error — linked recv will arrive with -ECANCELED; conn_close
-             * is idempotent so the RECV_CLIENT handler can call it again safely. */
-            conn_close(w, cid, true);
-            break;
-        }
-        h->send_buf_off += (uint32_t)sent;
-        if (h->send_buf_off < h->send_buf_len) {
-            /* Partial send — flush remainder; pre-armed recv is still in flight */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, true); break; }
-            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_send_buf(&w->pool, cid) + h->send_buf_off,
-                h->send_buf_len - h->send_buf_off, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-            uring_submit(&w->uring);
-        }
-        /* Full send: recv already queued by kernel — nothing else to submit */
-        h->send_buf_off = 0;
-        h->send_buf_len = 0;
+    case VORTEX_OP_SEND_CLIENT_LINKED:
+        handle_send_client_linked(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_SPLICE_BACKEND: {
-        /* Kernel spliced n bytes from backend_fd into splice_pipe[1] */
-        int n = cqe->res;
-        log_debug("splice_backend", "conn=%u n=%d", cid, n);
-        if (n < 0) { conn_close(w, cid, true); break; }
-        if (n == 0) {
-            /* Backend EOF — done streaming */
-            h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_SPLICE_MODE);
-            if (h->backend_fd >= 0) {
-                uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-                close(h->backend_fd); h->backend_fd = -1;
-            }
-            h->flags &= ~CONN_FLAG_BACKEND_POOLED;
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, false); break; }
-            PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-            uring_submit(&w->uring);
-            break;
-        }
-        /* Bytes are in the pipe — splice pipe[0] → client_fd */
-        h->bytes_out += (uint32_t)n;
-        struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); break; }
-        io_uring_prep_splice(sqe, cold->splice_pipe[0], -1,
-                             h->client_fd, -1,
-                             (unsigned int)n, SPLICE_F_MOVE);
-        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_CLIENT, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_SPLICE_BACKEND:
+        handle_splice_backend(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_SPLICE_CLIENT: {
-        /* Kernel spliced bytes from pipe → client_fd */
-        int sent = cqe->res;
-        log_debug("splice_client", "conn=%u sent=%d", cid, sent);
-        if (sent < 0) { conn_close(w, cid, true); break; }
-        /* Loop: splice next chunk from backend into pipe */
-        if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-            struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, true); break; }
-            io_uring_prep_splice(sqe, h->backend_fd, -1,
-                                 cold->splice_pipe[1], -1,
-                                 (unsigned int)(1u << 20), SPLICE_F_MOVE);
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SPLICE_BACKEND, cid);
-            uring_submit(&w->uring);
-        } else {
-            /* Streaming flag cleared elsewhere (shouldn't normally reach here) */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, false); break; }
-            PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-            uring_submit(&w->uring);
-        }
+    case VORTEX_OP_SPLICE_CLIENT:
+        handle_splice_client(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_CONNECT: {
-        /* Async backend connect completed */
-        const struct backend_config *bcfg = &w->cfg->routes[h->route_idx].backends[h->backend_idx];
-        h->flags &= ~CONN_FLAG_BACKEND_CONNECTING;
-        {
-            int _ri = h->route_idx, _bi = h->backend_idx;
-            struct timespec _cb_ts;
-            clock_gettime(CLOCK_MONOTONIC_COARSE, &_cb_ts);
-            uint64_t _now = (uint64_t)_cb_ts.tv_sec * 1000000000ULL + _cb_ts.tv_nsec;
-            if (cqe->res < 0) {
-                cb_record_failure(w, _ri, _bi, _now,
-                    w->cfg->routes[_ri].health.fail_threshold,
-                    w->cfg->routes[_ri].health.open_ms);
-            } else {
-                cb_record_success(w, _ri, _bi);
-            }
-        }
-        if (cqe->res < 0) {
-            log_warn("connect_cqe", "conn=%u backend connect failed: %s",
-                cid, strerror(-cqe->res));
-            const char *r502 =
-                "HTTP/1.1 502 Bad Gateway\r\n"
-                "Content-Length: 11\r\nConnection: close\r\n\r\nBad Gateway";
-            send(h->client_fd, r502, strlen(r502), MSG_NOSIGNAL);
-            conn_close(w, cid, false);
-            break;
-        }
-        log_debug("connect_cqe", "conn=%u backend_fd=%d connected", cid, h->backend_fd);
-        if (bcfg->tls) {
-            if (backend_tls_handshake(w, bcfg, cid) != 0) {
-                log_warn("connect_cqe", "conn=%u backend TLS handshake failed", cid);
-                send_bad_gateway_and_close(w, cid);
-                break;
-            }
-        }
-
-        h->state = CONN_STATE_PROXYING;
-
-        if (h->send_buf_len > 0) {
-            /* Reconnect case: request already buffered in recv_buf.
-             * Strip the Authorization header (security) then forward. */
-            uint32_t saved_n = h->send_buf_len;
-            h->send_buf_len = 0;
-            uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-            int fwd_n = (int)saved_n;
-
-            /* Strip Authorization so proxy credentials don't reach backend */
-            uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
-            if (!ah)
-                ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
-            if (ah) {
-                uint8_t *le = (uint8_t *)FIND_CRLF(ah + 2,
-                    (size_t)(rbuf + fwd_n - ah - 2));
-                if (le) {
-                    le += 2;
-                    size_t rm = (size_t)(le - ah - 2);
-                    memmove(ah + 2, ah + 2 + rm,
-                        (size_t)(rbuf + fwd_n - (ah + 2 + rm)));
-                    fwd_n -= (int)rm;
-                }
-            }
-
-            /* Rewrite Connection: keep-alive → close so the backend signals
-             * response completion with EOF, allowing RECV_CLIENT to re-arm. */
-            {
-                uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
-                if (!ch)
-                    ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
-                if (ch) {
-                    uint8_t *vs = ch + 13;
-                    while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                    uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                        (size_t)(rbuf + fwd_n - vs));
-                    if (ve && ve > vs) {
-                        size_t old_len = (size_t)(ve - vs);
-                        int delta = 5 - (int)old_len; /* "close" = 5 bytes */
-                        if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
-                            memmove(vs + 5, ve, (size_t)(rbuf + fwd_n - ve));
-                            memcpy(vs, "close", 5);
-                            fwd_n += delta;
-                        }
-                    }
-                } else {
-                    /* No Connection header — inject one after the request line */
-                    const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
-                    if (eol0 && fwd_n + 19 <= (int)w->pool.buf_size) {
-                        size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
-                        memmove(rbuf + le + 19, rbuf + le, (size_t)fwd_n - le);
-                        memcpy(rbuf + le, "Connection: close\r\n", 19);
-                        fwd_n += 19;
-                    }
-                }
-            }
-            if (backend_uses_tls(w, cid)) {
-                if (backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n) < 0) {
-                    send_bad_gateway_and_close(w, cid);
-                    break;
-                }
-                backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
-                {
-                    int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
-                    if (rn < 0) {
-                        send_bad_gateway_and_close(w, cid);
-                        break;
-                    }
-                    handle_backend_read_result(w, cid, rn);
-                }
-                break;
-            }
-
-            struct io_uring_sqe *sqe_s = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe_s) { conn_close(w, cid, true); break; }
-            PREP_SEND(w, sqe_s, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-                rbuf, (size_t)fwd_n, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
-            sqe_s->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
-        } else {
-            /* Initial connect: arm RECV_CLIENT to get the first request */
-            struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe_c) { conn_close(w, cid, true); break; }
-            PREP_RECV(w, sqe_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-            sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-        }
-        uring_submit(&w->uring);
+    case VORTEX_OP_CONNECT:
+        handle_connect(w, cqe, cid, h);
         break;
-    }
-
-    /* --- WebSocket relay: client → backend direction ---
-     *
-     * Recv completed: n bytes of client data sit in recv_buf.
-     * Queue an async send to the backend; the buffer must not be reused
-     * until SEND_BACKEND_WS fires, so RECV_CLIENT_WS is re-armed there. */
-    case VORTEX_OP_RECV_CLIENT_WS: {
-        int n = cqe->res;
-        if (n <= 0) { conn_close(w, cid, false); break; }
-        h->recv_buf_off = 0;
-        h->recv_buf_len = (uint32_t)n;
-        struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe_ws_c) { conn_close(w, cid, false); break; }
-        PREP_SEND(w, sqe_ws_c, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-            conn_recv_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
-        sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND_WS, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_RECV_CLIENT_WS:
+        handle_recv_client_ws(w, cqe, cid, h);
         break;
-    }
-
-    /* Send to backend completed — recv_buf is free; re-arm the client recv. */
-    case VORTEX_OP_SEND_BACKEND_WS: {
-        int sent = cqe->res;
-        if (sent <= 0) { conn_close(w, cid, false); break; }
-        h->recv_buf_off += (uint32_t)sent;
-        if (h->recv_buf_off < h->recv_buf_len) {
-            struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe_ws_c) { conn_close(w, cid, false); break; }
-            PREP_SEND(w, sqe_ws_c, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-                conn_recv_buf(&w->pool, cid) + h->recv_buf_off,
-                (size_t)(h->recv_buf_len - h->recv_buf_off),
-                MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
-            sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND_WS, cid);
-            uring_submit(&w->uring);
-            break;
-        }
-        h->recv_buf_off = 0;
-        h->recv_buf_len = 0;
-        struct io_uring_sqe *sqe_ws_c = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe_ws_c) { conn_close(w, cid, false); break; }
-        PREP_RECV(w, sqe_ws_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
-            conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_RECV(w, cid));
-        sqe_ws_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT_WS, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_SEND_BACKEND_WS:
+        handle_send_backend_ws(w, cqe, cid, h);
         break;
-    }
-
-    /* --- WebSocket relay: backend → client direction ---
-     *
-     * Recv completed: n bytes of backend data sit in send_buf.
-     * Queue an async send to the client; re-arm RECV_BACKEND_WS in SEND_CLIENT_WS. */
-    case VORTEX_OP_RECV_BACKEND_WS: {
-        int n = cqe->res;
-        if (n <= 0) { conn_close(w, cid, false); break; }
-        h->send_buf_off = 0;
-        h->send_buf_len = (uint32_t)n;
-        struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe_ws_b) { conn_close(w, cid, false); break; }
-        PREP_SEND(w, sqe_ws_b, h->client_fd, FIXED_FD_CLIENT(w, cid),
-            conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-        sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_WS, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_RECV_BACKEND_WS:
+        handle_recv_backend_ws(w, cqe, cid, h);
         break;
-    }
-
-    /* Send to client completed — send_buf is free; re-arm the backend recv. */
-    case VORTEX_OP_SEND_CLIENT_WS: {
-        int sent = cqe->res;
-        if (sent <= 0) { conn_close(w, cid, false); break; }
-        h->send_buf_off += (uint32_t)sent;
-        if (h->send_buf_off < h->send_buf_len) {
-            struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe_ws_b) { conn_close(w, cid, false); break; }
-            PREP_SEND(w, sqe_ws_b, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_send_buf(&w->pool, cid) + h->send_buf_off,
-                (size_t)(h->send_buf_len - h->send_buf_off),
-                MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-            sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_WS, cid);
-            uring_submit(&w->uring);
-            break;
-        }
-        h->send_buf_off = 0;
-        h->send_buf_len = 0;
-        struct io_uring_sqe *sqe_ws_b = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe_ws_b) { conn_close(w, cid, false); break; }
-        PREP_RECV(w, sqe_ws_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-            conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
-        sqe_ws_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
-        uring_submit(&w->uring);
+    case VORTEX_OP_SEND_CLIENT_WS:
+        handle_send_client_ws(w, cqe, cid, h);
         break;
-    }
-
-    case VORTEX_OP_SEND_CLIENT_ZC: {
-        /*
-         * Two CQEs per send_zc_fixed operation:
-         *
-         * 1. Completion CQE (IORING_CQE_F_MORE set, IORING_CQE_F_NOTIF clear):
-         *    res = bytes transferred. Process partial sends here.
-         *    Buffer is still pinned — do NOT arm next recv yet.
-         *
-         * 2. Notification CQE (IORING_CQE_F_NOTIF set):
-         *    res = 0. Kernel has released the buffer. Safe to arm next recv.
-         *
-         * zc_notif_count tracks outstanding notifications so we handle partial
-         * sends (multiple in-flight ZC ops) and stale NOTIFs on reused slots.
-         */
-        if (cqe->flags & IORING_CQE_F_NOTIF) {
-            /* Buffer released — decrement counter and arm next recv if all done */
-            if (h->zc_notif_count > 0) h->zc_notif_count--;
-            if (h->zc_notif_count == 0) {
-                struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-                if (!sqe) { conn_close(w, cid, true); break; }
-                if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-                    /* More backend data expected — re-arm backend recv */
-                    PREP_RECV(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
-                        conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
-                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND, cid);
-                } else {
-                    /* Response complete — arm next client request (keep-alive) */
-                    PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                        conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-                    sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-                }
-                uring_submit(&w->uring);
-            }
-            break;
-        }
-
-        /* Completion CQE */
-        int zc_sent = cqe->res;
-        if (zc_sent <= 0) { conn_close(w, cid, true); break; }
-        h->bytes_out += (uint32_t)zc_sent;
-        /* Note: do NOT arm next recv here — wait for the NOTIF CQE */
+    case VORTEX_OP_SEND_CLIENT_ZC:
+        handle_send_client_zc(w, cqe, cid, h);
         break;
-    }
-
 #ifdef VORTEX_H2
-    case VORTEX_OP_H2_RECV_CLIENT: {
-        /* Multishot: IORING_CQE_F_MORE means the recv SQE is still armed.
-         * When not set (ring empty, fd closed, etc.) we must re-arm. */
-        bool ms_active = (cqe->flags & IORING_CQE_F_MORE) != 0;
-        const uint8_t *data;
-        uint16_t buf_id = 0;
-        if (w->uring.recv_ring && (cqe->flags & IORING_CQE_F_BUFFER)) {
-            buf_id = (uint16_t)(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-            data   = uring_recv_ring_buf(&w->uring, buf_id, w->pool.buf_size);
-        } else {
-            data = conn_recv_buf(&w->pool, cid);
-        }
-        h2_on_recv(w, cid, cqe->res, data, buf_id, ms_active);
+    case VORTEX_OP_H2_RECV_CLIENT:
+        handle_h2_recv_client(w, cqe, cid, h);
         break;
-    }
-    case VORTEX_OP_H2_SEND_CLIENT: {
-        h2_on_send_client(w, cid, cqe->res);
+    case VORTEX_OP_H2_SEND_CLIENT:
+        handle_h2_send_client(w, cqe, cid, h);
         break;
-    }
 #endif
-
-    default: break;
+    default:
+        break;
     }
 }

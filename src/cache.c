@@ -20,6 +20,16 @@
 #define MAP_HUGE_SHIFT 26
 #endif
 
+static inline uint32_t fnv1a(const char *data, size_t len)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
 /* Try mmap with hugepages, fall back to THP, then regular */
 static void *alloc_aligned(size_t size, bool try_hugepages)
 {
@@ -161,6 +171,7 @@ static struct cache_index_entry *cache_lookup_locked(struct cache *c,
     const char *url, size_t url_len)
 {
     uint64_t hash = xxhash64(url, url_len);
+    uint32_t confirm = fnv1a(url, url_len);
     size_t   slot = hash & c->index_mask;
 
     PREFETCH_R(&c->index[slot]);
@@ -179,8 +190,13 @@ static struct cache_index_entry *cache_lookup_locked(struct cache *c,
                 c->misses++;
                 return NULL;
             }
+            if (e->url_hash_confirm != confirm) {
+                /* Hash + prefix matched but secondary hash didn't — genuine collision */
+                c->misses++;
+                return NULL;
+            }
             e->last_accessed_ts = (uint32_t)time(NULL);
-            e->hit_count = e->hit_count < 0xFFFF ? e->hit_count + 1 : 0xFFFF;
+            e->hit_count = e->hit_count < 0xFF ? e->hit_count + 1 : 0xFF;
             c->hits++;
             return e;
         }
@@ -282,6 +298,7 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
 
     /* Insert into hash table using Robin Hood */
     uint64_t hash = xxhash64(url, url_len);
+    uint32_t confirm = fnv1a(url, url_len);
     size_t   slot = hash & c->index_mask;
     uint32_t now  = (uint32_t)time(NULL);
 
@@ -294,11 +311,12 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
         .header_len       = (uint32_t)header_len,
         .status_code      = status,
         .flags            = CACHE_FLAG_VALID,
-        .ttl_seconds      = ttl,
+        .ttl_seconds      = (uint16_t)(ttl > UINT16_MAX ? UINT16_MAX : ttl),
         .created_ts       = now,
         .last_accessed_ts = now,
         .hit_count        = 0,
         .url_key_len      = klen,
+        .url_hash_confirm = confirm,
     };
     memcpy(new_entry.url_key, url, klen);
 
