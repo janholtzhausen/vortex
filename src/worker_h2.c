@@ -1862,7 +1862,8 @@ void h2_on_backend_recv(struct worker *w, uint32_t cid, uint32_t slot, int n)
                     const uint8_t *v = ct + 13;
                     while (v < eol && (*v == ' ' || *v == '\t')) v++;
                     size_t vlen = (size_t)(eol - v);
-                    if ((vlen >= 6 && memcmp(v, "image/", 6) == 0) ||
+                    if ((vlen >= 9 && memcmp(v, "text/html", 9) == 0) ||
+                        (vlen >= 6 && memcmp(v, "image/", 6) == 0) ||
                         memmem(v, vlen, "font", 4) != NULL ||
                         (vlen >= 8 && memcmp(v, "text/css", 8) == 0) ||
                         memmem(v, vlen, "javascript", 10) != NULL ||
