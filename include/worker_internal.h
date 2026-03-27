@@ -56,9 +56,9 @@
 /* Dynamic recv window: double on full read, cap at buf_size.
  * Called after every RECV_CLIENT / RECV_BACKEND completion. */
 #define RECV_WINDOW_GROW(h, n, buf_size) do { \
-    if ((size_t)(n) >= (h)->recv_window && (h)->recv_window < (uint16_t)(buf_size)) { \
+    if ((size_t)(n) >= (h)->recv_window && (h)->recv_window < (uint32_t)(buf_size)) { \
         uint32_t next = (uint32_t)(h)->recv_window * 2; \
-        (h)->recv_window = (uint16_t)(next < (buf_size) ? next : (buf_size)); \
+        (h)->recv_window = (uint32_t)(next < (buf_size) ? next : (buf_size)); \
     } \
 } while (0)
 
