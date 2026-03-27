@@ -193,8 +193,8 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
             !(h->flags & CONN_FLAG_BACKEND_TLS_PENDING) &&
             !(h->flags & CONN_FLAG_BACKEND_CONNECTING)) {
             int ri = h->route_idx, bi = h->backend_idx;
-            int ps = (ri >= 0 && ri < VORTEX_MAX_ROUTES &&
-                      bi >= 0 && bi < VORTEX_MAX_BACKENDS)
+            int ps = (ri < w->cfg->route_count &&
+                      bi < w->cfg->routes[ri].backend_count)
                      ? w->cfg->routes[ri].backends[bi].pool_size : 0;
             if (ps > 0) {
                 struct global_backend_conn pooled = {
