@@ -50,6 +50,22 @@ if(OPENSSL_AVAILABLE)
 endif()
 target_link_libraries(test_cache pthread)
 
+add_executable(test_auth
+    test_auth.c
+    ../src/auth.c
+)
+target_include_directories(test_auth PRIVATE
+    ../include
+    ../src
+)
+if(OPENSSL_AVAILABLE)
+    target_compile_definitions(test_auth PRIVATE VORTEX_PHASE_TLS=1)
+    target_include_directories(test_auth PRIVATE ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(test_auth ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
+    target_link_directories(test_auth PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
+endif()
+target_link_libraries(test_auth pthread)
+
 add_executable(test_router
     test_router.c
     ../src/router.c
@@ -69,4 +85,5 @@ target_link_directories(test_router PRIVATE ${YAML_LIBRARY_DIRS})
 add_test(NAME test_config COMMAND $<TARGET_FILE:test_config>)
 add_test(NAME test_log    COMMAND $<TARGET_FILE:test_log>)
 add_test(NAME test_cache  COMMAND $<TARGET_FILE:test_cache>)
+add_test(NAME test_auth   COMMAND $<TARGET_FILE:test_auth>)
 add_test(NAME test_router COMMAND $<TARGET_FILE:test_router>)

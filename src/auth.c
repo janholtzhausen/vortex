@@ -66,6 +66,29 @@ static bool auth_verify_password(const struct auth_verifier *verifier,
     }
     return CRYPTO_memcmp(derived, verifier->hash, verifier->hash_len) == 0;
 }
+
+static bool auth_username_match_ct(const char *a, const char *b)
+{
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    size_t n = la > lb ? la : lb;
+    unsigned char diff = (unsigned char)(la ^ lb);
+
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+static void auth_make_dummy_verifier(struct auth_verifier *dst,
+                                     const struct auth_verifier *src)
+{
+    *dst = *src;
+    if (dst->hash_len > 0)
+        dst->hash[0] ^= 0xFF;
+}
 #endif
 
 bool auth_parse_verifier(struct auth_verifier *out, const char *value)
@@ -233,14 +256,21 @@ bool auth_check_basic_value(const struct route_auth_config *auth,
     (void)password;
     return false;
 #else
+    const struct auth_verifier *selected = NULL;
+    const struct auth_verifier *fallback = &auth->verifiers[0];
+    struct auth_verifier dummy;
+
     for (int i = 0; i < auth->credential_count; i++) {
         const struct auth_verifier *verifier = &auth->verifiers[i];
-        if (strcmp(username, verifier->username) != 0)
-            continue;
-        if (auth_verify_password(verifier, password))
-            return true;
+        if (auth_username_match_ct(username, verifier->username))
+            selected = verifier;
     }
-    return false;
+
+    if (!selected) {
+        auth_make_dummy_verifier(&dummy, fallback);
+        selected = &dummy;
+    }
+    return auth_verify_password(selected, password);
 #endif
 }
 
