@@ -64,7 +64,7 @@ void config_set_defaults(struct vortex_config *cfg)
     cfg->sqpoll         = false;
     cfg->hugepages      = false;
     cfg->cpu_affinity   = true;  /* on by default — safe, scheduler can override */
-    cfg->ipv4_only      = true;  /* dual-stack off by default; XDP blocklist is IPv4-only */
+    cfg->ipv4_only      = true;  /* dual-stack off by default; set false to bind AF_INET6 with v4-mapped support */
     snprintf(cfg->bind_address, sizeof(cfg->bind_address), "%s", "0.0.0.0");
     cfg->bind_port      = 443;
     cfg->http_port      = 80;

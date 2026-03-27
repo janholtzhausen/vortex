@@ -33,6 +33,10 @@ global:
   # Disable if you have other latency-sensitive processes that need specific
   # core placement and don't want vortex claiming whole cores.
   cpu_affinity: true
+  # Listener mode. ipv4_only: true creates an AF_INET listener only.
+  # Set ipv4_only: false with bind_address: "::" for a dual-stack listener
+  # (native IPv6 plus IPv4-mapped connections on one socket).
+  ipv4_only: true
   bind_address: "0.0.0.0"
   bind_port: 443
   http_port: 80
@@ -56,7 +60,7 @@ xdp:
     enabled: true
     requests_per_second: 1000
     burst: 2000
-  blocklist_file: "/etc/vortex/blocklist.txt"
+  blocklist_file: "/etc/vortex/blocklist.txt"  # One IPv4 or IPv6 literal per line
 
 cache:
   enabled: true

@@ -165,7 +165,8 @@ NIC ──► XDP program ──────►  │  blocklist drop            
 Separate threads:
   - Metrics HTTP server (Prometheus scrape endpoint)
   - ACME renewal thread (checks every hour)
-  - WebSocket relay threads (spawned on 101 upgrade, detached)
+  - Shared TLS handshake pool
+  - Shared compression offload pool
   - QUIC server thread (HTTP/3, when compiled)
 ```
 
@@ -254,8 +255,8 @@ cmake --build build-release -j$(nproc)
 ### Run tests
 
 ```sh
-cmake --build build --target test_config test_cache test_log
-ctest --test-dir build/tests
+cmake --build build-release
+ctest --test-dir build-release --output-on-failure
 ```
 
 ### Custom paths
@@ -283,9 +284,12 @@ cmake -B build \
 
 `tools/build_deb.sh` produces a self-contained Debian package that bundles the
 OpenSSL 4.0 shared libraries so the target machine does not need them pre-installed.
+If no version is passed, the script picks the next patch version after the
+highest version it can find from `VERSION`, git tags, and local `.deb`
+artifacts, and refuses version regressions.
 
 ```sh
-tools/build_deb.sh 0.2.0        # produces vortex_0.2.0_amd64.deb
+bash tools/build_deb.sh 1.0.0   # produces vortex_1.0.0_amd64.deb
 ```
 
 ### Installing on a fresh machine
@@ -295,7 +299,7 @@ tools/build_deb.sh 0.2.0        # produces vortex_0.2.0_amd64.deb
 sudo apt-get install -y libbpf1 liburing2 libyaml-0-2
 
 # Install the package
-sudo dpkg -i vortex_0.2.0_amd64.deb
+sudo dpkg -i vortex_1.0.0_amd64.deb
 ```
 
 The postinst script will:
@@ -356,6 +360,7 @@ disables XDP explicitly. `-T` disables TLS.
 global:
   workers: auto            # Number of worker threads (default: auto = nproc)
   compress_pool_threads: 0 # 0 = synchronous compression in worker thread; 2-4 recommended for offload
+  ipv4_only: true          # false = AF_INET6 dual-stack listener with IPV6_V6ONLY=0
   bind_address: "0.0.0.0"
   bind_port: 443
   http_port: 80            # Used by ACME HTTP-01 challenge server
@@ -374,7 +379,7 @@ tls:
 
 xdp:
   mode: "auto"             # auto | native | skb
-  blocklist_file: "/etc/vortex/blocklist.txt"  # One IPv4 per line, # comments
+  blocklist_file: "/etc/vortex/blocklist.txt"  # One IPv4 or IPv6 literal per line, # comments
   rate_limit:
     enabled: true
     requests_per_second: 1000   # New connections per second per source IP
@@ -430,6 +435,14 @@ routes:
       file: "/etc/vortex/auth/api-users.auth"
       users:
         - "alice:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc="
+```
+
+For dual-stack ingress, set:
+
+```yaml
+global:
+  ipv4_only: false
+  bind_address: "::"
 ```
 
 ### Environment variable expansion
@@ -519,7 +532,7 @@ The codebase was developed in phases; `VORTEX_PHASE=7` is the current build targ
 
 **Features added beyond the original phase plan:**
 - Tarpit mode with automatic XDP blocklist escalation
-- WebSocket passthrough (detect Upgrade, relay thread)
+- WebSocket passthrough (detect Upgrade, relay via io_uring)
 - Connection-rate limiting applied SYN-only (not per-packet)
 - Cache ETag support with If-None-Match / 304 responses
 - Optional SHA-256-derived ETag generation for cached bodies
@@ -545,10 +558,13 @@ All maps pinned under `/sys/fs/bpf/vortex/`:
 | Map | Type | Key | Value | Purpose |
 |---|---|---|---|---|
 | `rate_limit_map` | LRU_HASH (64K) | src IPv4 | token bucket entry | SYN rate limiting |
+| `rate_limit_map_v6` | LRU_HASH (64K) | src IPv6 | token bucket entry | SYN rate limiting |
 | `blocklist_map` | HASH (10K) | src IPv4 | u8 flag | IP blocklist |
+| `blocklist_map_v6` | HASH (10K) | src IPv6 | u8 flag | IP blocklist |
 | `metrics_map` | PERCPU_ARRAY (1) | 0 | `vortex_metrics` | per-CPU counters |
 | `rate_config_map` | ARRAY (1) | 0 | `rate_config` | global rate limit config |
 | `conn_track_map` | LRU_HASH (128K) | `conn_tuple` (5-tuple) | `conn_state` | TCP state machine |
+| `conn_track_map_v6` | LRU_HASH (128K) | `conn_tuple_v6` (5-tuple) | `conn_state` | TCP state machine |
 
 ### kTLS fast path
 
@@ -575,7 +591,7 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 - **IPv6 extension headers** in the XDP program are allowlisted: plain TCP plus common hop-by-hop, routing, destination-options, and initial-fragment layouts are handled; unknown extension chains and non-initial fragments are dropped at XDP
 - **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
-- **Backend connections** are synchronous blocking connects (set non-blocking after connect); async io_uring CONNECT is planned
+- **Backend connections** use async non-blocking connect; origin I/O remains protocol-specific after connect
 - **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can still stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Pooled TLS backends reuse the live origin socket and `SSL*` state across requests when the response is framing-safe to return to the pool; repeated fresh connections also reuse cached client TLS sessions when the origin permits resumption.
 - **Backend TLS verification** is enabled by default. Per backend, set `verify_peer: false` or `insecure_skip_verify: true` to ignore certificate-chain and hostname validity checks for that origin.
 - **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
@@ -590,20 +606,31 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 ```
 src/        Core proxy engine
-  main.c    Entry point, signal handling, lifecycle
-  worker.c  io_uring event loop, proxy data path, tarpit, header rewrites
-  conn.c/h  Connection pool (hot/cold split, cache-line aligned)
-  router.c  SNI route lookup, backend selection (LB algorithms)
-  tls.c     OpenSSL 4.0 TLS context, accept, kTLS install, cert rotation
-  cache.c   Response cache (RAM+disk slab, LRU index, configurable ETag hashing)
-  auth.c    HTTP Basic Auth
-  metrics.c Prometheus HTTP server
-  log.c     Structured JSON/text logger
-  config.c  YAML config parser with env-var expansion
-  bpf_loader.c  libbpf wrapper: load, attach, map accessors
-  uring.c   io_uring helpers (init, submit, timeout)
-  quic.c    HTTP/3 server (ngtcp2 + nghttp3, conditional)
-  util.h    xxhash64, rdtsc
+  main.c            Entry point, signal handling, lifecycle
+  worker.c          Worker init/teardown and io_uring event loop
+  worker_accept.c   Accept path, SNI pre-check, tarpit
+  worker_backend.c  Backend connect and HTTPS origin handling
+  worker_cache.c    Cache hit/store helpers
+  worker_compress.c Response compression helpers
+  worker_h2.c       HTTP/2 frontend path
+  worker_proxy.c    HTTP/1.x proxy state machine and header rewrites
+  conn.c            Connection pool (hot/cold split, cache-line aligned)
+  router.c          SNI route lookup, backend selection (LB algorithms)
+  tls.c             OpenSSL 4.0 TLS context, accept, kTLS install, cert rotation
+  tls_pool.c        Shared TLS handshake offload pool
+  compress_pool.c   Shared compression offload pool
+  pool.c            Shared backend keep-alive pool
+  cache.c           Response cache (RAM+disk slab, LRU index, ETag/CRC support)
+  auth.c            HTTP Basic Auth
+  metrics.c         Prometheus HTTP server
+  dashboard.c       Live dashboard HTTP/WebSocket server
+  log.c             Structured JSON/text logger
+  config.c          YAML config parser with env-var expansion
+  bpf_loader.c      libbpf wrapper: load, attach, map accessors
+  uring.c           io_uring helpers (init, submit, timeout)
+  quic.c            HTTP/3 server (ngtcp2 + nghttp3, conditional)
+  simd.c            SIMD helpers and CPU-feature probes
+  util.h            utility helpers
 
 bpf/
   vortex_xdp.bpf.c  XDP kernel program
@@ -623,6 +650,7 @@ tests/
   test_config.c
   test_cache.c
   test_log.c
+  test_router.c
 
 tools/
   gen_vmlinux.sh     Regenerate bpf/vmlinux.h from running kernel
