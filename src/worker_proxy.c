@@ -1530,6 +1530,8 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
         }
         return;
     }
+    h->send_buf_off = 0;
+    h->send_buf_len = (uint32_t)fwd_n;
     struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
     if (!sqe) { conn_close(w, cid, true); return; }
     PREP_SEND(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
@@ -1543,6 +1545,19 @@ static void handle_send_backend(struct worker *w, struct io_uring_cqe *cqe, uint
     int n = cqe->res;
     log_debug("send_backend", "conn=%u n=%d", cid, n);
     if (n < 0) { conn_close(w, cid, true); return; }
+    h->send_buf_off += (uint32_t)n;
+    if (h->send_buf_off < h->send_buf_len) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+        if (!sqe) { conn_close(w, cid, true); return; }
+        PREP_SEND(w, sqe, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+            conn_recv_buf(&w->pool, cid) + h->send_buf_off,
+            h->send_buf_len - h->send_buf_off, MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
+        uring_submit(&w->uring);
+        return;
+    }
+    h->send_buf_off = 0;
+    h->send_buf_len = 0;
     /* All client data forwarded — arm deadline then wait for backend response */
     backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
     if (backend_uses_tls(w, cid)) {
@@ -1844,6 +1859,8 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
             return;
         }
 
+        h->send_buf_off = 0;
+        h->send_buf_len = (uint32_t)fwd_n;
         struct io_uring_sqe *sqe_s = io_uring_get_sqe(&w->uring.ring);
         if (!sqe_s) { conn_close(w, cid, true); return; }
         PREP_SEND(w, sqe_s, h->backend_fd, FIXED_FD_BACKEND(w, cid),
