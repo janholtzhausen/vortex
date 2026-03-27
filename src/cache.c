@@ -100,11 +100,12 @@ static void *alloc_aligned(size_t size, bool try_hugepages)
 int cache_init(struct cache *c, uint32_t index_entries,
                size_t slab_size, bool try_hugepages,
                const char *disk_path, size_t disk_size,
-               bool etag_sha256)
+               bool etag_sha256, bool verify_crc)
 {
     memset(c, 0, sizeof(*c));
     pthread_mutex_init(&c->lock, NULL);
     c->etag_sha256 = etag_sha256;
+    c->verify_crc = verify_crc;
 
     /* Round up index_entries to power of 2 */
     if (!IS_POWER_OF_2(index_entries)) {
@@ -215,7 +216,7 @@ static struct cache_index_entry *cache_lookup_locked(struct cache *c,
         }
 
         if (e->url_hash == hash) {
-            uint8_t klen = (uint8_t)(url_len > 16 ? 16 : url_len);
+            uint8_t klen = (uint8_t)(url_len > 12 ? 12 : url_len);
             if (e->url_key_len != klen || memcmp(e->url_key, url, klen) != 0) {
                 c->misses++;
                 return NULL;
@@ -326,16 +327,22 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
         c->slab_watermark += total;
     }
 
+    const uint8_t *stored = use_disk
+        ? c->disk_slab + (slab_off & ~CACHE_SLAB_DISK_FLAG)
+        : c->slab + slab_off;
+    uint32_t crc32c = crc32c_hw(stored, total);
+
     /* Insert into hash table using Robin Hood */
     uint64_t hash = xxhash64(url, url_len);
     uint32_t confirm = fnv1a(url, url_len);
     size_t   slot = hash & c->index_mask;
     uint32_t now  = coarse_now();
 
-    uint8_t klen = (uint8_t)(url_len > 16 ? 16 : url_len);
+    uint8_t klen = (uint8_t)(url_len > 12 ? 12 : url_len);
     struct cache_index_entry new_entry = {
         .url_hash         = hash,
         .body_etag        = etag,
+        .crc32c           = crc32c,
         .slab_offset      = slab_off,
         .body_len         = (uint32_t)body_len,
         .header_len       = (uint32_t)header_len,
@@ -407,6 +414,23 @@ int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
 
     const uint8_t *resp = cache_response_ptr(c, e);
     size_t total = e->header_len + e->body_len;
+    if (!resp || total == 0) {
+        if (e) e->flags = 0;
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
+    if (c->verify_crc) {
+        uint32_t actual = crc32c_hw(resp, total);
+        if (actual != e->crc32c) {
+            log_warn("cache_crc", "crc mismatch url=%.*s expected=%08x actual=%08x",
+                     (int)url_len, url, e->crc32c, actual);
+            e->flags = 0;
+            c->evictions++;
+            c->misses++;
+            pthread_mutex_unlock(&c->lock);
+            return -1;
+        }
+    }
     out->data = malloc(total);
     if (!out->data) {
         pthread_mutex_unlock(&c->lock);

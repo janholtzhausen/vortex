@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#ifdef __SSE4_2__
+#include <nmmintrin.h>
+#endif
 
 /* Branch prediction hints */
 #define likely(x)   __builtin_expect(!!(x), 1)
@@ -97,4 +100,33 @@ static inline uint64_t xxhash64(const void *data, size_t len) {
 
     h64 ^= h64 >> 33; h64 *= PRIME2; h64 ^= h64 >> 29; h64 *= PRIME3; h64 ^= h64 >> 32;
     return h64;
+}
+
+static inline uint32_t crc32c_hw(const uint8_t *data, size_t len)
+{
+#ifdef __SSE4_2__
+    uint64_t crc = 0xFFFFFFFFu;
+    const uint8_t *p = data;
+
+    while (len >= 8) {
+        uint64_t v;
+        memcpy(&v, p, sizeof(v));
+        crc = _mm_crc32_u64(crc, v);
+        p += 8;
+        len -= 8;
+    }
+    while (len--)
+        crc = _mm_crc32_u8((uint32_t)crc, *p++);
+    return (uint32_t)crc ^ 0xFFFFFFFFu;
+#else
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0x82F63B78u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+#endif
 }

@@ -141,6 +141,7 @@ struct tls_config {
 struct cache_config {
     bool     enabled;
     bool     etag_sha256;
+    bool     verify_crc;
     uint32_t index_entries;
     uint64_t slab_size_bytes;        /* 0 = auto (30% of system RAM) */
     uint32_t default_ttl;

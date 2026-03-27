@@ -23,6 +23,7 @@ typedef enum {
 struct __attribute__((packed, aligned(64))) cache_index_entry {
     uint64_t url_hash;
     uint64_t body_etag;       /* configured 64-bit ETag fingerprint of response body */
+    uint32_t crc32c;
     uint32_t slab_offset;
     uint32_t body_len;
     uint32_t header_len;
@@ -33,14 +34,14 @@ struct __attribute__((packed, aligned(64))) cache_index_entry {
     uint8_t  flags;
     uint8_t  hit_count;
     uint8_t  content_type;
-    uint8_t  url_key_len;     /* bytes stored (0..16) */
+    uint8_t  url_key_len;     /* bytes stored (0..12) */
     uint32_t url_hash_confirm;/* FNV-1a of full URL — secondary collision check */
-    /* Collision guard: first min(key_len,16) bytes of the cache key.
+    /* Collision guard: first min(key_len,12) bytes of the cache key.
      * Combined with the 64-bit hash and secondary FNV-1a confirm hash
      * this makes a false-positive essentially impossible while keeping
      * the entry at 64 bytes.
-     * 8+8+4+4+4+4+4+2+2+1+1+1+1+4+16 = 64 */
-    char     url_key[16];     /* first 16 bytes of "host|path" key */
+     * 8+8+4+4+4+4+4+2+2+1+1+1+1+4+12 = 60 (+4 alignment padding) */
+    char     url_key[12];     /* first 12 bytes of "host|path" key */
 };
 _Static_assert(sizeof(struct cache_index_entry) == 64,
     "cache_index_entry must be exactly 64 bytes");
@@ -68,6 +69,7 @@ struct cache {
     uint64_t evictions;
     uint64_t stores;
     bool     etag_sha256;
+    bool     verify_crc;
 };
 
 struct cached_response {
@@ -86,7 +88,7 @@ uint64_t cache_compute_body_etag(bool etag_sha256,
 int   cache_init(struct cache *c, uint32_t index_entries,
                  size_t slab_size, bool try_hugepages,
                  const char *disk_path, size_t disk_size,
-                 bool etag_sha256);
+                 bool etag_sha256, bool verify_crc);
 void  cache_destroy(struct cache *c);
 
 /* Look up a URL. Returns index entry pointer (may be STALE), or NULL on miss.

@@ -17,7 +17,7 @@ static int g_failed = 0;
 static void test_init_destroy(void)
 {
     struct cache c;
-    int r = cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
+    int r = cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
     CHECK(r == 0, "cache_init succeeds");
     CHECK(c.index != NULL, "index allocated");
     CHECK(c.slab != NULL, "slab allocated");
@@ -30,7 +30,7 @@ static void test_power_of_two(void)
 {
     struct cache c;
     /* Non-power-of-two should be rounded up */
-    int r = cache_init(&c, 100, 1024 * 1024, false, NULL, 0, false);
+    int r = cache_init(&c, 100, 1024 * 1024, false, NULL, 0, false, false);
     CHECK(r == 0, "init with 100 entries");
     CHECK(c.index_capacity == 128, "rounded up to 128");
     cache_destroy(&c);
@@ -39,7 +39,7 @@ static void test_power_of_two(void)
 static void test_miss(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
     struct cache_index_entry *e = cache_lookup(&c, "/notfound", 9);
     CHECK(e == NULL, "lookup miss returns NULL");
@@ -52,7 +52,7 @@ static void test_miss(void)
 static void test_store_and_hit(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
     const char *url  = "/api/v1/data";
     const char *body = "hello world";
@@ -80,7 +80,7 @@ static void test_store_and_hit(void)
 static void test_valid_expired(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
     const char *url  = "/short";
     const char *body = "data";
@@ -103,7 +103,7 @@ static void test_valid_expired(void)
 static void test_multiple_entries(void)
 {
     struct cache c;
-    cache_init(&c, 64, 2 * 1024 * 1024, false, NULL, 0, false);
+    cache_init(&c, 64, 2 * 1024 * 1024, false, NULL, 0, false, false);
 
     /* Store 10 entries */
     char url[64], body[64];
@@ -134,7 +134,7 @@ static void test_multiple_entries(void)
 static void test_update_existing(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
     const char *url = "/update";
     cache_store(&c, url, strlen(url), 200, 60,
@@ -153,7 +153,7 @@ static void test_update_existing(void)
 static void test_evict(void)
 {
     struct cache c;
-    cache_init(&c, 8, 1024 * 1024, false, NULL, 0, false);
+    cache_init(&c, 8, 1024 * 1024, false, NULL, 0, false, false);
 
     /* Fill to capacity (8 slots with RH probing) */
     char url[32], body[32];
@@ -180,7 +180,7 @@ static void test_slab_wrap(void)
 {
     struct cache c;
     /* Very small slab to force wrap */
-    cache_init(&c, 64, 4096, false, NULL, 0, false);
+    cache_init(&c, 64, 4096, false, NULL, 0, false, false);
 
     /* Store entries until slab wraps */
     char url[32];
@@ -203,9 +203,9 @@ static void test_sha256_etag_toggle(void)
     const char *url  = "/etag";
     const char *body = "etag-body";
 
-    CHECK(cache_init(&c_xx, 64, 1024 * 1024, false, NULL, 0, false) == 0,
+    CHECK(cache_init(&c_xx, 64, 1024 * 1024, false, NULL, 0, false, false) == 0,
           "cache_init xxhash etag");
-    CHECK(cache_init(&c_sha, 64, 1024 * 1024, false, NULL, 0, true) == 0,
+    CHECK(cache_init(&c_sha, 64, 1024 * 1024, false, NULL, 0, true, false) == 0,
           "cache_init sha256 etag");
 
     CHECK(cache_store(&c_xx, url, strlen(url), 200, 60, NULL, 0,
@@ -229,6 +229,30 @@ static void test_sha256_etag_toggle(void)
     cache_destroy(&c_sha);
 }
 
+static void test_crc_verify_corruption(void)
+{
+    struct cache c;
+    const char *url = "/crc";
+    const char *body = "crc-body";
+    struct cached_response out;
+
+    CHECK(cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, true) == 0,
+          "cache_init crc verify");
+    CHECK(cache_store(&c, url, strlen(url), 200, 60, NULL, 0,
+                      (const uint8_t *)body, strlen(body)) == 0,
+          "store crc-protected entry");
+
+    struct cache_index_entry *e = cache_lookup(&c, url, strlen(url));
+    CHECK(e != NULL, "crc entry lookup");
+    const uint8_t *bp = cache_body_ptr(&c, e);
+    CHECK(bp != NULL, "crc body pointer valid");
+    ((uint8_t *)bp)[0] ^= 0x01;
+
+    CHECK(cache_fetch_copy(&c, url, strlen(url), &out) == -1,
+          "crc mismatch invalidates corrupted entry");
+    cache_destroy(&c);
+}
+
 int main(void)
 {
     log_init(LOG_ERROR, LOG_FMT_TEXT, NULL);
@@ -243,6 +267,7 @@ int main(void)
     test_evict();
     test_slab_wrap();
     test_sha256_etag_toggle();
+    test_crc_verify_corruption();
 
     printf("cache tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed ? 1 : 0;

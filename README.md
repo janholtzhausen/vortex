@@ -64,6 +64,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - 64-byte cache index entries, one per cache line; hugepage-backed index for TLB efficiency
 - LRU eviction; per-URL TTL selection based on path/extension patterns
 - **ETag support** — body fingerprint stored as ETag; default `xxhash64`, optional SHA-256-derived 64-bit value via `cache.etag_sha256`; `If-None-Match` → 304 Not Modified
+- Optional CRC32C cache integrity verification via `cache.verify_crc`; corrupted RAM/disk-slab entries are invalidated and treated as misses
 - `X-Cache: HIT` header injected on cache hits
 - URL-pattern-driven Cache-Control rewrite:
   - Static assets (images, fonts, bundles): `public, max-age=N, immutable`
@@ -381,6 +382,8 @@ xdp:
 
 cache:
   enabled: true
+  etag_sha256: false      # Use SHA-256-derived 64-bit ETags instead of xxhash64
+  verify_crc: false       # Verify cached headers+body with CRC32C on fetch
   index_entries: 16384     # Number of URL slots (power of 2 recommended)
   slab_size_mb: 64         # RAM slab size; default = 30% of system RAM
   default_ttl: 300         # Default TTL in seconds

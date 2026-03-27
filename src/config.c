@@ -93,6 +93,7 @@ void config_set_defaults(struct vortex_config *cfg)
     /* Cache defaults — slab sized to 30% of system RAM */
     cfg->cache.enabled       = true;
     cfg->cache.etag_sha256   = false;
+    cfg->cache.verify_crc    = false;
     cfg->cache.index_entries = 16384;
     {
         long pages = sysconf(_SC_PHYS_PAGES);
@@ -241,6 +242,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
     case P_CACHE:
         if      (!strcmp(k, "enabled"))          c->cache.enabled          = !strcmp(val,"true");
         else if (!strcmp(k, "etag_sha256"))      c->cache.etag_sha256      = !strcmp(val,"true") || !strcmp(val,"yes");
+        else if (!strcmp(k, "verify_crc"))       c->cache.verify_crc       = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "index_entries"))    c->cache.index_entries    = (uint32_t)atol(val);
         else if (!strcmp(k, "slab_size_mb"))     c->cache.slab_size_bytes  = (uint64_t)atol(val) * 1024 * 1024;
         else if (!strcmp(k, "default_ttl"))      c->cache.default_ttl      = (uint32_t)atol(val);

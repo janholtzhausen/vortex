@@ -64,6 +64,9 @@ cache:
   # instead of xxhash64(body). OpenSSL uses SHA-NI automatically when the CPU
   # supports it.
   etag_sha256: false
+  # When true, cached headers+body are verified with CRC32C before serving.
+  # Corrupted cache entries are invalidated and treated as misses.
+  verify_crc: false
   index_entries: 4096
   slab_size_mb: 64
   default_ttl: 300
