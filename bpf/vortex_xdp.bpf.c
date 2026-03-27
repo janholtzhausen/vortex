@@ -327,14 +327,14 @@ int vortex_xdp_main(struct xdp_md *ctx)
                 nexthdr = frag->nexthdr;
                 off += sizeof(*frag);
                 if ((bpf_ntohs(frag->frag_off) & 0xfff8) != 0)
-                    goto pass;
+                    goto drop_invalid;
                 continue;
             }
-            goto pass;
+            goto drop_invalid;
         }
 
         if (nexthdr != IPPROTO_TCP)
-            goto pass;
+            goto drop_invalid;
 
         struct tcphdr *tcp6 = (void *)ip6 + off;
         if ((void *)(tcp6 + 1) > data_end)
@@ -379,6 +379,10 @@ pass:
 pass_invalid:
     if (m) m->dropped_invalid++;
     return XDP_PASS;
+
+drop_invalid:
+    if (m) m->dropped_invalid++;
+    return XDP_DROP;
 }
 
 char _license[] SEC("license") = "GPL";

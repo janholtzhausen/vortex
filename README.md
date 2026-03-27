@@ -573,7 +573,7 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 ## Known Limitations
 
-- **IPv6 extension headers** in the XDP program are handled for the common hop-by-hop, routing, destination-options, and fragment cases; uncommon extension chains still fall back to pass-through rather than deep normalization
+- **IPv6 extension headers** in the XDP program are allowlisted: plain TCP plus common hop-by-hop, routing, destination-options, and initial-fragment layouts are handled; unknown extension chains and non-initial fragments are dropped at XDP
 - **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
 - **Backend connections** are synchronous blocking connects (set non-blocking after connect); async io_uring CONNECT is planned
 - **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can still stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Pooled TLS backends reuse the live origin socket and `SSL*` state across requests when the response is framing-safe to return to the pool; repeated fresh connections also reuse cached client TLS sessions when the origin permits resumption.
