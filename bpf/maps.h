@@ -21,6 +21,10 @@ struct rate_limit_entry {
     __u64 last_refill_ns;   /* ktime_get_ns() at last refill */
 };
 
+struct ip6_addr {
+    __u8 addr[16];
+};
+
 /* Aggregate metrics — fetched by userspace from per-CPU array */
 struct vortex_metrics {
     __u64 rx_packets;
@@ -71,6 +75,15 @@ struct conn_tuple {
     __be16 dst_port;
     __u8   proto;
     __u8   _pad[3];   /* must be zero — part of the map key */
+};
+
+struct conn_tuple_v6 {
+    struct ip6_addr src_ip;
+    struct ip6_addr dst_ip;
+    __be16          src_port;
+    __be16          dst_port;
+    __u8            proto;
+    __u8            _pad[3];
 };
 
 /* Per-connection tracking state */

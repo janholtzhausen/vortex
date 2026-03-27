@@ -185,7 +185,7 @@ struct vortex_config {
     /* When true (default), bind an AF_INET socket only.
      * When false, bind an AF_INET6 socket with IPV6_V6ONLY=0 for dual-stack
      * (accepts both IPv4-mapped and native IPv6 connections on one fd).
-     * Note: XDP/tarpit blocklist is IPv4-only regardless of this setting. */
+     * Note: XDP blocklist, rate limiting, and conntrack cover both IPv4 and IPv6. */
     bool     ipv4_only;
     char     bind_address[64];
     uint16_t bind_port;

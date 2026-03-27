@@ -31,7 +31,7 @@ struct route_sample {
 };
 
 struct blocked_ip {
-    uint32_t ip_host;
+    struct vortex_ip_addr ip;
     time_t   expire_at;
 };
 
@@ -242,11 +242,19 @@ static void send_http_simple(int fd, const char *status, const char *ctype,
     }
 }
 
-static void ipv4_to_str(uint32_t ip_host, char buf[INET_ADDRSTRLEN])
+static void ip_to_str(const struct vortex_ip_addr *ip, char buf[INET6_ADDRSTRLEN])
 {
-    struct in_addr addr = { .s_addr = htonl(ip_host) };
-    if (!inet_ntop(AF_INET, &addr, buf, INET_ADDRSTRLEN))
-        snprintf(buf, INET_ADDRSTRLEN, "0.0.0.0");
+    if (!ip || ip->family == 0) {
+        snprintf(buf, INET6_ADDRSTRLEN, "unknown");
+        return;
+    }
+    if (ip->family == AF_INET) {
+        if (!inet_ntop(AF_INET, ip->addr, buf, INET6_ADDRSTRLEN))
+            snprintf(buf, INET6_ADDRSTRLEN, "0.0.0.0");
+        return;
+    }
+    if (!inet_ntop(AF_INET6, ip->addr, buf, INET6_ADDRSTRLEN))
+        snprintf(buf, INET6_ADDRSTRLEN, "::");
 }
 
 static void format_hms_utc(char out[16], time_t now)
@@ -278,7 +286,8 @@ static void collect_blocked_ips(struct dashboard_server *ds,
             struct blocked_entry *be = &w->blocked_list[idx];
             bool merged = false;
             for (size_t j = 0; j < used; j++) {
-                if (ips[j].ip_host == be->ip_host) {
+                if (ips[j].ip.family == be->ip.family &&
+                    memcmp(ips[j].ip.addr, be->ip.addr, sizeof(be->ip.addr)) == 0) {
                     if (be->expire_at > ips[j].expire_at)
                         ips[j].expire_at = be->expire_at;
                     merged = true;
@@ -286,7 +295,7 @@ static void collect_blocked_ips(struct dashboard_server *ds,
                 }
             }
             if (!merged && used < total) {
-                ips[used].ip_host = be->ip_host;
+                ips[used].ip = be->ip;
                 ips[used].expire_at = be->expire_at;
                 used++;
             }
@@ -454,8 +463,8 @@ static int build_snapshot_json(struct dashboard_server *ds,
     }
 
     for (size_t i = 0; i < blocked_count; i++) {
-        char ipbuf[INET_ADDRSTRLEN];
-        ipv4_to_str(blocked[i].ip_host, ipbuf);
+        char ipbuf[INET6_ADDRSTRLEN];
+        ip_to_str(&blocked[i].ip, ipbuf);
         long ttl = (long)(blocked[i].expire_at - now_wall);
         if (appendf(buf, bufsz, &pos,
             "%s{\"ip\":\"%s\",\"ttl_seconds\":%ld}",

@@ -89,7 +89,7 @@ int peek_client_hello_sni(int fd, char *out, size_t out_max)
  */
 void tarpit_conn(struct worker *w, int fd)
 {
-    uint32_t stored_ip = 0;
+    struct vortex_ip_addr stored_ip = {0};
 
     /* Clamp receive window to 1 — attacker can only send 1 byte at a time */
     int clamp = 1;
@@ -102,10 +102,15 @@ void tarpit_conn(struct worker *w, int fd)
         if (getpeername(fd, (struct sockaddr *)&ss, &slen) == 0) {
             char ipstr[64] = {0};
             if (ss.ss_family == AF_INET) {
-                stored_ip = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+                stored_ip.family = AF_INET;
+                memcpy(stored_ip.addr,
+                       &((struct sockaddr_in *)&ss)->sin_addr.s_addr, 4);
                 inet_ntop(AF_INET,
                     &((struct sockaddr_in *)&ss)->sin_addr, ipstr, sizeof(ipstr));
             } else {
+                stored_ip.family = AF_INET6;
+                memcpy(stored_ip.addr,
+                       &((struct sockaddr_in6 *)&ss)->sin6_addr, 16);
                 inet_ntop(AF_INET6,
                     &((struct sockaddr_in6 *)&ss)->sin6_addr, ipstr, sizeof(ipstr));
             }
@@ -137,21 +142,23 @@ void tarpit_conn(struct worker *w, int fd)
     if (w->tarpit_count == WORKER_TARPIT_MAX) {
         /* Evict oldest — move its IP into the XDP blocklist for 60 minutes */
         int evict_fd = w->tarpit_fds[w->tarpit_head];
-        uint32_t evict_ip = w->tarpit_ips[w->tarpit_head];
+        struct vortex_ip_addr evict_ip = w->tarpit_ips[w->tarpit_head];
         if (evict_fd >= 0) {
-            if (evict_ip != 0) {
-                if (bpf_blocklist_add(evict_ip) == 0 &&
+            if (evict_ip.family != 0) {
+                if (bpf_blocklist_add_addr(&evict_ip) == 0 &&
                     w->blocked_count < WORKER_BLOCKED_MAX) {
                     struct blocked_entry *be =
                         &w->blocked_list[w->blocked_tail];
-                    be->ip_host   = evict_ip;
+                    be->ip = evict_ip;
                     be->expire_at = time(NULL) + WORKER_BLOCK_TTL_SECS;
                     w->blocked_tail =
                         (w->blocked_tail + 1) % WORKER_BLOCKED_MAX;
                     w->blocked_count++;
-                    struct in_addr a = { .s_addr = htonl(evict_ip) };
-                    char evict_ip_str[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &a, evict_ip_str, sizeof(evict_ip_str));
+                    char evict_ip_str[INET6_ADDRSTRLEN];
+                    if (evict_ip.family == AF_INET)
+                        inet_ntop(AF_INET, evict_ip.addr, evict_ip_str, sizeof(evict_ip_str));
+                    else
+                        inet_ntop(AF_INET6, evict_ip.addr, evict_ip_str, sizeof(evict_ip_str));
                     log_info("tarpit_block", "ip=%s blocked for %ds",
                              evict_ip_str, WORKER_BLOCK_TTL_SECS);
                 }

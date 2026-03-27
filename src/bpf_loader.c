@@ -24,9 +24,12 @@ static struct bpf_link    *g_link     = NULL;
 static int                 g_ifindex  = -1;
 static int                 g_map_rate_limit_fd  = -1;
 static int                 g_map_blocklist_fd   = -1;
+static int                 g_map_rate_limit_v6_fd  = -1;
+static int                 g_map_blocklist_v6_fd   = -1;
 static int                 g_map_metrics_fd     = -1;
 static int                 g_map_rate_config_fd = -1;
 static int                 g_map_conntrack_fd   = -1;
+static int                 g_map_conntrack_v6_fd = -1;
 static int                 g_xdp_active         = 0;
 
 /* Suppress verbose libbpf logs unless VORTEX_DEBUG is set */
@@ -131,11 +134,27 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
         bpf_map__pin(map, pin_path);
     }
 
+    map = bpf_object__find_map_by_name(g_obj, "rate_limit_map_v6");
+    if (map) {
+        g_map_rate_limit_v6_fd = bpf_map__fd(map);
+        char pin_path[256];
+        snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/rate_limit_map_v6");
+        bpf_map__pin(map, pin_path);
+    }
+
     map = bpf_object__find_map_by_name(g_obj, "blocklist_map");
     if (map) {
         g_map_blocklist_fd = bpf_map__fd(map);
         char pin_path[256];
         snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/blocklist_map");
+        bpf_map__pin(map, pin_path);
+    }
+
+    map = bpf_object__find_map_by_name(g_obj, "blocklist_map_v6");
+    if (map) {
+        g_map_blocklist_v6_fd = bpf_map__fd(map);
+        char pin_path[256];
+        snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/blocklist_map_v6");
         bpf_map__pin(map, pin_path);
     }
 
@@ -167,6 +186,18 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
         log_warn("bpf_loader", "conn_track_map not found in BPF object");
     }
 
+    map = bpf_object__find_map_by_name(g_obj, "conn_track_map_v6");
+    if (map) {
+        g_map_conntrack_v6_fd = bpf_map__fd(map);
+        char pin_path[256];
+        snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/conn_track_map_v6");
+        bpf_map__pin(map, pin_path);
+        log_info("bpf_loader", "ipv6 conntrack map loaded: max_entries=%u",
+            CT_MAP_MAX_ENTRIES);
+    } else {
+        log_warn("bpf_loader", "conn_track_map_v6 not found in BPF object");
+    }
+
     g_xdp_active = 1;
     log_info("bpf_loader", "BPF loader initialised: obj=%s if=%s ifindex=%d",
         bpf_obj_path, ifname, g_ifindex);
@@ -188,10 +219,13 @@ void bpf_loader_detach(void)
     /* Unpin maps */
     char path[256];
     snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_limit_map");  unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_limit_map_v6"); unlink(path);
     snprintf(path, sizeof(path), BPF_PIN_DIR "/blocklist_map");   unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/blocklist_map_v6"); unlink(path);
     snprintf(path, sizeof(path), BPF_PIN_DIR "/metrics_map");     unlink(path);
     snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_config_map"); unlink(path);
     snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map");  unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map_v6"); unlink(path);
     rmdir(BPF_PIN_DIR);
 
     if (g_obj) {
@@ -216,6 +250,36 @@ int bpf_blocklist_remove(uint32_t ip_host)
     if (g_map_blocklist_fd < 0) return -1;
     uint32_t key = htonl(ip_host);
     return bpf_map_delete_elem(g_map_blocklist_fd, &key);
+}
+
+int bpf_blocklist_add_addr(const struct vortex_ip_addr *ip)
+{
+    if (!ip) return -1;
+    if (ip->family == AF_INET) {
+        if (g_map_blocklist_fd < 0) return -1;
+        uint8_t val = 1;
+        return bpf_map_update_elem(g_map_blocklist_fd, ip->addr, &val, BPF_ANY);
+    }
+    if (ip->family == AF_INET6) {
+        if (g_map_blocklist_v6_fd < 0) return -1;
+        uint8_t val = 1;
+        return bpf_map_update_elem(g_map_blocklist_v6_fd, ip->addr, &val, BPF_ANY);
+    }
+    return -1;
+}
+
+int bpf_blocklist_remove_addr(const struct vortex_ip_addr *ip)
+{
+    if (!ip) return -1;
+    if (ip->family == AF_INET) {
+        if (g_map_blocklist_fd < 0) return -1;
+        return bpf_map_delete_elem(g_map_blocklist_fd, ip->addr);
+    }
+    if (ip->family == AF_INET6) {
+        if (g_map_blocklist_v6_fd < 0) return -1;
+        return bpf_map_delete_elem(g_map_blocklist_v6_fd, ip->addr);
+    }
+    return -1;
 }
 
 int bpf_rate_limit_set(uint32_t ip_host, uint64_t tokens_per_sec)
@@ -252,6 +316,7 @@ int bpf_metrics_read(struct vortex_metrics *out)
             out->dropped_blocklist += per_cpu[i].dropped_blocklist;
             out->dropped_invalid   += per_cpu[i].dropped_invalid;
             out->passed            += per_cpu[i].passed;
+            out->dropped_conntrack += per_cpu[i].dropped_conntrack;
         }
     }
 
@@ -297,16 +362,26 @@ int bpf_rate_config_set(uint32_t tokens_per_sec, uint32_t burst)
 
 int bpf_blocklist_clear(void)
 {
-    if (g_map_blocklist_fd < 0) return 0;
+    if (g_map_blocklist_fd >= 0) {
+        __be32 key, next_key;
+        int ret = bpf_map_get_next_key(g_map_blocklist_fd, NULL, &key);
+        while (ret == 0) {
+            int next_ret = bpf_map_get_next_key(g_map_blocklist_fd, &key, &next_key);
+            bpf_map_delete_elem(g_map_blocklist_fd, &key);
+            if (next_ret != 0) break;
+            key = next_key;
+        }
+    }
 
-    /* Iterate and delete all keys */
-    __be32 key, next_key;
-    int ret = bpf_map_get_next_key(g_map_blocklist_fd, NULL, &key);
-    while (ret == 0) {
-        int next_ret = bpf_map_get_next_key(g_map_blocklist_fd, &key, &next_key);
-        bpf_map_delete_elem(g_map_blocklist_fd, &key);
-        if (next_ret != 0) break;
-        key = next_key;
+    if (g_map_blocklist_v6_fd >= 0) {
+        struct ip6_addr key, next_key;
+        int ret = bpf_map_get_next_key(g_map_blocklist_v6_fd, NULL, &key);
+        while (ret == 0) {
+            int next_ret = bpf_map_get_next_key(g_map_blocklist_v6_fd, &key, &next_key);
+            bpf_map_delete_elem(g_map_blocklist_v6_fd, &key);
+            if (next_ret != 0) break;
+            key = next_key;
+        }
     }
     return 0;
 }
@@ -336,14 +411,20 @@ int bpf_blocklist_load_file(const char *path)
             *end-- = '\0';
         }
 
-        struct in_addr addr;
-        if (inet_aton(p, &addr) == 0) {
+        struct vortex_ip_addr ip = {0};
+        struct in_addr addr4;
+        struct in6_addr addr6;
+        if (inet_pton(AF_INET, p, &addr4) == 1) {
+            ip.family = AF_INET;
+            memcpy(ip.addr, &addr4.s_addr, sizeof(addr4.s_addr));
+        } else if (inet_pton(AF_INET6, p, &addr6) == 1) {
+            ip.family = AF_INET6;
+            memcpy(ip.addr, &addr6, sizeof(addr6));
+        } else {
             log_warn("bpf_blocklist", "invalid IP in blocklist: '%s'", p);
             continue;
         }
-        /* inet_aton fills addr.s_addr in network byte order;
-         * bpf_blocklist_add expects host byte order and does htonl internally. */
-        if (bpf_blocklist_add(ntohl(addr.s_addr)) == 0)
+        if (bpf_blocklist_add_addr(&ip) == 0)
             count++;
     }
     fclose(f);

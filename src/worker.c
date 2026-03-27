@@ -115,7 +115,7 @@ static void *worker_thread(void *arg)
                     struct blocked_entry *be =
                         &w->blocked_list[w->blocked_head];
                     if (be->expire_at > now_t) break;
-                    bpf_blocklist_remove(be->ip_host);
+                    bpf_blocklist_remove_addr(&be->ip);
                     w->blocked_head =
                         (w->blocked_head + 1) % WORKER_BLOCKED_MAX;
                     w->blocked_count--;
@@ -482,7 +482,7 @@ void worker_destroy(struct worker *w)
     /* Remove any still-live blocklist entries so they don't persist across restarts */
     for (uint32_t i = 0; i < w->blocked_count; i++) {
         uint32_t bi = (w->blocked_head + i) % WORKER_BLOCKED_MAX;
-        bpf_blocklist_remove(w->blocked_list[bi].ip_host);
+        bpf_blocklist_remove_addr(&w->blocked_list[bi].ip);
     }
 
     if (w->listen_fd >= 0) { close(w->listen_fd); w->listen_fd = -1; }

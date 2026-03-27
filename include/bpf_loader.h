@@ -1,10 +1,16 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "../bpf/maps.h"
 
 /* Forward declaration — full definition in config.h */
 struct xdp_config;
+
+struct vortex_ip_addr {
+    uint8_t family; /* AF_INET / AF_INET6, 0 = unset */
+    uint8_t addr[16];
+};
 
 int  bpf_loader_init(const char *bpf_obj_path, const char *ifname);
 void bpf_loader_detach(void);
@@ -12,6 +18,8 @@ void bpf_loader_detach(void);
 /* BPF map accessors — per-IP */
 int  bpf_blocklist_add(uint32_t ip_host);
 int  bpf_blocklist_remove(uint32_t ip_host);
+int  bpf_blocklist_add_addr(const struct vortex_ip_addr *ip);
+int  bpf_blocklist_remove_addr(const struct vortex_ip_addr *ip);
 int  bpf_rate_limit_set(uint32_t ip_host, uint64_t tokens_per_sec);
 int  bpf_metrics_read(struct vortex_metrics *out);
 

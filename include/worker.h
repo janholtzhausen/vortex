@@ -8,6 +8,7 @@
 #include "tls_pool.h"
 #include "compress_pool.h"
 #include "cache.h"
+#include "bpf_loader.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,7 +27,7 @@
 #define WORKER_BLOCKED_MAX     4096
 
 struct blocked_entry {
-    uint32_t ip_host;     /* host byte order, IPv4 only */
+    struct vortex_ip_addr ip;
     time_t   expire_at;
 };
 
@@ -60,7 +61,7 @@ struct worker {
 
     /* Tarpit: unrecognised-SNI connections held with window=1 */
     int              tarpit_fds[WORKER_TARPIT_MAX];
-    uint32_t         tarpit_ips[WORKER_TARPIT_MAX]; /* IPv4 addr in host byte order, 0 = unknown */
+    struct vortex_ip_addr tarpit_ips[WORKER_TARPIT_MAX];
     uint32_t         tarpit_head;   /* FIFO: head is the eviction index (oldest fd), wraps via %WORKER_TARPIT_MAX */
     uint32_t         tarpit_count;  /* number of live tarpit fds */
     uint64_t         tarpit_total;  /* cumulative tarpit count */
@@ -105,7 +106,7 @@ struct worker {
  * ipv4_only=true  → AF_INET socket, addr is a dotted-quad (or "" for INADDR_ANY).
  * ipv4_only=false → AF_INET6 socket with IPV6_V6ONLY=0; accepts both IPv4-mapped
  *                   and native IPv6.  addr should be "::" for all-interfaces.
- * Note: the XDP/tarpit blocklist only handles IPv4 regardless of this setting. */
+ * XDP/tarpit blocklist and rate limiting apply to both IPv4 and IPv6. */
 int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ipv4_only);
 
 /* Initialize worker (call before starting thread).
