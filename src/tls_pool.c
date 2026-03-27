@@ -11,6 +11,9 @@
 
 struct tls_pool g_tls_pool;
 
+_Static_assert(sizeof(struct tls_handshake_result) <= 4096,
+    "tls_handshake_result must fit in PIPE_BUF");
+
 static void log_pool_ssl_errors(const char *tag)
 {
     unsigned long err;
