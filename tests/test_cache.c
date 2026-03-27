@@ -17,7 +17,7 @@ static int g_failed = 0;
 static void test_init_destroy(void)
 {
     struct cache c;
-    int r = cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
+    int r = cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
     CHECK(r == 0, "cache_init succeeds");
     CHECK(c.index != NULL, "index allocated");
     CHECK(c.slab != NULL, "slab allocated");
@@ -30,7 +30,7 @@ static void test_power_of_two(void)
 {
     struct cache c;
     /* Non-power-of-two should be rounded up */
-    int r = cache_init(&c, 100, 1024 * 1024, false, NULL, 0);
+    int r = cache_init(&c, 100, 1024 * 1024, false, NULL, 0, false);
     CHECK(r == 0, "init with 100 entries");
     CHECK(c.index_capacity == 128, "rounded up to 128");
     cache_destroy(&c);
@@ -39,7 +39,7 @@ static void test_power_of_two(void)
 static void test_miss(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
 
     struct cache_index_entry *e = cache_lookup(&c, "/notfound", 9);
     CHECK(e == NULL, "lookup miss returns NULL");
@@ -52,7 +52,7 @@ static void test_miss(void)
 static void test_store_and_hit(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
 
     const char *url  = "/api/v1/data";
     const char *body = "hello world";
@@ -80,7 +80,7 @@ static void test_store_and_hit(void)
 static void test_valid_expired(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
 
     const char *url  = "/short";
     const char *body = "data";
@@ -103,7 +103,7 @@ static void test_valid_expired(void)
 static void test_multiple_entries(void)
 {
     struct cache c;
-    cache_init(&c, 64, 2 * 1024 * 1024, false, NULL, 0);
+    cache_init(&c, 64, 2 * 1024 * 1024, false, NULL, 0, false);
 
     /* Store 10 entries */
     char url[64], body[64];
@@ -134,7 +134,7 @@ static void test_multiple_entries(void)
 static void test_update_existing(void)
 {
     struct cache c;
-    cache_init(&c, 64, 1024 * 1024, false, NULL, 0);
+    cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false);
 
     const char *url = "/update";
     cache_store(&c, url, strlen(url), 200, 60,
@@ -153,7 +153,7 @@ static void test_update_existing(void)
 static void test_evict(void)
 {
     struct cache c;
-    cache_init(&c, 8, 1024 * 1024, false, NULL, 0);
+    cache_init(&c, 8, 1024 * 1024, false, NULL, 0, false);
 
     /* Fill to capacity (8 slots with RH probing) */
     char url[32], body[32];
@@ -180,7 +180,7 @@ static void test_slab_wrap(void)
 {
     struct cache c;
     /* Very small slab to force wrap */
-    cache_init(&c, 64, 4096, false, NULL, 0);
+    cache_init(&c, 64, 4096, false, NULL, 0, false);
 
     /* Store entries until slab wraps */
     char url[32];
@@ -196,6 +196,35 @@ static void test_slab_wrap(void)
     cache_destroy(&c);
 }
 
+static void test_sha256_etag_toggle(void)
+{
+    struct cache c_xx;
+    struct cache c_sha;
+    const char *url  = "/etag";
+    const char *body = "etag-body";
+
+    CHECK(cache_init(&c_xx, 64, 1024 * 1024, false, NULL, 0, false) == 0,
+          "cache_init xxhash etag");
+    CHECK(cache_init(&c_sha, 64, 1024 * 1024, false, NULL, 0, true) == 0,
+          "cache_init sha256 etag");
+
+    CHECK(cache_store(&c_xx, url, strlen(url), 200, 60, NULL, 0,
+                      (const uint8_t *)body, strlen(body)) == 0,
+          "store xxhash etag entry");
+    CHECK(cache_store(&c_sha, url, strlen(url), 200, 60, NULL, 0,
+                      (const uint8_t *)body, strlen(body)) == 0,
+          "store sha256 etag entry");
+
+    struct cache_index_entry *e_xx = cache_lookup(&c_xx, url, strlen(url));
+    struct cache_index_entry *e_sha = cache_lookup(&c_sha, url, strlen(url));
+    CHECK(e_xx != NULL && e_sha != NULL, "etag entries stored");
+    CHECK(e_xx->body_etag != e_sha->body_etag,
+          "sha256 etag differs from xxhash etag for same body");
+
+    cache_destroy(&c_xx);
+    cache_destroy(&c_sha);
+}
+
 int main(void)
 {
     log_init(LOG_ERROR, LOG_FMT_TEXT, NULL);
@@ -209,6 +238,7 @@ int main(void)
     test_update_existing();
     test_evict();
     test_slab_wrap();
+    test_sha256_etag_toggle();
 
     printf("cache tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed ? 1 : 0;

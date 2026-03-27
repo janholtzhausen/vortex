@@ -60,6 +60,10 @@ xdp:
 
 cache:
   enabled: true
+  # When true, ETags are derived from the first 8 bytes of SHA-256(body)
+  # instead of xxhash64(body). OpenSSL uses SHA-NI automatically when the CPU
+  # supports it.
+  etag_sha256: false
   index_entries: 4096
   slab_size_mb: 64
   default_ttl: 300

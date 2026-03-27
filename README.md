@@ -63,7 +63,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - Per-worker in-memory cache (RAM slab, optionally disk-backed via file-backed mmap)
 - 64-byte cache index entries, one per cache line; hugepage-backed index for TLB efficiency
 - LRU eviction; per-URL TTL selection based on path/extension patterns
-- **ETag support** — body xxhash64 stored as ETag; `If-None-Match` → 304 Not Modified
+- **ETag support** — body fingerprint stored as ETag; default `xxhash64`, optional SHA-256-derived 64-bit value via `cache.etag_sha256`; `If-None-Match` → 304 Not Modified
 - `X-Cache: HIT` header injected on cache hits
 - URL-pattern-driven Cache-Control rewrite:
   - Static assets (images, fonts, bundles): `public, max-age=N, immutable`
@@ -519,6 +519,7 @@ The codebase was developed in phases; `VORTEX_PHASE=7` is the current build targ
 - WebSocket passthrough (detect Upgrade, relay thread)
 - Connection-rate limiting applied SYN-only (not per-packet)
 - Cache ETag support with If-None-Match / 304 responses
+- Optional SHA-256-derived ETag generation for cached bodies
 - Cache-Control rewrite + Pragma stripping based on URL patterns
 - Partial send handling in io_uring (kTLS record boundary flush)
 - Authorization header stripping before backend forward
@@ -591,7 +592,7 @@ src/        Core proxy engine
   conn.c/h  Connection pool (hot/cold split, cache-line aligned)
   router.c  SNI route lookup, backend selection (LB algorithms)
   tls.c     OpenSSL 4.0 TLS context, accept, kTLS install, cert rotation
-  cache.c   Response cache (RAM+disk slab, LRU index, ETag)
+  cache.c   Response cache (RAM+disk slab, LRU index, configurable ETag hashing)
   auth.c    HTTP Basic Auth
   metrics.c Prometheus HTTP server
   log.c     Structured JSON/text logger

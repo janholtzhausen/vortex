@@ -22,7 +22,7 @@ typedef enum {
 /* Cache index entry — exactly 64 bytes, one cache line */
 struct __attribute__((packed, aligned(64))) cache_index_entry {
     uint64_t url_hash;
-    uint64_t body_etag;       /* xxhash64 of response body — served as ETag */
+    uint64_t body_etag;       /* configured 64-bit ETag fingerprint of response body */
     uint32_t slab_offset;
     uint32_t body_len;
     uint32_t header_len;
@@ -67,6 +67,7 @@ struct cache {
     uint64_t misses;
     uint64_t evictions;
     uint64_t stores;
+    bool     etag_sha256;
 };
 
 struct cached_response {
@@ -81,7 +82,8 @@ struct cached_response {
  * disk_size: 0 = auto (50% of free space on disk_path's filesystem). */
 int   cache_init(struct cache *c, uint32_t index_entries,
                  size_t slab_size, bool try_hugepages,
-                 const char *disk_path, size_t disk_size);
+                 const char *disk_path, size_t disk_size,
+                 bool etag_sha256);
 void  cache_destroy(struct cache *c);
 
 /* Look up a URL. Returns index entry pointer (may be STALE), or NULL on miss.

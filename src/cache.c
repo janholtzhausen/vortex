@@ -12,6 +12,10 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
+#ifdef VORTEX_PHASE_TLS
+#include <openssl/evp.h>
+#endif
+
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x40000
 #endif
@@ -71,10 +75,12 @@ static void *alloc_aligned(size_t size, bool try_hugepages)
 
 int cache_init(struct cache *c, uint32_t index_entries,
                size_t slab_size, bool try_hugepages,
-               const char *disk_path, size_t disk_size)
+               const char *disk_path, size_t disk_size,
+               bool etag_sha256)
 {
     memset(c, 0, sizeof(*c));
     pthread_mutex_init(&c->lock, NULL);
+    c->etag_sha256 = etag_sha256;
 
     /* Round up index_entries to power of 2 */
     if (!IS_POWER_OF_2(index_entries)) {
@@ -238,7 +244,25 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
     }
 
     /* Compute ETag from body */
-    uint64_t etag = (body && body_len > 0) ? xxhash64(body, body_len) : 0;
+    uint64_t etag = 0;
+    if (body && body_len > 0) {
+#ifdef VORTEX_PHASE_TLS
+        if (c->etag_sha256) {
+            unsigned char sha[32];
+            unsigned int sha_len = sizeof(sha);
+            if (EVP_Digest(body, body_len, sha, &sha_len, EVP_sha256(), NULL) == 1 &&
+                sha_len >= sizeof(etag)) {
+                memcpy(&etag, sha, sizeof(etag));
+            } else {
+                etag = xxhash64(body, body_len);
+            }
+        } else {
+            etag = xxhash64(body, body_len);
+        }
+#else
+        etag = xxhash64(body, body_len);
+#endif
+    }
 
     /* Try RAM slab first; on overflow try disk slab; finally wrap RAM */
     uint32_t slab_off;

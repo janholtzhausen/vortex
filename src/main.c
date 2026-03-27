@@ -525,7 +525,8 @@ int main(int argc, char *argv[])
         const char *disk_path = g_cfg.cache.disk_cache_path[0] ?
             g_cfg.cache.disk_cache_path : NULL;
         if (cache_init(&g_shared_cache, entries, slab_bytes,
-                       g_cfg.cache.use_hugepages, disk_path, disk_bytes) == 0) {
+                       g_cfg.cache.use_hugepages, disk_path, disk_bytes,
+                       g_cfg.cache.etag_sha256) == 0) {
             shared_cache = &g_shared_cache;
         } else {
             log_warn("main", "shared cache init failed — running without cache");
