@@ -252,6 +252,10 @@ static void h2_send_pending(struct h2_session *sess)
 /* Free all resources for a stream slot (does NOT submit RST — caller does) */
 static void h2_stream_cleanup(struct h2_session *sess, struct h2_stream *st)
 {
+    if (st->backend_counted) {
+        router_backend_active_dec((int)st->route_idx, (int)st->backend_idx);
+        st->backend_counted = false;
+    }
     if (st->backend_fd >= 0) { close(st->backend_fd); st->backend_fd = -1; }
     free(st->req_body);   st->req_body   = NULL;
     free(st->resp_buf);   st->resp_buf   = NULL;
@@ -787,6 +791,10 @@ static void h2_stream_connect_backend(struct worker *w, struct h2_session *sess,
 
     st->backend_fd = fd;
     st->state = H2_STREAM_CONNECTING;
+    st->route_idx = (uint16_t)ri;
+    st->backend_idx = (uint16_t)bi;
+    st->backend_counted = true;
+    router_backend_active_inc(ri, bi);
     log_debug("h2_connect", "cid=%u stream=%d slot=%u fd=%d -> %s",
               sess->cid, st->stream_id, (unsigned)st->slot, fd, bcfg->address);
 }

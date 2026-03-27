@@ -626,16 +626,19 @@ int main(int argc, char *argv[])
         if (g_reload) {
             g_reload = 0;
             log_info("config_reload", "SIGHUP received, reloading %s", g_config_path);
-            config_reload(g_config_path, &g_cfg);
-            config_resolve_backends(&g_cfg);
-            if (xdp_loaded) {
-                bpf_loader_apply_config(&g_cfg.xdp);
-            }
+            if (config_reload(g_config_path, &g_cfg) == 0) {
+                config_resolve_backends(&g_cfg);
+                if (xdp_loaded) {
+                    bpf_loader_apply_config(&g_cfg.xdp);
+                }
 #ifdef VORTEX_PHASE_TLS
-            if (tls_ptr) {
-                cert_manager_reload_static();
-            }
+                if (tls_ptr) {
+                    cert_manager_reload_static();
+                }
 #endif
+            } else {
+                log_warn("config_reload", "reload rejected; keeping current configuration");
+            }
         }
 
         if (xdp_loaded) {

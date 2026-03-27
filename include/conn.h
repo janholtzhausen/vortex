@@ -36,6 +36,7 @@ typedef enum {
 #define CONN_FLAG_CLIENT_GZIP        (1 << 11) /* client sent Accept-Encoding: gzip */
 #define CONN_FLAG_CLIENT_BR          (1 << 12) /* client sent Accept-Encoding: br (brotli) */
 #define CONN_FLAG_SPLICE_MODE        (1 << 13) /* streaming body via zero-copy splice */
+#define CONN_FLAG_BACKEND_COUNTED    (1 << 14) /* counted in shared least_conn backend load */
 
 /* Hot connection data — 2 cache lines (128 bytes), accessed per-packet */
 struct __attribute__((aligned(64))) conn_hot {

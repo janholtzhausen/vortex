@@ -13,9 +13,9 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **Per-CPU worker threads** — one io_uring ring per thread, auto-scales to CPU count (max 64)
 - **SNI-based routing** — TLS Server Name Indication routes connections to named backends before the full handshake completes
 - **Wildcard hostname matching** — planned but not yet implemented; current matching is exact (case-insensitive)
-- **Load balancing** — round-robin, weighted round-robin, least-connections (falls back to round-robin), IP-hash
+- **Load balancing** — round-robin, weighted round-robin, least-connections, IP-hash
 - **HTTP/1.1 keep-alive** — backend `Connection: close` forced; client side rewritten to `keep-alive`; backend reconnect on next request
-- **WebSocket passthrough** — detects `Upgrade: websocket` and `101 Switching Protocols`; hands off to a dedicated relay thread for full-duplex streaming
+- **WebSocket passthrough** — detects `Upgrade: websocket` and `101 Switching Protocols`; switches to paired io_uring recv/send chains for full-duplex streaming
 - **HTTP/2 and HTTP/3** — HTTP/3 via ngtcp2 + nghttp3 (conditional compile); `Alt-Svc: h3=":443"` injected into HTTP/1.x responses to advertise QUIC
 
 ### TLS (OpenSSL 4.0)
@@ -108,7 +108,7 @@ python3 tools/vortex-passwd.py admin
 - Foreground by default; `systemd` should supervise the process directly
 - `-d` enables background daemonisation for non-`systemd` use
 - PID file written only in daemon mode to `/run/vortex.pid` (configurable)
-- **SIGHUP** — hot-reload config, refresh XDP blocklist and rate-limit config, re-read static certs from disk
+- **SIGHUP** — hot-reload config, refresh XDP blocklist and rate-limit config, re-read static certs from disk; route/backend topology changes are rejected and require a restart
 - **SIGTERM / SIGINT** — graceful shutdown: stops workers, closes connections, detaches XDP, removes PID file
 - `-t` — test config and exit
 - `-v` — force debug logging
@@ -116,24 +116,6 @@ python3 tools/vortex-passwd.py admin
 - `-T` — disable TLS (plain HTTP only)
 - `-b <path>` — path to BPF object file (default: must be supplied alongside `-b`)
 - Environment variable expansion in config values: `${VAR}` and `$VAR`
-
-### Public-Origin Benchmarking
-- Vortex can now proxy HTTPS origins on the backend leg for HTTP/1.1 routes.
-- A dedicated benchmark config lives at `config/public-benchmark.yaml`.
-- A repeatable local benchmark helper lives at `tools/benchmark_public_origins.sh`.
-- The current public HTTPS benchmark set is:
-  - `https://httpbingo.org:443` for API-style request/response behavior
-  - `https://www.wikipedia.org:443` for a larger production HTML site
-  - `https://speed.hetzner.de:443` for larger transfer/throughput checks
-- Backend TLS verifies origin certificates by default and sends SNI derived from the backend hostname.
-- Current limitation: WebSocket upgrades are still plain-HTTP-origin only; HTTPS-origin WebSocket passthrough is not implemented yet.
-- Run the benchmark with:
-
-```sh
-bash tools/benchmark_public_origins.sh
-```
-
----
 
 ## Architecture
 
@@ -577,12 +559,12 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 ## Known Limitations
 
 - **IPv4 only** in the XDP program — IPv6 packets are passed without filtering or conntrack
-- **Load balancer — least_conn** falls back to round-robin (per-backend active connection tracking not yet implemented)
+- **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
 - **Backend connections** are synchronous blocking connects (set non-blocking after connect); async io_uring CONNECT is planned
 - **Backend TLS** (`https://` origins) performs blocking `SSL_connect`/`SSL_write`/`SSL_read` in the worker thread. A slow or unresponsive HTTPS backend will stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Connection pooling is disabled for TLS backends (each request performs a full TCP+TLS handshake).
 - **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
-- **WebSocket relay** uses `select(2)` in a dedicated thread rather than io_uring
-- **Config reload** does a full in-memory replace (`memcpy`); live connections use the old route/backend config until they close
+- **WebSocket relay** uses one in-flight io_uring recv/send chain per direction and relies on socket backpressure rather than deep proxy-side queues
+- **Config reload** rejects route/backend topology changes on SIGHUP; changing route order, backend order, or backend counts still requires a restart
 
 ---
 

@@ -22,6 +22,8 @@ int parse_http_request_line(const uint8_t *buf, int len,
     /* "GET /path HTTP/1.1\r\n..." */
     const char *p = (const char *)buf;
     const char *end = p + len;
+    const char *line_end;
+    const char *ver;
 
     /* Method */
     const char *sp = (const char *)memchr(p, ' ', (size_t)(end - p));
@@ -39,6 +41,18 @@ int parse_http_request_line(const uint8_t *buf, int len,
     if (ulen >= url_max) ulen = url_max - 1;
     memcpy(url_out, p, ulen);
     url_out[ulen] = '\0';
+    p = sp + 1;
+
+    line_end = (const char *)memmem(p, (size_t)(end - p), "\r\n", 2);
+    if (!line_end || line_end == p)
+        return -1;
+
+    ver = p;
+    if ((size_t)(line_end - ver) != 8)
+        return -1;
+    if (memcmp(ver, "HTTP/1.1", 8) != 0 &&
+        memcmp(ver, "HTTP/1.0", 8) != 0)
+        return -1;
 
     return 0;
 }
@@ -64,6 +78,48 @@ static void send_service_unavailable_and_close(struct worker *w, uint32_t cid)
     conn_close(w, cid, false);
 }
 
+static void send_bad_request_and_close(struct worker *w, uint32_t cid)
+{
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    static const char r400[] =
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+    send(h->client_fd, r400, sizeof(r400) - 1, MSG_NOSIGNAL);
+    conn_close(w, cid, false);
+}
+
+static bool request_has_ambiguous_framing(const uint8_t *buf, size_t len)
+{
+    const uint8_t *te;
+    const uint8_t *cl;
+
+    te = (const uint8_t *)memmem(buf, len, "\r\nTransfer-Encoding:", 20);
+    if (!te) te = (const uint8_t *)memmem(buf, len, "\r\ntransfer-encoding:", 20);
+    if (!te)
+        return false;
+
+    cl = (const uint8_t *)memmem(buf, len, "\r\nContent-Length:", 17);
+    if (!cl) cl = (const uint8_t *)memmem(buf, len, "\r\ncontent-length:", 17);
+    return cl != NULL;
+}
+
+static void conn_backend_count_assign(struct conn_hot *h, int route_idx, int backend_idx)
+{
+    if ((h->flags & CONN_FLAG_BACKEND_COUNTED) &&
+        (h->route_idx != (uint16_t)route_idx || h->backend_idx != (uint16_t)backend_idx)) {
+        router_backend_active_dec((int)h->route_idx, (int)h->backend_idx);
+        h->flags &= ~CONN_FLAG_BACKEND_COUNTED;
+    }
+
+    h->route_idx = (uint16_t)route_idx;
+    h->backend_idx = (uint16_t)backend_idx;
+
+    if (!(h->flags & CONN_FLAG_BACKEND_COUNTED)) {
+        router_backend_active_inc(route_idx, backend_idx);
+        h->flags |= CONN_FLAG_BACKEND_COUNTED;
+    }
+}
+
 /* Route to a backend and establish or reuse a connection.
  * Returns 0 on success (recv armed or CONNECT in flight), -1 on failure. */
 static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool has_pending_data)
@@ -79,8 +135,7 @@ static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool
         return -1;
     }
 
-    h->route_idx = (uint16_t)route_idx;
-    h->backend_idx = (uint16_t)backend_idx;
+    conn_backend_count_assign(h, route_idx, backend_idx);
 
     const char *addr = router_backend_addr(&w->router, route_idx, backend_idx);
     if (!addr) {
@@ -1063,6 +1118,16 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
     /* Basic Auth check */
     {
         const struct route_config *rc = &w->cfg->routes[h->route_idx];
+        const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        if (parse_http_request_line(rbuf, n, (char [16]){0}, 16, (char [512]){0}, 512) != 0) {
+            send_bad_request_and_close(w, cid);
+            return;
+        }
+        if (request_has_ambiguous_framing(rbuf, (size_t)n)) {
+            log_warn("bad_request", "conn=%u ambiguous Content-Length/Transfer-Encoding", cid);
+            send_bad_request_and_close(w, cid);
+            return;
+        }
         if (!auth_check_request(&rc->auth, conn_recv_buf(&w->pool, cid), n)) {
             /* Send 401 and re-arm for next request */
             static const char r401[] =

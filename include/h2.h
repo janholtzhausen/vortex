@@ -158,6 +158,9 @@ struct h2_stream {
      * buffers alive until the outstanding send/recv completions drain. */
     bool     backend_send_in_flight;
     bool     backend_recv_in_flight;
+    uint16_t route_idx;
+    uint16_t backend_idx;
+    bool     backend_counted;
 
     uint8_t  slot;              /* index in h2_session.streams[] */
     uint32_t cid;               /* parent connection id */

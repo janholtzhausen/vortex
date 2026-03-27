@@ -24,3 +24,7 @@ int router_select_backend(struct router *r, int route_idx,
 
 /* Get backend address string for connection */
 const char *router_backend_addr(struct router *r, int route_idx, int backend_idx);
+
+/* Shared backend active-connection counters used by least_conn selection. */
+void router_backend_active_inc(int route_idx, int backend_idx);
+void router_backend_active_dec(int route_idx, int backend_idx);

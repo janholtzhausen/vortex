@@ -583,6 +583,41 @@ int config_reload(const char *path, struct vortex_config *cfg)
 {
     struct vortex_config new_cfg;
     if (config_load(path, &new_cfg) != 0) return -1;
+    if (new_cfg.route_count != cfg->route_count) {
+        log_warn("config_reload",
+                 "refusing reload: route_count changed from %d to %d; restart required",
+                 cfg->route_count, new_cfg.route_count);
+        return -1;
+    }
+    for (int ri = 0; ri < cfg->route_count; ri++) {
+        const struct route_config *old_route = &cfg->routes[ri];
+        const struct route_config *new_route = &new_cfg.routes[ri];
+        if (strcmp(old_route->hostname, new_route->hostname) != 0) {
+            log_warn("config_reload",
+                     "refusing reload: route %d hostname changed (%s -> %s); restart required",
+                     ri, old_route->hostname, new_route->hostname);
+            return -1;
+        }
+        if (old_route->backend_count != new_route->backend_count) {
+            log_warn("config_reload",
+                     "refusing reload: route %d backend_count changed (%u -> %u); restart required",
+                     ri, old_route->backend_count, new_route->backend_count);
+            return -1;
+        }
+        for (int bi = 0; bi < old_route->backend_count; bi++) {
+            const struct backend_config *old_backend = &old_route->backends[bi];
+            const struct backend_config *new_backend = &new_route->backends[bi];
+            if (strcmp(old_backend->address, new_backend->address) != 0 ||
+                old_backend->tls != new_backend->tls) {
+                log_warn("config_reload",
+                         "refusing reload: route %d backend %d changed (%s/%d -> %s/%d); restart required",
+                         ri, bi,
+                         old_backend->address, old_backend->tls,
+                         new_backend->address, new_backend->tls);
+                return -1;
+            }
+        }
+    }
     /* Atomic copy — caller must handle live state */
     memcpy(cfg, &new_cfg, sizeof(*cfg));
     return 0;

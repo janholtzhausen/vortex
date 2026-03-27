@@ -174,6 +174,10 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
     struct conn_hot *h = conn_hot(&w->pool, cid);
     struct conn_cold *cc = conn_cold_ptr(&w->pool, cid);
     if (h->state == CONN_STATE_FREE) return;
+    if (h->flags & CONN_FLAG_BACKEND_COUNTED) {
+        router_backend_active_dec((int)h->route_idx, (int)h->backend_idx);
+        h->flags &= ~CONN_FLAG_BACKEND_COUNTED;
+    }
 #ifdef VORTEX_PHASE_TLS
     if (cc->backend_ssl) { SSL_free((SSL *)cc->backend_ssl); cc->backend_ssl = NULL; }
     if (h->ssl) { tls_ssl_free((SSL *)h->ssl); h->ssl = NULL; }

@@ -191,6 +191,8 @@ struct proxy_args {
     struct sockaddr_storage peer_addr;
     socklen_t               peer_addrlen;
     int64_t                 stream_id;
+    int                     route_idx;
+    int                     backend_idx;
     char                    backend_addr[256];
     char                    method[16];
     char                    url[512];
@@ -341,6 +343,7 @@ static void *proxy_thread(void *arg)
     }
 
 push:;
+    router_backend_active_dec(pa->route_idx, pa->backend_idx);
     struct quic_server *qs = pa->server;
     pthread_mutex_lock(&qs->comp_mu);
     int next = (qs->comp_tail + 1) % QUIC_COMP_RING_SIZE;
@@ -401,9 +404,10 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
     }
 
     const char *addr = NULL;
+    int backend_idx = -1;
     if (qs->cfg->route_count > 0) {
-        int bi = router_select_backend(&qs->router, route_idx, 0);
-        addr = router_backend_addr(&qs->router, route_idx, bi);
+        backend_idx = router_select_backend(&qs->router, route_idx, 0);
+        addr = router_backend_addr(&qs->router, route_idx, backend_idx);
     }
 
     if (!addr) goto err_502;
@@ -415,6 +419,8 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
         memcpy(&pa->peer_addr, &c->peer_addr, c->peer_addrlen);
         pa->peer_addrlen = c->peer_addrlen;
         pa->stream_id    = s->stream_id;
+        pa->route_idx    = route_idx;
+        pa->backend_idx  = backend_idx;
         snprintf(pa->backend_addr, sizeof(pa->backend_addr), "%s", addr);
         snprintf(pa->method, sizeof(pa->method), "%s", s->method);
         snprintf(pa->url, sizeof(pa->url), "%s", s->url);
@@ -428,6 +434,7 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
 
         pthread_t t;
         pthread_attr_t attr;
+        router_backend_active_inc(route_idx, backend_idx);
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&t, &attr, proxy_thread, pa) == 0) {
@@ -435,6 +442,7 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
             return; /* proxy thread will push completion via eventfd */
         }
         pthread_attr_destroy(&attr);
+        router_backend_active_dec(route_idx, backend_idx);
         free(pa->req_body);
         free(pa);
     }

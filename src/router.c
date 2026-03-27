@@ -7,6 +7,8 @@
 #define _GNU_SOURCE
 #include <fnmatch.h>
 
+static uint32_t g_backend_active[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
+
 int router_init(struct router *r, struct vortex_config *cfg)
 {
     memset(r, 0, sizeof(*r));
@@ -81,9 +83,23 @@ int router_select_backend(struct router *r, int route_idx, uint32_t client_ip)
         return (int)(h % (uint64_t)route->backend_count);
     }
 
-    case LB_LEAST_CONN:
-        /* TODO Phase 6: track active connections per backend */
-        /* Fall through to round-robin for now */
+    case LB_LEAST_CONN: {
+        uint32_t idx = __atomic_fetch_add(&r->rr_counters[route_idx], 1,
+                                          __ATOMIC_RELAXED);
+        uint32_t min_active = UINT32_MAX;
+        int best = 0;
+        for (int off = 0; off < route->backend_count; off++) {
+            int bi = (int)((idx + (uint32_t)off) % route->backend_count);
+            uint32_t active = __atomic_load_n(&g_backend_active[route_idx][bi],
+                                              __ATOMIC_RELAXED);
+            if (active < min_active) {
+                min_active = active;
+                best = bi;
+            }
+        }
+        return best;
+    }
+
     default: {
         uint32_t idx = __atomic_fetch_add(&r->rr_counters[route_idx], 1,
                                           __ATOMIC_RELAXED);
@@ -98,4 +114,30 @@ const char *router_backend_addr(struct router *r, int route_idx, int backend_idx
     const struct route_config *route = &r->cfg->routes[route_idx];
     if (backend_idx < 0 || backend_idx >= route->backend_count) return NULL;
     return route->backends[backend_idx].address;
+}
+
+void router_backend_active_inc(int route_idx, int backend_idx)
+{
+    if (route_idx < 0 || route_idx >= VORTEX_MAX_ROUTES ||
+        backend_idx < 0 || backend_idx >= VORTEX_MAX_BACKENDS)
+        return;
+    __atomic_fetch_add(&g_backend_active[route_idx][backend_idx], 1,
+                       __ATOMIC_RELAXED);
+}
+
+void router_backend_active_dec(int route_idx, int backend_idx)
+{
+    if (route_idx < 0 || route_idx >= VORTEX_MAX_ROUTES ||
+        backend_idx < 0 || backend_idx >= VORTEX_MAX_BACKENDS)
+        return;
+
+    uint32_t cur;
+    do {
+        cur = __atomic_load_n(&g_backend_active[route_idx][backend_idx],
+                              __ATOMIC_RELAXED);
+        if (cur == 0)
+            return;
+    } while (!__atomic_compare_exchange_n(&g_backend_active[route_idx][backend_idx],
+                                          &cur, cur - 1, false,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 }
