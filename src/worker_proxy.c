@@ -71,6 +71,56 @@ static void submit_client_response_send(struct worker *w, uint32_t cid,
     uring_submit(&w->uring);
 }
 
+static int inject_response_etag(struct worker *w, uint8_t *buf, int n)
+{
+    if (n <= 0 || memcmp(buf, "HTTP/", 5) != 0)
+        return n;
+
+    uint8_t *hdr_end = (uint8_t *)FIND_HDR_END(buf, (size_t)n);
+    if (!hdr_end)
+        return n;
+
+    size_t hdr_len = (size_t)(hdr_end - buf) + 4;
+    if (memmem(buf, hdr_len, "\r\nETag:", 7) ||
+        memmem(buf, hdr_len, "\r\netag:", 7))
+        return n;
+
+    bool is_chunked =
+        memmem(buf, hdr_len, "\r\nTransfer-Encoding: chunked", 28) ||
+        memmem(buf, hdr_len, "\r\ntransfer-encoding: chunked", 28);
+    if (is_chunked)
+        return n;
+
+    const char *clh = (const char *)memmem(buf, hdr_len, "\r\nContent-Length:", 17);
+    if (!clh)
+        clh = (const char *)memmem(buf, hdr_len, "\r\ncontent-length:", 17);
+    if (!clh)
+        return n;
+
+    const char *cv = clh + 17;
+    while (*cv == ' ') cv++;
+    size_t body_len = (size_t)n - hdr_len;
+    if ((size_t)atol(cv) != body_len || body_len == 0)
+        return n;
+
+    uint64_t etag = cache_compute_body_etag(w->cfg->cache.etag_sha256,
+                                            buf + hdr_len, body_len);
+    if (etag == 0)
+        return n;
+
+    char etag_hdr[40];
+    int etag_len = snprintf(etag_hdr, sizeof(etag_hdr),
+        "\r\nETag: \"%016llx\"",
+        (unsigned long long)etag);
+    if (etag_len <= 0 || n + etag_len > (int)w->pool.buf_size)
+        return n;
+
+    size_t hle = (size_t)(hdr_end - buf);
+    memmove(buf + hle + etag_len, buf + hle, (size_t)(n - (int)hle));
+    memcpy(buf + hle, etag_hdr, (size_t)etag_len);
+    return n + etag_len;
+}
+
 static int rewrite_backend_connection_header(struct worker *w, uint32_t cid,
                                              struct conn_hot *h, uint8_t *rbuf,
                                              int fwd_n, bool is_ws)
@@ -799,6 +849,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
         }
     }
 
+    n = inject_response_etag(w, conn_send_buf(&w->pool, cid), n);
     submit_client_response_send(w, cid, h, n);
 }
 

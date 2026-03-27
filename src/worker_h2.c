@@ -496,6 +496,8 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
         }
     }
 
+    bool etag_seen = false;
+
     /* First pass: count non-filtered headers */
     int nv_count = 1; /* 1 for :status */
     {
@@ -510,8 +512,8 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
     }
     if (nv_count > 60) nv_count = 60; /* cap; leave 4 slots for injected headers */
 
-    /* Allocate nghttp2_nv array (+1 for :status, +4 for injections) */
-    nghttp2_nv *nvs = malloc((size_t)(nv_count + 4) * sizeof(nghttp2_nv));
+    /* Allocate nghttp2_nv array (+1 for :status, +5 for injections) */
+    nghttp2_nv *nvs = malloc((size_t)(nv_count + 5) * sizeof(nghttp2_nv));
     if (!nvs) return;
 
     int idx = 0;
@@ -598,6 +600,9 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
         if (name_len == 25 && memcmp(name_p, "strict-transport-security", 25) == 0)
             hsts_seen = true;
 
+        if (name_len == 4 && memcmp(name_p, "etag", 4) == 0)
+            etag_seen = true;
+
         /* Strip Pragma and Expires for static assets (Kestrel sends no-cache/-1) */
         if (ttl >= 3600) {
             if ((name_len == 6  && memcmp(name_p, "pragma",  6)  == 0) ||
@@ -617,7 +622,7 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
     }
 
     /* Inject cache-control if backend sent none and we have a TTL */
-    if (ttl > 0 && !cc_injected && idx < nv_count + 4) {
+    if (ttl > 0 && !cc_injected && idx < nv_count + 5) {
         nvs[idx].name     = (uint8_t *)"cache-control";
         nvs[idx].namelen  = 13;
         nvs[idx].value    = (uint8_t *)cc_val;
@@ -626,7 +631,7 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
         idx++;
     }
 
-    if (!hsts_seen && idx < nv_count + 4) {
+    if (!hsts_seen && idx < nv_count + 5) {
         static const uint8_t hsts[] = "max-age=31536000; includeSubDomains";
         nvs[idx].name     = (uint8_t *)"strict-transport-security";
         nvs[idx].namelen  = 25;
@@ -638,7 +643,7 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
 
 #ifdef VORTEX_QUIC
     /* Advertise HTTP/3 availability */
-    if (idx < nv_count + 4) {
+    if (idx < nv_count + 5) {
         nvs[idx].name     = (uint8_t *)"alt-svc";
         nvs[idx].namelen  = 7;
         nvs[idx].value    = (uint8_t *)"h3=\":443\"; ma=86400";
@@ -650,6 +655,24 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
 
     uint32_t body_len = st->resp_buf_len > st->resp_hdr_end
                         ? st->resp_buf_len - st->resp_hdr_end : 0u;
+
+    if (!etag_seen && st->backend_eof && body_len > 0 && idx < nv_count + 5) {
+        uint64_t etag = cache_compute_body_etag(w->cfg->cache.etag_sha256,
+                                                st->resp_buf + st->resp_hdr_end,
+                                                body_len);
+        if (etag != 0) {
+            char *etag_val = malloc(17);
+            if (etag_val) {
+                snprintf(etag_val, 17, "%016llx", (unsigned long long)etag);
+                nvs[idx].name     = (uint8_t *)"etag";
+                nvs[idx].namelen  = 4;
+                nvs[idx].value    = (uint8_t *)etag_val;
+                nvs[idx].valuelen = 16;
+                nvs[idx].flags    = NGHTTP2_NV_FLAG_NO_COPY_NAME;
+                idx++;
+            }
+        }
+    }
 
     nghttp2_data_provider dp = {
         .source        = { .ptr = st },
@@ -664,6 +687,13 @@ static void h2_submit_response(struct h2_session *sess, struct h2_stream *st)
     int rv = nghttp2_submit_response(sess->ngh2, st->stream_id,
                                      nvs, (size_t)idx,
                                      use_provider ? &dp : NULL);
+    for (int i = 0; i < idx; i++) {
+        if (nvs[i].namelen == 4 && memcmp(nvs[i].name, "etag", 4) == 0 &&
+            nvs[i].flags == NGHTTP2_NV_FLAG_NO_COPY_NAME) {
+            free(nvs[i].value);
+            break;
+        }
+    }
     free(nvs);
     if (rv != 0) {
         log_error("h2_resp", "nghttp2_submit_response2 stream=%d: %s",

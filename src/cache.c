@@ -34,6 +34,30 @@ static inline uint32_t fnv1a(const char *data, size_t len)
     return h;
 }
 
+uint64_t cache_compute_body_etag(bool etag_sha256,
+                                 const uint8_t *body, size_t body_len)
+{
+    if (!body || body_len == 0)
+        return 0;
+
+#ifdef VORTEX_PHASE_TLS
+    if (etag_sha256) {
+        unsigned char sha[32];
+        unsigned int sha_len = sizeof(sha);
+        uint64_t etag = 0;
+        if (EVP_Digest(body, body_len, sha, &sha_len, EVP_sha256(), NULL) == 1 &&
+            sha_len >= sizeof(etag)) {
+            memcpy(&etag, sha, sizeof(etag));
+            return etag;
+        }
+    }
+#else
+    (void)etag_sha256;
+#endif
+
+    return xxhash64(body, body_len);
+}
+
 /* Try mmap with hugepages, fall back to THP, then regular */
 static void *alloc_aligned(size_t size, bool try_hugepages)
 {
@@ -244,25 +268,7 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
     }
 
     /* Compute ETag from body */
-    uint64_t etag = 0;
-    if (body && body_len > 0) {
-#ifdef VORTEX_PHASE_TLS
-        if (c->etag_sha256) {
-            unsigned char sha[32];
-            unsigned int sha_len = sizeof(sha);
-            if (EVP_Digest(body, body_len, sha, &sha_len, EVP_sha256(), NULL) == 1 &&
-                sha_len >= sizeof(etag)) {
-                memcpy(&etag, sha, sizeof(etag));
-            } else {
-                etag = xxhash64(body, body_len);
-            }
-        } else {
-            etag = xxhash64(body, body_len);
-        }
-#else
-        etag = xxhash64(body, body_len);
-#endif
-    }
+    uint64_t etag = cache_compute_body_etag(c->etag_sha256, body, body_len);
 
     /* Try RAM slab first; on overflow try disk slab; finally wrap RAM */
     uint32_t slab_off;

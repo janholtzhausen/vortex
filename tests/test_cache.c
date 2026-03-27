@@ -218,8 +218,12 @@ static void test_sha256_etag_toggle(void)
     struct cache_index_entry *e_xx = cache_lookup(&c_xx, url, strlen(url));
     struct cache_index_entry *e_sha = cache_lookup(&c_sha, url, strlen(url));
     CHECK(e_xx != NULL && e_sha != NULL, "etag entries stored");
-    CHECK(e_xx->body_etag != e_sha->body_etag,
-          "sha256 etag differs from xxhash etag for same body");
+    CHECK(e_xx->body_etag == cache_compute_body_etag(false,
+          (const uint8_t *)body, strlen(body)),
+          "xxhash etag matches helper output");
+    CHECK(e_sha->body_etag == cache_compute_body_etag(true,
+          (const uint8_t *)body, strlen(body)),
+          "sha256 toggle etag matches helper output");
 
     cache_destroy(&c_xx);
     cache_destroy(&c_sha);

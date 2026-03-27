@@ -78,6 +78,9 @@ struct cached_response {
     uint64_t  body_etag;
 };
 
+uint64_t cache_compute_body_etag(bool etag_sha256,
+                                 const uint8_t *body, size_t body_len);
+
 /* disk_path: path for file-backed disk slab (NULL or "" = RAM-only).
  * disk_size: 0 = auto (50% of free space on disk_path's filesystem). */
 int   cache_init(struct cache *c, uint32_t index_entries,

@@ -42,6 +42,12 @@ target_include_directories(test_cache PRIVATE
     ../include
     ../src
 )
+if(OPENSSL_AVAILABLE)
+    target_compile_definitions(test_cache PRIVATE VORTEX_PHASE_TLS=1)
+    target_include_directories(test_cache PRIVATE ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(test_cache ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
+    target_link_directories(test_cache PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
+endif()
 target_link_libraries(test_cache pthread)
 
 add_executable(test_router
