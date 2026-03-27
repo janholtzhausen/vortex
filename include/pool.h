@@ -3,6 +3,10 @@
 
 #include <pthread.h>
 #include <unistd.h>
+#include <stdbool.h>
+#ifdef VORTEX_PHASE_TLS
+#include <openssl/ssl.h>
+#endif
 #include "config.h"
 
 /*
@@ -26,10 +30,15 @@
  * Real cap is min(pool_size_from_config, GLOBAL_POOL_SLOTS). */
 #define GLOBAL_POOL_SLOTS 256
 
+struct global_backend_conn {
+    int   fd;
+    void *ssl;
+};
+
 struct global_fd_pool {
     pthread_spinlock_t spin;
     uint32_t           count;
-    int                fds[GLOBAL_POOL_SLOTS];
+    struct global_backend_conn conns[GLOBAL_POOL_SLOTS];
 };
 
 extern struct global_fd_pool g_backend_pools[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
@@ -37,28 +46,36 @@ extern struct global_fd_pool g_backend_pools[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKE
 void global_pool_init(void);
 void global_pool_destroy(void);
 
-/* Returns a pooled fd or -1 if the pool is empty. */
-static inline int global_pool_get(int ri, int bi)
+/* Returns a pooled backend connection or false if the pool is empty. */
+static inline bool global_pool_get(int ri, int bi, struct global_backend_conn *out)
 {
     struct global_fd_pool *p = &g_backend_pools[ri][bi];
     pthread_spin_lock(&p->spin);
-    int fd = (p->count > 0) ? p->fds[--p->count] : -1;
+    bool ok = p->count > 0;
+    if (ok && out) {
+        *out = p->conns[--p->count];
+        p->conns[p->count] = (struct global_backend_conn){ .fd = -1, .ssl = NULL };
+    }
     pthread_spin_unlock(&p->spin);
-    return fd;
+    return ok;
 }
 
-/* Returns fd to the pool.  Closes it if the pool is already at cap. */
-static inline void global_pool_put(int ri, int bi, int fd, int cap)
+/* Returns a backend connection to the pool. */
+static inline void global_pool_put(int ri, int bi, struct global_backend_conn conn, int cap)
 {
     struct global_fd_pool *p = &g_backend_pools[ri][bi];
     int slots = (cap < GLOBAL_POOL_SLOTS) ? cap : GLOBAL_POOL_SLOTS;
     pthread_spin_lock(&p->spin);
     if ((int)p->count < slots) {
-        p->fds[p->count++] = fd;
+        p->conns[p->count++] = conn;
         pthread_spin_unlock(&p->spin);
     } else {
         pthread_spin_unlock(&p->spin);
-        close(fd);
+        close(conn.fd);
+#ifdef VORTEX_PHASE_TLS
+        if (conn.ssl)
+            SSL_free((SSL *)conn.ssl);
+#endif
     }
 }
 

@@ -68,6 +68,7 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
 #ifdef VORTEX_PHASE_TLS
     struct conn_hot *h = conn_hot(&w->pool, cid);
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    SSL_SESSION *cached_session = NULL;
     SSL *ssl;
     char sni_buf[256];
     const char *server_name;
@@ -89,12 +90,18 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
         return -1;
     }
 
+    if (h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS)
+        cached_session = w->backend_tls_sessions[h->route_idx][h->backend_idx];
+    if (cached_session) {
+        if (SSL_set_session(ssl, cached_session) != 1)
+            log_backend_ssl_errors("backend_tls_set_session");
+    }
+
     server_name = backend_server_name(bcfg, sni_buf, sizeof(sni_buf));
     if (server_name[0]) {
         SSL_set_tlsext_host_name(ssl, server_name);
         if (bcfg->verify_peer || !bcfg->verify_peer_set) {
-            X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
-            if (X509_VERIFY_PARAM_set1_host(param, server_name, 0) != 1) {
+            if (SSL_set1_host(ssl, server_name) != 1) {
                 log_backend_ssl_errors("backend_tls_set_host");
                 SSL_free(ssl);
                 return -1;
@@ -133,6 +140,16 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
         log_warn("backend_tls_handshake", "conn=%u certificate verification failed", cid);
         SSL_free(ssl);
         return -1;
+    }
+
+    if (h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS) {
+        SSL_SESSION *new_session = SSL_get1_session(ssl);
+        if (new_session) {
+            SSL_SESSION *old_session = w->backend_tls_sessions[h->route_idx][h->backend_idx];
+            w->backend_tls_sessions[h->route_idx][h->backend_idx] = new_session;
+            if (old_session)
+                SSL_SESSION_free(old_session);
+        }
     }
 
     cold->backend_ssl = ssl;

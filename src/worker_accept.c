@@ -179,7 +179,6 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         h->flags &= ~CONN_FLAG_BACKEND_COUNTED;
     }
 #ifdef VORTEX_PHASE_TLS
-    if (cc->backend_ssl) { SSL_free((SSL *)cc->backend_ssl); cc->backend_ssl = NULL; }
     if (h->ssl) { tls_ssl_free((SSL *)h->ssl); h->ssl = NULL; }
 #endif
     if (h->client_fd  >= 0) {
@@ -188,23 +187,32 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
     }
     if (h->backend_fd >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-        /* On a clean close with an idle (non-streaming) backend, return the fd
-         * to the global pool for reuse by future connections. */
+        /* On a clean close with an idle backend, return both the fd and SSL
+         * state to the global pool for reuse by future connections. */
         if (!is_error && !(h->flags & CONN_FLAG_STREAMING_BACKEND) &&
-            !(h->flags & CONN_FLAG_BACKEND_TLS)) {
+            !(h->flags & CONN_FLAG_BACKEND_TLS_PENDING) &&
+            !(h->flags & CONN_FLAG_BACKEND_CONNECTING)) {
             int ri = h->route_idx, bi = h->backend_idx;
             int ps = (ri >= 0 && ri < VORTEX_MAX_ROUTES &&
                       bi >= 0 && bi < VORTEX_MAX_BACKENDS)
                      ? w->cfg->routes[ri].backends[bi].pool_size : 0;
             if (ps > 0) {
-                global_pool_put(ri, bi, h->backend_fd, ps);
+                struct global_backend_conn pooled = {
+                    .fd = h->backend_fd,
+                    .ssl = cc->backend_ssl,
+                };
+                global_pool_put(ri, bi, pooled, ps);
                 h->backend_fd = -1;
+                cc->backend_ssl = NULL;
             }
         }
         if (h->backend_fd >= 0) {
             close(h->backend_fd); h->backend_fd = -1;
         }
     }
+#ifdef VORTEX_PHASE_TLS
+    if (cc->backend_ssl) { SSL_free((SSL *)cc->backend_ssl); cc->backend_ssl = NULL; }
+#endif
 #ifdef VORTEX_H2
     if (cc->h2) { h2_session_free(cc->h2); cc->h2 = NULL; }
 #endif

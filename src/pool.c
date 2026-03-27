@@ -10,7 +10,7 @@ void global_pool_init(void)
             pthread_spin_init(&p->spin, PTHREAD_PROCESS_PRIVATE);
             p->count = 0;
             for (int i = 0; i < GLOBAL_POOL_SLOTS; i++)
-                p->fds[i] = -1;
+                p->conns[i] = (struct global_backend_conn){ .fd = -1, .ssl = NULL };
         }
     }
 }
@@ -22,7 +22,15 @@ void global_pool_destroy(void)
             struct global_fd_pool *p = &g_backend_pools[ri][bi];
             pthread_spin_lock(&p->spin);
             for (uint32_t i = 0; i < p->count; i++) {
-                if (p->fds[i] >= 0) { close(p->fds[i]); p->fds[i] = -1; }
+                if (p->conns[i].fd >= 0) {
+                    close(p->conns[i].fd);
+#ifdef VORTEX_PHASE_TLS
+                    if (p->conns[i].ssl)
+                        SSL_free((SSL *)p->conns[i].ssl);
+#endif
+                    p->conns[i].fd = -1;
+                    p->conns[i].ssl = NULL;
+                }
             }
             p->count = 0;
             pthread_spin_unlock(&p->spin);

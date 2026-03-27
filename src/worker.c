@@ -321,9 +321,16 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
         log_error("worker_init", "SSL_CTX_new(TLS_client_method) failed");
         return -1;
     }
+    SSL_CTX_set_session_cache_mode(w->backend_tls_client_ctx, SSL_SESS_CACHE_CLIENT);
     SSL_CTX_set_min_proto_version(w->backend_tls_client_ctx, cfg->tls.min_version);
     SSL_CTX_set_max_proto_version(w->backend_tls_client_ctx, cfg->tls.max_version);
-    SSL_CTX_set_default_verify_paths(w->backend_tls_client_ctx);
+    if (SSL_CTX_set_default_verify_paths(w->backend_tls_client_ctx) != 1) {
+        if (SSL_CTX_load_verify_locations(w->backend_tls_client_ctx,
+                                          "/etc/ssl/certs/ca-certificates.crt",
+                                          "/etc/ssl/certs") != 1) {
+            log_warn("worker_init", "backend TLS CA store load failed; HTTPS origin verification may fail");
+        }
+    }
 #else
     (void)tls;
 #endif
@@ -458,6 +465,14 @@ void worker_destroy(struct worker *w)
     if (w->backend_tls_client_ctx) {
         SSL_CTX_free(w->backend_tls_client_ctx);
         w->backend_tls_client_ctx = NULL;
+    }
+    for (int ri = 0; ri < VORTEX_MAX_ROUTES; ri++) {
+        for (int bi = 0; bi < VORTEX_MAX_BACKENDS; bi++) {
+            if (w->backend_tls_sessions[ri][bi]) {
+                SSL_SESSION_free(w->backend_tls_sessions[ri][bi]);
+                w->backend_tls_sessions[ri][bi] = NULL;
+            }
+        }
     }
 #endif
 

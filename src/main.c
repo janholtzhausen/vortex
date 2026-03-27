@@ -94,6 +94,20 @@ static char   g_bpf_obj_path[512] = "";
 static int    g_no_xdp = 0;
 static int    g_no_tls = 0;
 
+#ifdef VORTEX_PHASE_TLS
+static bool config_uses_backend_tls(const struct vortex_config *cfg)
+{
+    for (int ri = 0; ri < cfg->route_count; ri++) {
+        const struct route_config *route = &cfg->routes[ri];
+        for (int bi = 0; bi < route->backend_count; bi++) {
+            if (route->backends[bi].tls)
+                return true;
+        }
+    }
+    return false;
+}
+#endif
+
 #define MAX_WORKERS 64
 static struct worker  g_workers[MAX_WORKERS];
 static int            g_num_workers = 0;
@@ -520,7 +534,8 @@ int main(int argc, char *argv[])
 
 #ifdef VORTEX_PHASE_TLS
     /* TLS handshake thread pool — shared across all workers */
-    if (tls_ptr) tls_pool_init();
+    bool need_tls_pool = (tls_ptr != NULL) || config_uses_backend_tls(&g_cfg);
+    if (need_tls_pool) tls_pool_init();
 #endif
 
     /* Create one SO_REUSEPORT listen socket per worker.
@@ -682,7 +697,7 @@ int main(int argc, char *argv[])
     }
     global_pool_destroy();
 #ifdef VORTEX_PHASE_TLS
-    if (tls_ptr) tls_pool_destroy();
+    if (need_tls_pool) tls_pool_destroy();
 #endif
     if (g_cfg.metrics.enabled) {
         metrics_stop(&g_metrics);

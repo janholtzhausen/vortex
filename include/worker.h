@@ -41,6 +41,7 @@ struct worker {
 #ifdef VORTEX_PHASE_TLS
     struct tls_ctx  *tls;             /* Shared TLS context (NULL = plain HTTP) */
     SSL_CTX         *backend_tls_client_ctx; /* Per-worker client SSL_CTX for HTTPS origins */
+    SSL_SESSION     *backend_tls_sessions[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
 #endif
 
     struct vortex_config *cfg;        /* Shared, atomic ptr swap for reload */

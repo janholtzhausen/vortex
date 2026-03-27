@@ -13,8 +13,11 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **Per-CPU worker threads** — one io_uring ring per thread, auto-scales to CPU count (max 64)
 - **SNI-based routing** — TLS Server Name Indication routes connections to named backends before the full handshake completes
 - **Wildcard hostname matching** — planned but not yet implemented; current matching is exact (case-insensitive)
-- **Load balancing** — round-robin, weighted round-robin, least-connections, IP-hash
-- **HTTP/1.1 keep-alive** — backend `Connection: close` forced; client side rewritten to `keep-alive`; backend reconnect on next request
+- **Load balancing** — round-robin, weighted round-robin (honors per-backend `weight`), least-connections, IP-hash
+- **HTTP/1.1 keep-alive** — backends with `pool_size > 0` are kept alive and returned to the shared origin pool after each complete response; non-pooled backends are forced closed
+- **HTTPS backend TLS offload** — origin `SSL_connect` runs in the shared TLS pool instead of blocking the io_uring worker thread
+- **HTTPS backend session reuse** — repeated TLS-origin connections reuse cached client TLS sessions per worker/backend when the origin supports resumption
+- **HTTPS backend pooling** — pooled `https://` origins reuse both the TCP socket and live `SSL*` session across client connections when the origin keeps the connection alive
 - **WebSocket passthrough** — detects `Upgrade: websocket` and `101 Switching Protocols`; switches to paired io_uring recv/send chains for full-duplex streaming
 - **HTTP/2 and HTTP/3** — HTTP/3 via ngtcp2 + nghttp3 (conditional compile); `Alt-Svc: h3=":443"` injected into HTTP/1.x responses to advertise QUIC
 
@@ -561,7 +564,8 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 - **IPv4 only** in the XDP program — IPv6 packets are passed without filtering or conntrack
 - **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
 - **Backend connections** are synchronous blocking connects (set non-blocking after connect); async io_uring CONNECT is planned
-- **Backend TLS** (`https://` origins) performs blocking `SSL_connect`/`SSL_write`/`SSL_read` in the worker thread. A slow or unresponsive HTTPS backend will stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Connection pooling is disabled for TLS backends (each request performs a full TCP+TLS handshake).
+- **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can still stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Pooled TLS backends reuse the live origin socket and `SSL*` state across requests when the response is framing-safe to return to the pool; repeated fresh connections also reuse cached client TLS sessions when the origin permits resumption.
+- **Backend TLS verification** is enabled by default. Per backend, set `verify_peer: false` or `insecure_skip_verify: true` to ignore certificate-chain and hostname validity checks for that origin.
 - **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
 - **WebSocket relay** uses one in-flight io_uring recv/send chain per direction and relies on socket backpressure rather than deep proxy-side queues
 - **Config reload** rejects route/backend topology changes on SIGHUP; changing route order, backend order, or backend counts still requires a restart

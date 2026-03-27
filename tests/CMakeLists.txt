@@ -44,6 +44,23 @@ target_include_directories(test_cache PRIVATE
 )
 target_link_libraries(test_cache pthread)
 
+add_executable(test_router
+    test_router.c
+    ../src/router.c
+    ../src/config.c
+    ../src/auth.c
+    ../src/log.c
+)
+target_include_directories(test_router PRIVATE
+    ../include
+    ../src
+    ../bpf
+    ${YAML_INCLUDE_DIRS}
+)
+target_link_libraries(test_router ${YAML_LIBRARIES} pthread)
+target_link_directories(test_router PRIVATE ${YAML_LIBRARY_DIRS})
+
 add_test(NAME test_config COMMAND $<TARGET_FILE:test_config>)
 add_test(NAME test_log    COMMAND $<TARGET_FILE:test_log>)
 add_test(NAME test_cache  COMMAND $<TARGET_FILE:test_cache>)
+add_test(NAME test_router COMMAND $<TARGET_FILE:test_router>)

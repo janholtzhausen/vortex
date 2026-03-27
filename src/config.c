@@ -318,6 +318,10 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         } else if (!strcmp(k, "verify_peer")) {
             b->verify_peer = !strcmp(val, "true") || !strcmp(val, "yes");
             b->verify_peer_set = true;
+        } else if (!strcmp(k, "insecure_skip_verify")) {
+            bool insecure = !strcmp(val, "true") || !strcmp(val, "yes");
+            b->verify_peer = !insecure;
+            b->verify_peer_set = true;
         }
         break;
     }

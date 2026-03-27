@@ -36,6 +36,9 @@ struct backend_config {
     bool     tls;
     bool     verify_peer;
     bool     verify_peer_set;
+    /* insecure_skip_verify=true disables both certificate-chain and hostname
+     * verification for this backend TLS leg. Prefer verify_peer=false in new
+     * configs; this alias exists to make the risk explicit. */
     /* Pre-resolved at config load — eliminates blocking getaddrinfo on hot path */
     struct sockaddr_storage resolved_addr;
     socklen_t               resolved_addrlen; /* 0 = not resolved */

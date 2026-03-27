@@ -9,6 +9,11 @@
 
 static uint32_t g_backend_active[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
 
+static uint32_t backend_effective_weight(const struct backend_config *backend)
+{
+    return backend->weight > 0 ? (uint32_t)backend->weight : 1u;
+}
+
 int router_init(struct router *r, struct vortex_config *cfg)
 {
     memset(r, 0, sizeof(*r));
@@ -70,12 +75,33 @@ int router_select_backend(struct router *r, int route_idx, uint32_t client_ip)
     if (route->backend_count == 1) return 0;
 
     switch (route->lb_algo) {
-    case LB_ROUND_ROBIN:
-    case LB_WEIGHTED_ROUND_ROBIN: {
-        /* Simple round-robin for now; weighted version: accumulate weights */
+    case LB_ROUND_ROBIN: {
         uint32_t idx = __atomic_fetch_add(&r->rr_counters[route_idx], 1,
                                           __ATOMIC_RELAXED);
         return (int)(idx % route->backend_count);
+    }
+
+    case LB_WEIGHTED_ROUND_ROBIN: {
+        uint32_t total_weight = 0;
+        for (int bi = 0; bi < route->backend_count; bi++)
+            total_weight += backend_effective_weight(&route->backends[bi]);
+
+        if (total_weight == 0) {
+            uint32_t idx = __atomic_fetch_add(&r->rr_counters[route_idx], 1,
+                                              __ATOMIC_RELAXED);
+            return (int)(idx % route->backend_count);
+        }
+
+        uint32_t idx = __atomic_fetch_add(&r->rr_counters[route_idx], 1,
+                                          __ATOMIC_RELAXED);
+        uint32_t slot = idx % total_weight;
+        uint32_t acc = 0;
+        for (int bi = 0; bi < route->backend_count; bi++) {
+            acc += backend_effective_weight(&route->backends[bi]);
+            if (slot < acc)
+                return bi;
+        }
+        return route->backend_count - 1;
     }
 
     case LB_IP_HASH: {

@@ -32,10 +32,16 @@ struct tls_pool_stats {
     uint64_t dropped_total;
 };
 
+typedef enum {
+    TLS_HANDSHAKE_FRONTEND = 0,
+    TLS_HANDSHAKE_BACKEND  = 1,
+} tls_handshake_kind_t;
+
 /* Result written to the per-worker pipe after handshake completes */
 struct tls_handshake_result {
+    tls_handshake_kind_t kind;
     uint32_t cid;           /* connection id to resume */
-    int      client_fd;     /* original fd (for fcntl back to blocking) */
+    int      client_fd;     /* original fd (frontend) */
     int      tls_route_idx; /* SNI-matched route (-1 on error) */
     SSL     *ssl;           /* NULL if kTLS took over or on error */
     bool     ok;            /* false = handshake failed, close and free conn */
@@ -43,14 +49,23 @@ struct tls_handshake_result {
     bool     ktls_rx;
     bool     h2_negotiated; /* ALPN selected "h2" */
     int      tls_version;   /* SSL_version() result */
+    SSL_SESSION *backend_session; /* cached resumable session for HTTPS origins */
 };
 
 /* Job submitted by the worker to the pool */
 struct tls_handshake_job {
+    tls_handshake_kind_t kind;
     int             client_fd;
     uint32_t        cid;
     struct tls_ctx *tls;
     int             result_pipe_wr; /* write end of per-worker result pipe */
+    SSL_CTX        *backend_tls_client_ctx;
+    uint32_t        timeout_ms;
+    bool            verify_peer;
+    bool            verify_peer_set;
+    char            backend_addr[256];
+    char            backend_sni[256];
+    SSL_SESSION    *resume_session;
 };
 
 struct tls_pool {
