@@ -15,6 +15,40 @@
 
 static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn_hot *h);
 
+static void try_backend_pool_return(struct worker *w, uint32_t cid, struct conn_hot *h)
+{
+    if (!(h->flags & CONN_FLAG_STREAMING_BACKEND))
+        return;
+
+    int ri = h->route_idx, bi = h->backend_idx;
+    int ps = w->cfg->routes[ri].backends[bi].pool_size;
+    if (ps <= 0)
+        return;
+
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    if (cold->backend_content_length == 0 ||
+        cold->backend_body_recv < cold->backend_content_length)
+        return;
+
+    if (h->backend_fd >= 0) {
+        uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
+        struct global_backend_conn pooled = {
+            .fd = h->backend_fd,
+            .ssl = cold->backend_ssl,
+        };
+        global_pool_put(ri, bi, pooled, ps);
+        h->backend_fd = -1;
+        cold->backend_ssl = NULL;
+    }
+    h->flags &= ~(CONN_FLAG_STREAMING_BACKEND |
+                  CONN_FLAG_BACKEND_POOLED |
+                  CONN_FLAG_BACKEND_TLS);
+    cold->backend_content_length = 0;
+    cold->backend_body_recv      = 0;
+    log_debug("backend_pool_return", "conn=%u route=%d backend=%d",
+        cid, ri, bi);
+}
+
 /* Extract method and URL from HTTP/1.x request line.
  * Returns 0 on success, -1 if not a parseable HTTP request. */
 int parse_http_request_line(const uint8_t *buf, int len,
@@ -1606,37 +1640,7 @@ static void handle_send_client(struct worker *w, struct io_uring_cqe *cqe, uint3
     h->send_buf_off = 0;
     h->send_buf_len = 0;
 
-    /* Check if a poolable backend response is now complete.
-     * When it is, return the backend to the global pool immediately so other
-     * client connections can reuse the same keep-alive origin socket. */
-    if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-        int ri = h->route_idx, bi = h->backend_idx;
-        int ps = w->cfg->routes[ri].backends[bi].pool_size;
-        if (ps > 0) {
-            struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-            if (cold->backend_content_length > 0 &&
-                cold->backend_body_recv >= cold->backend_content_length) {
-                /* Full response forwarded — backend is idle and reusable. */
-                if (h->backend_fd >= 0) {
-                    uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-                    struct global_backend_conn pooled = {
-                        .fd = h->backend_fd,
-                        .ssl = cold->backend_ssl,
-                    };
-                    global_pool_put(ri, bi, pooled, ps);
-                    h->backend_fd = -1;
-                    cold->backend_ssl = NULL;
-                }
-                h->flags &= ~(CONN_FLAG_STREAMING_BACKEND |
-                              CONN_FLAG_BACKEND_POOLED |
-                              CONN_FLAG_BACKEND_TLS);
-                cold->backend_content_length = 0;
-                cold->backend_body_recv      = 0;
-                log_debug("backend_pool_return", "conn=%u route=%d backend=%d",
-                    cid, ri, bi);
-            }
-        }
-    }
+    try_backend_pool_return(w, cid, h);
 
     if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
         if (backend_uses_tls(w, cid)) {
@@ -2040,33 +2044,7 @@ static void handle_send_client_zc(struct worker *w, struct io_uring_cqe *cqe, ui
         /* Buffer released — decrement counter and arm next recv if all done */
         if (h->zc_notif_count > 0) h->zc_notif_count--;
         if (h->zc_notif_count == 0) {
-            if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
-                int ri = h->route_idx, bi = h->backend_idx;
-                int ps = w->cfg->routes[ri].backends[bi].pool_size;
-                if (ps > 0) {
-                    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                    if (cold->backend_content_length > 0 &&
-                        cold->backend_body_recv >= cold->backend_content_length) {
-                        if (h->backend_fd >= 0) {
-                            uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
-                            struct global_backend_conn pooled = {
-                                .fd = h->backend_fd,
-                                .ssl = cold->backend_ssl,
-                            };
-                            global_pool_put(ri, bi, pooled, ps);
-                            h->backend_fd = -1;
-                            cold->backend_ssl = NULL;
-                        }
-                        h->flags &= ~(CONN_FLAG_STREAMING_BACKEND |
-                                      CONN_FLAG_BACKEND_POOLED |
-                                      CONN_FLAG_BACKEND_TLS);
-                        cold->backend_content_length = 0;
-                        cold->backend_body_recv      = 0;
-                        log_debug("backend_pool_return", "conn=%u route=%d backend=%d",
-                            cid, ri, bi);
-                    }
-                }
-            }
+            try_backend_pool_return(w, cid, h);
             struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
             if (!sqe) { conn_close(w, cid, true); return; }
             if (h->flags & CONN_FLAG_STREAMING_BACKEND) {
