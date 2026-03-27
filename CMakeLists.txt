@@ -7,6 +7,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 enable_testing()
 
+set(VORTEX_VERSION_OVERRIDE "" CACHE STRING "Override the Vortex version string for package builds")
+if(VORTEX_VERSION_OVERRIDE)
+    set(VORTEX_VERSION "${VORTEX_VERSION_OVERRIDE}")
+else()
+    file(READ "${CMAKE_SOURCE_DIR}/VERSION" VORTEX_VERSION_RAW)
+    string(STRIP "${VORTEX_VERSION_RAW}" VORTEX_VERSION)
+endif()
+configure_file(
+    "${CMAKE_SOURCE_DIR}/include/version.h.in"
+    "${CMAKE_BINARY_DIR}/generated/version.h"
+    @ONLY
+)
+
 # ---- Build type flags ----
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -168,6 +181,7 @@ add_dependencies(vortex bpf_prog)
 
 target_include_directories(vortex PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/generated
     ${CMAKE_SOURCE_DIR}/include/cert
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/bpf

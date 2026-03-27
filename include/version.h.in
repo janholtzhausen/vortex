@@ -1,0 +1,3 @@
+#pragma once
+
+#define VORTEX_VERSION "@VORTEX_VERSION@"

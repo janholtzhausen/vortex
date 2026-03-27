@@ -1,12 +1,19 @@
 #!/bin/bash
 # Build a .deb package for vortex.
 # Usage: tools/build_deb.sh [version]
-# Default version is derived from git describe (e.g. 0.2.1).
+# Default version is the next patch after the highest known version from
+# VERSION, git tags, and local package artifacts.
 # Output: vortex_<version>_amd64.deb in the repo root.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$REPO_ROOT/build-release"
+VERSION_FILE="$REPO_ROOT/VERSION"
+
+version_file_version() {
+    [ -f "$VERSION_FILE" ] || return 0
+    tr -d '[:space:]' < "$VERSION_FILE"
+}
 
 latest_local_pkg_version() {
     find "$REPO_ROOT" -maxdepth 1 -type f -name 'vortex_*_amd64.deb' -printf '%f\n' 2>/dev/null \
@@ -15,20 +22,37 @@ latest_local_pkg_version() {
         | tail -n 1
 }
 
+latest_git_tag_version() {
+    git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null \
+        | sed 's/^v//'
+}
+
+highest_known_version() {
+    {
+        version_file_version; printf '\n'
+        latest_git_tag_version; printf '\n'
+        latest_local_pkg_version; printf '\n'
+    } | sed '/^$/d' | sort -V | tail -n 1
+}
+
+next_patch_version() {
+    local cur="${1:-}"
+    local major minor patch
+
+    [ -n "$cur" ] || return 1
+    IFS=. read -r major minor patch <<EOF
+$cur
+EOF
+    patch="${patch:-0}"
+    printf '%s.%s.%s\n' "$major" "$minor" "$((patch + 1))"
+}
+
 default_version() {
-    local git_version=""
-    local pkg_version=""
+    local highest=""
 
-    git_version="$(git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null \
-        | sed 's/^v//')"
-    pkg_version="$(latest_local_pkg_version)"
-
-    if [ -n "$git_version" ] && [ -n "$pkg_version" ]; then
-        printf '%s\n%s\n' "$git_version" "$pkg_version" | sort -V | tail -n 1
-    elif [ -n "$pkg_version" ]; then
-        printf '%s\n' "$pkg_version"
-    elif [ -n "$git_version" ]; then
-        printf '%s\n' "$git_version"
+    highest="$(highest_known_version)"
+    if [ -n "$highest" ]; then
+        next_patch_version "$highest"
     else
         echo "Unable to determine package version." >&2
         echo "Pass an explicit version: bash tools/build_deb.sh <version>" >&2
@@ -37,6 +61,14 @@ default_version() {
 }
 
 VERSION="${1:-$(default_version)}"
+HIGHEST_KNOWN="$(highest_known_version)"
+
+if [ -n "$HIGHEST_KNOWN" ] && [ "$(printf '%s\n%s\n' "$HIGHEST_KNOWN" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+    echo "Refusing package version regression: requested ${VERSION}, highest known is ${HIGHEST_KNOWN}" >&2
+    echo "Bump VERSION or pass an explicit version greater than ${HIGHEST_KNOWN}" >&2
+    exit 1
+fi
+
 PKG="vortex_${VERSION}_amd64"
 STAGING="/tmp/${PKG}"
 OPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR:-/opt/openssl-4.0}"
@@ -51,6 +83,7 @@ echo "==> Building vortex .deb  version=${VERSION} march=${VORTEX_DEB_MARCH}"
 # ---- 1. Compile ----
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DVORTEX_VERSION_OVERRIDE="$VERSION" \
     -DVORTEX_MARCH="$VORTEX_DEB_MARCH" \
     -DFORCE_OPENSSL_BUNDLED=ON \
     -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \

@@ -11,6 +11,7 @@
 #include "log.h"
 #include "config.h"
 #include "bpf_loader.h"
+#include "version.h"
 
 #include "worker.h"
 #include "pool.h"
@@ -403,7 +404,7 @@ int main(int argc, char *argv[])
     if (verbose) lvl = LOG_DEBUG;
     log_init(lvl, fmt, NULL);
 
-    log_info("vortex_start", "version=0.3.0 config=%s", config_path);
+    log_info("vortex_start", "version=%s config=%s", VORTEX_VERSION, config_path);
 
     setup_signals();
 
