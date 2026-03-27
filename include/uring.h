@@ -29,6 +29,7 @@
 #define VORTEX_OP_H2_RECV_BACKEND    22 /* recv HTTP/1.1 response from H2 stream backend */
 #define VORTEX_OP_H2_GRPC_SEND_BACKEND 23 /* send nghttp2-client output to gRPC backend (h2c) */
 #define VORTEX_OP_H2_GRPC_RECV_BACKEND 24 /* recv raw bytes from gRPC backend (h2c) */
+#define VORTEX_OP_COMPRESS_DONE      25 /* compress_pool result pipe became readable */
 
 /*
  * H2 user_data encoding — encodes op, stream slot, and connection id.

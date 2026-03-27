@@ -41,6 +41,7 @@
 #include "util.h"
 #include "auth.h"
 #include "simd.h"
+#include "compress_pool.h"
 #ifdef VORTEX_PHASE_TLS
 #include "tls.h"
 #include "tls_pool.h"
@@ -157,6 +158,11 @@ static inline size_t b64_encode(const char *src, size_t slen, char *dst, size_t 
 size_t gzip_compress(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_max);
 size_t brotli_compress(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_max);
 bool   is_compressible_type(const uint8_t *ct_val, size_t ct_len);
+size_t compress_http_response_parts(uint8_t *headers, size_t header_len,
+                                    const uint8_t *body, size_t body_len,
+                                    uint8_t *scratch, size_t buf_size,
+                                    bool prefer_br, bool *used_brotli,
+                                    size_t *compressed_len_out);
 
 /* worker_accept.c */
 int  peek_client_hello_sni(int fd, char *out, size_t out_max);

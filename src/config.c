@@ -60,6 +60,7 @@ void config_set_defaults(struct vortex_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->workers        = 0; /* auto */
+    cfg->compress_pool_threads = 0;
     cfg->sqpoll         = false;
     cfg->hugepages      = false;
     cfg->cpu_affinity   = true;  /* on by default — safe, scheduler can override */
@@ -195,6 +196,7 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
     switch (ctx->state) {
     case P_GLOBAL:
         if      (!strcmp(k, "workers"))      c->workers        = atoi(val);
+        else if (!strcmp(k, "compress_pool_threads")) c->compress_pool_threads = atoi(val);
         else if (!strcmp(k, "sqpoll"))       c->sqpoll         = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "hugepages"))    c->hugepages      = !strcmp(val,"true") || !strcmp(val,"yes");
         else if (!strcmp(k, "cpu_affinity")) c->cpu_affinity   = !strcmp(val,"true") || !strcmp(val,"yes");

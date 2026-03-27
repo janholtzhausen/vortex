@@ -2,6 +2,7 @@
 #include "log.h"
 #include "bpf_loader.h"
 #include "tls_pool.h"
+#include "compress_pool.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,29 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
         write_metric_counter(buf, &pos, bufsz,
             "vortex_tls_pool_dropped_total", "TLS handshakes dropped because the pool queue was full",
             tls_stats.dropped_total);
+    }
+
+    {
+        struct compress_pool_stats compress_stats = {0};
+        compress_pool_snapshot(&compress_stats);
+        write_metric_gauge(buf, &pos, bufsz,
+            "vortex_compress_pool_queue_depth", "Pending compression jobs in the pool queue",
+            compress_stats.queue_depth);
+        write_metric_gauge(buf, &pos, bufsz,
+            "vortex_compress_pool_active_jobs", "Compression jobs currently executing",
+            compress_stats.active_jobs);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_compress_pool_submitted_total", "Compression jobs submitted to the pool",
+            compress_stats.submitted_total);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_compress_pool_completed_total", "Compression jobs completed successfully",
+            compress_stats.completed_total);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_compress_pool_failed_total", "Compression jobs that failed or were not beneficial",
+            compress_stats.failed_total);
+        write_metric_counter(buf, &pos, bufsz,
+            "vortex_compress_pool_dropped_total", "Compression jobs dropped because the pool queue was full",
+            compress_stats.dropped_total);
     }
 
     /* Cert expiry */

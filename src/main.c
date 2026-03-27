@@ -537,6 +537,9 @@ int main(int argc, char *argv[])
     bool need_tls_pool = (tls_ptr != NULL) || config_uses_backend_tls(&g_cfg);
     if (need_tls_pool) tls_pool_init();
 #endif
+    bool need_compress_pool = g_cfg.compress_pool_threads > 0;
+    if (need_compress_pool)
+        compress_pool_init(g_cfg.compress_pool_threads);
 
     /* Create one SO_REUSEPORT listen socket per worker.
      * The kernel distributes incoming connections across them by hashing the
@@ -693,6 +696,10 @@ int main(int argc, char *argv[])
     for (int i = 0; i < num_workers; i++) worker_stop(&g_workers[i]);
     for (int i = 0; i < num_workers; i++) {
         worker_join(&g_workers[i]);
+    }
+    if (need_compress_pool)
+        compress_pool_destroy();
+    for (int i = 0; i < num_workers; i++) {
         worker_destroy(&g_workers[i]);
     }
     global_pool_destroy();

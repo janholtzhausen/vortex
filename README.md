@@ -18,6 +18,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **HTTPS backend TLS offload** — origin `SSL_connect` runs in the shared TLS pool instead of blocking the io_uring worker thread
 - **HTTPS backend session reuse** — repeated TLS-origin connections reuse cached client TLS sessions per worker/backend when the origin supports resumption
 - **HTTPS backend pooling** — pooled `https://` origins reuse both the TCP socket and live `SSL*` session across client connections when the origin keeps the connection alive
+- **Optional compression offload** — gzip/brotli response compression can run in a dedicated thread pool instead of blocking the io_uring worker thread
 - **WebSocket passthrough** — detects `Upgrade: websocket` and `101 Switching Protocols`; switches to paired io_uring recv/send chains for full-duplex streaming
 - **HTTP/2 and HTTP/3** — HTTP/3 via ngtcp2 + nghttp3 (conditional compile); `Alt-Svc: h3=":443"` injected into HTTP/1.x responses to advertise QUIC
 
@@ -353,6 +354,7 @@ disables XDP explicitly. `-T` disables TLS.
 ```yaml
 global:
   workers: auto            # Number of worker threads (default: auto = nproc)
+  compress_pool_threads: 0 # 0 = synchronous compression in worker thread; 2-4 recommended for offload
   bind_address: "0.0.0.0"
   bind_port: 443
   http_port: 80            # Used by ACME HTTP-01 challenge server
@@ -461,6 +463,12 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 | `vortex_tls_pool_completed_total` | Successful TLS handshakes completed by the pool |
 | `vortex_tls_pool_failed_total` | TLS handshakes that failed in the pool |
 | `vortex_tls_pool_dropped_total` | Handshakes dropped because the TLS pool queue was full |
+| `vortex_compress_pool_queue_depth` | Pending compression jobs in the shared compression queue |
+| `vortex_compress_pool_active_jobs` | Compression jobs currently executing |
+| `vortex_compress_pool_submitted_total` | Compression jobs submitted to the compression pool |
+| `vortex_compress_pool_completed_total` | Compression jobs completed successfully |
+| `vortex_compress_pool_failed_total` | Compression jobs that failed or were not beneficial |
+| `vortex_compress_pool_dropped_total` | Compression jobs dropped because the pool queue was full |
 | `vortex_xdp_rx_packets_total` | Packets seen by XDP |
 | `vortex_xdp_rx_bytes_total` | Bytes seen by XDP |
 | `vortex_xdp_passed_total` | Packets passed to kernel stack |

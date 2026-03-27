@@ -176,6 +176,7 @@ struct dashboard_config {
 struct vortex_config {
     /* global */
     int      workers;        /* 0 = auto (nproc) */
+    int      compress_pool_threads; /* 0 = synchronous compression in worker thread */
     bool     sqpoll;         /* io_uring SQPOLL: kernel thread polls SQ, zero-syscall submit */
     bool     hugepages;      /* use 2MB huge pages for conn buffer slabs (requires vm.nr_hugepages) */
     bool     cpu_affinity;   /* pin worker N to CPU N (reduces cache misses on hot path) */

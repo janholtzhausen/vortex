@@ -55,3 +55,62 @@ bool is_compressible_type(const uint8_t *ct_val, size_t ct_len)
            (ct_len >= 15 && memcmp(ct_val, "application/xml", 15) == 0) ||
            (ct_len >= 13 && memcmp(ct_val, "image/svg+xml", 13) == 0);
 }
+
+size_t compress_http_response_parts(uint8_t *headers, size_t header_len,
+                                    const uint8_t *body, size_t body_len,
+                                    uint8_t *scratch, size_t buf_size,
+                                    bool prefer_br, bool *used_brotli,
+                                    size_t *compressed_len_out)
+{
+    if (!headers || !body || !scratch || header_len < 4 || body_len < COMPRESS_MIN_BODY)
+        return 0;
+
+    size_t clen = prefer_br
+        ? brotli_compress(body, body_len, scratch, buf_size)
+        : gzip_compress(body, body_len, scratch, buf_size);
+    if (prefer_br && (clen == 0 || clen >= body_len)) {
+        prefer_br = false;
+        clen = gzip_compress(body, body_len, scratch, buf_size);
+    }
+    if (clen == 0 || clen >= body_len)
+        return 0;
+
+    uint8_t *clh = (uint8_t *)memmem(headers, header_len, "\r\nContent-Length:", 17);
+    if (!clh) clh = (uint8_t *)memmem(headers, header_len, "\r\ncontent-length:", 17);
+    if (!clh)
+        return 0;
+
+    size_t hdr_end_off = header_len - 4;
+    uint8_t *vs = clh + 17;
+    while (vs < headers + hdr_end_off && (*vs == ' ' || *vs == '\t')) vs++;
+    uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(headers + hdr_end_off - vs));
+    if (!ve)
+        return 0;
+
+    char new_cl[20];
+    int ncl = snprintf(new_cl, sizeof(new_cl), "%zu", clen);
+    int delta = ncl - (int)(ve - vs);
+    if (hdr_end_off + 4 + delta >= buf_size)
+        return 0;
+    memmove(vs + ncl, ve, (size_t)(headers + hdr_end_off + 4 - ve));
+    memcpy(vs, new_cl, (size_t)ncl);
+    hdr_end_off = (size_t)((int)hdr_end_off + delta);
+
+    const char *ce_hdr = prefer_br
+        ? "\r\nContent-Encoding: br"
+        : "\r\nContent-Encoding: gzip";
+    int ce_len = prefer_br ? 22 : 24;
+    size_t new_body_off = hdr_end_off + (size_t)ce_len + 4;
+    if (new_body_off + clen > buf_size)
+        return 0;
+
+    memmove(headers + hdr_end_off + ce_len, headers + hdr_end_off, 4);
+    memcpy(headers + hdr_end_off, ce_hdr, (size_t)ce_len);
+    memcpy(headers + new_body_off, scratch, clen);
+
+    if (used_brotli)
+        *used_brotli = prefer_br;
+    if (compressed_len_out)
+        *compressed_len_out = clen;
+    return new_body_off + clen;
+}

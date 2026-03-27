@@ -49,6 +49,28 @@ static void try_backend_pool_return(struct worker *w, uint32_t cid, struct conn_
         cid, ri, bi);
 }
 
+static void submit_client_response_send(struct worker *w, uint32_t cid,
+                                        struct conn_hot *h, int n)
+{
+    h->send_buf_off = 0;
+    h->send_buf_len = (uint32_t)n;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+    if (!sqe) { conn_close(w, cid, true); return; }
+    if (w->uring.bufs_registered && !(h->flags & CONN_FLAG_KTLS_TX)) {
+        h->zc_notif_count++;
+        io_uring_prep_send_zc_fixed(sqe, h->client_fd,
+            conn_send_buf(&w->pool, cid), (size_t)n,
+            MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
+        if (w->uring.files_registered) sqe->flags |= IOSQE_FIXED_FILE;
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
+    } else {
+        PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+            conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+        sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
+    }
+    uring_submit(&w->uring);
+}
+
 static int rewrite_backend_connection_header(struct worker *w, uint32_t cid,
                                              struct conn_hot *h, uint8_t *rbuf,
                                              int fwd_n, bool is_ws)
@@ -740,54 +762,36 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                     if (is_compressible_type(ct_val, ct_remaining)) {
                         bool use_br = (h->flags & CONN_FLAG_CLIENT_BR) != 0;
                         uint8_t *scratch = conn_recv_buf(&w->pool, cid);
-                        size_t clen = use_br
-                            ? brotli_compress(sbuf_gz + body_off, body_len,
-                                              scratch, w->pool.buf_size)
-                            : gzip_compress(sbuf_gz + body_off, body_len,
-                                            scratch, w->pool.buf_size);
-                        if (use_br && (clen == 0 || clen >= body_len)) {
-                            use_br = false;
-                            clen = gzip_compress(sbuf_gz + body_off, body_len,
-                                                 scratch, w->pool.buf_size);
+                        if (w->cfg->compress_pool_threads > 0 &&
+                            w->compress_done_pipe_wr >= 0) {
+                            struct compress_job job = {
+                                .cid = cid,
+                                .result_pipe_wr = w->compress_done_pipe_wr,
+                                .src = sbuf_gz + body_off,
+                                .src_len = body_len,
+                                .headers = sbuf_gz,
+                                .header_len = hdr_end_off + 4,
+                                .scratch = scratch,
+                                .use_brotli = use_br,
+                                .buf_size = w->pool.buf_size,
+                            };
+                            h->flags |= CONN_FLAG_COMPRESS_PENDING;
+                            h->send_buf_off = 0;
+                            h->send_buf_len = (uint32_t)n;
+                            if (compress_pool_submit(job))
+                                return;
+                            h->flags &= ~CONN_FLAG_COMPRESS_PENDING;
                         }
 
-                        if (clen > 0 && clen < body_len) {
-                            uint8_t *clh3 = (uint8_t *)memmem(
-                                sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
-                            if (!clh3) clh3 = (uint8_t *)memmem(
-                                sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
-                            if (clh3) {
-                                uint8_t *vs = clh3 + 17;
-                                while (*vs == ' ') vs++;
-                                uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                                    (size_t)(sbuf_gz + hdr_end_off - vs));
-                                if (ve) {
-                                    char new_cl[20];
-                                    int ncl = snprintf(new_cl, sizeof(new_cl), "%zu", clen);
-                                    int delta = ncl - (int)(ve - vs);
-                                    memmove(vs + ncl, ve,
-                                        (size_t)(sbuf_gz + hdr_end_off + 4 - ve));
-                                    memcpy(vs, new_cl, (size_t)ncl);
-                                    hdr_end_off = (size_t)((int)hdr_end_off + delta);
-                                }
-                            }
-
-                            {
-                                const char *ce_hdr = use_br
-                                    ? "\r\nContent-Encoding: br"
-                                    : "\r\nContent-Encoding: gzip";
-                                int ce_len = use_br ? 22 : 24;
-                                memmove(sbuf_gz + hdr_end_off + ce_len,
-                                        sbuf_gz + hdr_end_off, 4);
-                                memcpy(sbuf_gz + hdr_end_off, ce_hdr, (size_t)ce_len);
-                                size_t new_body_off = hdr_end_off + (size_t)ce_len + 4;
-                                if (new_body_off + clen <= w->pool.buf_size) {
-                                    memcpy(sbuf_gz + new_body_off, scratch, clen);
-                                    n = (int)(new_body_off + clen);
-                                    log_debug("compress", "conn=%u %s %zu→%zu bytes",
-                                              cid, use_br ? "br" : "gzip", body_len, clen);
-                                }
-                            }
+                        bool used_br = false;
+                        size_t clen = 0;
+                        size_t total_len = compress_http_response_parts(sbuf_gz, hdr_end_off + 4,
+                            sbuf_gz + body_off, body_len, scratch, w->pool.buf_size,
+                            use_br, &used_br, &clen);
+                        if (total_len > 0) {
+                            n = (int)total_len;
+                            log_debug("compress", "conn=%u %s %zu→%zu bytes",
+                                      cid, used_br ? "br" : "gzip", body_len, clen);
                         }
                     }
                 }
@@ -795,25 +799,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
         }
     }
 
-    h->send_buf_off = 0;
-    h->send_buf_len = (uint32_t)n;
-    {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe) { conn_close(w, cid, true); return; }
-        if (w->uring.bufs_registered && !(h->flags & CONN_FLAG_KTLS_TX)) {
-            h->zc_notif_count++;
-            io_uring_prep_send_zc_fixed(sqe, h->client_fd,
-                conn_send_buf(&w->pool, cid), (size_t)n,
-                MSG_NOSIGNAL, 0, (unsigned)SEND_IDX_SEND(w, cid));
-            if (w->uring.files_registered) sqe->flags |= IOSQE_FIXED_FILE;
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_ZC, cid);
-        } else {
-            PREP_SEND(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_send_buf(&w->pool, cid), (size_t)n, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
-        }
-        uring_submit(&w->uring);
-    }
+    submit_client_response_send(w, cid, h, n);
 }
 
 /*
@@ -1099,6 +1085,44 @@ static void handle_tls_done(struct worker *w, struct io_uring_cqe *cqe)
     }
 }
 #endif
+
+static void process_compress_result(struct worker *w, const struct compress_result *res)
+{
+    uint32_t cid = res->cid;
+    if (cid >= w->pool.capacity) return;
+    struct conn_hot *h = conn_hot(&w->pool, cid);
+    if (h->state == CONN_STATE_FREE) return;
+    if (!(h->flags & CONN_FLAG_COMPRESS_PENDING)) return;
+
+    h->flags &= ~CONN_FLAG_COMPRESS_PENDING;
+    submit_client_response_send(w, cid, h,
+        res->ok ? (int)res->total_len : (int)h->send_buf_len);
+}
+
+static void handle_compress_done(struct worker *w, struct io_uring_cqe *cqe)
+{
+    struct io_uring_sqe *rpsqe = io_uring_get_sqe(&w->uring.ring);
+    if (rpsqe) {
+        io_uring_prep_read(rpsqe, w->compress_done_pipe_rd,
+                           w->compress_pipe_buf, sizeof(w->compress_pipe_buf), 0);
+        rpsqe->user_data = URING_UD_ENCODE(VORTEX_OP_COMPRESS_DONE, 0);
+    }
+    uring_submit(&w->uring);
+
+    if (cqe->res != (int)sizeof(struct compress_result))
+        return;
+
+    struct compress_result res;
+    memcpy(&res, w->compress_pipe_buf, sizeof(res));
+    process_compress_result(w, &res);
+
+    for (;;) {
+        struct compress_result extra;
+        ssize_t nr = read(w->compress_done_pipe_rd, &extra, sizeof(extra));
+        if (nr != (ssize_t)sizeof(extra)) break;
+        process_compress_result(w, &extra);
+    }
+}
 
 #ifdef VORTEX_H2
 static bool handle_h2_backend_ops(struct worker *w, struct io_uring_cqe *cqe, uint32_t op)
@@ -2078,6 +2102,10 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         return;
     }
 #endif
+    if (op == VORTEX_OP_COMPRESS_DONE) {
+        handle_compress_done(w, cqe);
+        return;
+    }
 
 #ifdef VORTEX_H2
     if (handle_h2_backend_ops(w, cqe, op))

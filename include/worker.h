@@ -6,6 +6,7 @@
 #include "router.h"
 #include "tls.h"
 #include "tls_pool.h"
+#include "compress_pool.h"
 #include "cache.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -72,6 +73,9 @@ struct worker {
     int              tls_done_pipe_wr; /* write end — passed to pool threads */
     /* Buffer for a single read from the result pipe (one result at a time) */
     uint8_t          tls_pipe_buf[sizeof(struct tls_handshake_result)];
+    int              compress_done_pipe_rd; /* read end — polled by io_uring */
+    int              compress_done_pipe_wr; /* write end — passed to pool threads */
+    uint8_t          compress_pipe_buf[sizeof(struct compress_result)];
 
     /* XDP blocklist expiry ring — FIFO, oldest at head */
     struct blocked_entry blocked_list[WORKER_BLOCKED_MAX];

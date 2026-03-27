@@ -73,6 +73,14 @@ static void *worker_thread(void *arg)
         }
     }
 #endif
+    if (w->compress_done_pipe_rd >= 0) {
+        struct io_uring_sqe *csqe = io_uring_get_sqe(&w->uring.ring);
+        if (csqe) {
+            io_uring_prep_read(csqe, w->compress_done_pipe_rd,
+                               w->compress_pipe_buf, sizeof(w->compress_pipe_buf), 0);
+            csqe->user_data = URING_UD_ENCODE(VORTEX_OP_COMPRESS_DONE, 0);
+        }
+    }
     uring_submit(&w->uring);
 
     while (!w->stop) {
@@ -356,6 +364,19 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
         }
     }
 
+    if (cfg->compress_pool_threads > 0) {
+        int pfd[2];
+        if (pipe2(pfd, O_NONBLOCK | O_CLOEXEC) == 0) {
+            w->compress_done_pipe_rd = pfd[0];
+            w->compress_done_pipe_wr = pfd[1];
+        } else {
+            w->compress_done_pipe_rd = w->compress_done_pipe_wr = -1;
+            log_warn("worker_init", "compress_done pipe creation failed: %s", strerror(errno));
+        }
+    } else {
+        w->compress_done_pipe_rd = w->compress_done_pipe_wr = -1;
+    }
+
     /* Open tarpit log */
     w->tarpit_log = fopen("/var/log/vortex/tarpit.log", "a");
     if (!w->tarpit_log)
@@ -431,6 +452,14 @@ void worker_stop(struct worker *w)
         close(w->tls_done_pipe_wr);
         w->tls_done_pipe_wr = -1;
     }
+    if (w->compress_done_pipe_rd >= 0) {
+        close(w->compress_done_pipe_rd);
+        w->compress_done_pipe_rd = -1;
+    }
+    if (w->compress_done_pipe_wr >= 0) {
+        close(w->compress_done_pipe_wr);
+        w->compress_done_pipe_wr = -1;
+    }
 }
 
 void worker_join(struct worker *w)
@@ -460,6 +489,8 @@ void worker_destroy(struct worker *w)
     if (w->urandom_fd >= 0) { close(w->urandom_fd); w->urandom_fd = -1; }
     if (w->tls_done_pipe_rd >= 0) { close(w->tls_done_pipe_rd); w->tls_done_pipe_rd = -1; }
     if (w->tls_done_pipe_wr >= 0) { close(w->tls_done_pipe_wr); w->tls_done_pipe_wr = -1; }
+    if (w->compress_done_pipe_rd >= 0) { close(w->compress_done_pipe_rd); w->compress_done_pipe_rd = -1; }
+    if (w->compress_done_pipe_wr >= 0) { close(w->compress_done_pipe_wr); w->compress_done_pipe_wr = -1; }
     if (w->tarpit_log)  { fclose(w->tarpit_log); w->tarpit_log = NULL; }
 #ifdef VORTEX_PHASE_TLS
     if (w->backend_tls_client_ctx) {

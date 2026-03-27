@@ -6,6 +6,11 @@ global:
   #   ethtool -L eth0 combined <workers>
   workers: auto
 
+  # Number of response-compression offload threads. 0 keeps gzip/brotli
+  # synchronous in the io_uring worker thread (current default behavior).
+  # 2-4 is a reasonable starting point when large HTML/JSON bodies dominate.
+  compress_pool_threads: 0
+
   # io_uring SQPOLL: spawn a kernel thread per worker that continuously polls
   # the submission ring, eliminating the io_uring_enter() syscall on the hot
   # submit path. Requires CAP_SYS_ADMIN (already granted in the service unit).

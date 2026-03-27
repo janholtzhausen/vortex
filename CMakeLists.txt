@@ -135,6 +135,7 @@ set(VORTEX_SRCS
     src/worker_backend.c
     src/worker_cache.c
     src/worker_compress.c
+    src/compress_pool.c
     src/worker_proxy.c
     src/pool.c
     src/cache.c
