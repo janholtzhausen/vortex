@@ -49,6 +49,57 @@ static void try_backend_pool_return(struct worker *w, uint32_t cid, struct conn_
         cid, ri, bi);
 }
 
+static int rewrite_backend_connection_header(struct worker *w, uint32_t cid,
+                                             struct conn_hot *h, uint8_t *rbuf,
+                                             int fwd_n, bool is_ws)
+{
+    if (is_ws)
+        return fwd_n;
+
+    bool use_ka = ((h->flags & CONN_FLAG_BACKEND_POOLED) != 0
+                  || (w->cfg->routes[h->route_idx]
+                         .backends[h->backend_idx].pool_size > 0));
+    const char *conn_val = use_ka ? "keep-alive" : "close";
+    size_t conn_val_len = use_ka ? 10 : 5;
+
+    uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
+    if (!ch)
+        ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
+    if (ch) {
+        uint8_t *vs = ch + 13;
+        while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
+        uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
+        if (ve && ve > vs) {
+            size_t old_len = (size_t)(ve - vs);
+            int delta = (int)conn_val_len - (int)old_len;
+            if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
+                memmove(vs + conn_val_len, ve, (size_t)(rbuf + fwd_n - ve));
+                memcpy(vs, conn_val, conn_val_len);
+                fwd_n += delta;
+            }
+        }
+    } else {
+        const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
+        char inj0[32];
+        int il0 = snprintf(inj0, sizeof(inj0),
+            "Connection: %s\r\n", conn_val);
+        if (eol0 && fwd_n + il0 <= (int)w->pool.buf_size) {
+            size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
+            memmove(rbuf + le + il0, rbuf + le, (size_t)fwd_n - le);
+            memcpy(rbuf + le, inj0, (size_t)il0);
+            fwd_n += il0;
+        }
+    }
+
+    if (use_ka) {
+        struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+        cold->backend_content_length = 0;
+        cold->backend_body_recv      = 0;
+    }
+
+    return fwd_n;
+}
+
 /* Extract method and URL from HTTP/1.x request line.
  * Returns 0 on success, -1 if not a parseable HTTP request. */
 int parse_http_request_line(const uint8_t *buf, int len,
@@ -1431,52 +1482,7 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
          * For pooled backends (pool_size > 0): use keep-alive so we can
          * reuse the connection.  For all others: force "close" so the
          * backend signals response completion with EOF. */
-        if (!is_ws) {
-            bool use_ka = ((h->flags & CONN_FLAG_BACKEND_POOLED) != 0
-                          || (w->cfg->routes[h->route_idx]
-                                 .backends[h->backend_idx].pool_size > 0));
-            const char *conn_val = use_ka ? "keep-alive" : "close";
-            size_t      conn_val_len = use_ka ? 10 : 5;
-
-            uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
-            if (!ch)
-                ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
-            if (ch) {
-                uint8_t *vs = ch + 13;
-                while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
-                if (ve && ve > vs) {
-                    size_t old_len = (size_t)(ve - vs);
-                    int delta = (int)conn_val_len - (int)old_len;
-                    if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
-                        memmove(vs + conn_val_len, ve, (size_t)(rbuf + fwd_n - ve));
-                        memcpy(vs, conn_val, conn_val_len);
-                        fwd_n += delta;
-                    }
-                }
-            } else {
-                /* No Connection header — inject one */
-                const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
-                if (eol0) {
-                    size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
-                    char inj0[32];
-                    int il0 = snprintf(inj0, sizeof(inj0),
-                        "Connection: %s\r\n", conn_val);
-                    if (fwd_n + il0 <= (int)w->pool.buf_size) {
-                        memmove(rbuf + le + il0, rbuf + le, (size_t)fwd_n - le);
-                        memcpy(rbuf + le, inj0, (size_t)il0);
-                        fwd_n += il0;
-                    }
-                }
-            }
-
-            /* Reset per-response body tracking for this request */
-            if (use_ka) {
-                struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                cold->backend_content_length = 0;
-                cold->backend_body_recv      = 0;
-            }
-        }
+        fwd_n = rewrite_backend_connection_header(w, cid, h, rbuf, fwd_n, is_ws);
 
         /* ---- Inject proxy headers after request line ----
          * X-Forwarded-Proto, X-Forwarded-For, X-Real-IP, X-Api-Key */
@@ -1803,49 +1809,7 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
             }
         }
 
-        /* Rewrite or inject Connection based on backend pooling.
-         * Pooled backends keep the connection alive; all others close. */
-        {
-            bool use_ka = ((h->flags & CONN_FLAG_BACKEND_POOLED) != 0
-                          || (w->cfg->routes[h->route_idx]
-                                 .backends[h->backend_idx].pool_size > 0));
-            const char *conn_val = use_ka ? "keep-alive" : "close";
-            size_t conn_val_len = use_ka ? 10 : 5;
-            uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
-            if (!ch)
-                ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
-            if (ch) {
-                uint8_t *vs = ch + 13;
-                while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
-                uint8_t *ve = (uint8_t *)FIND_CRLF(vs,
-                    (size_t)(rbuf + fwd_n - vs));
-                if (ve && ve > vs) {
-                    size_t old_len = (size_t)(ve - vs);
-                    int delta = (int)conn_val_len - (int)old_len;
-                    if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
-                        memmove(vs + conn_val_len, ve, (size_t)(rbuf + fwd_n - ve));
-                        memcpy(vs, conn_val, conn_val_len);
-                        fwd_n += delta;
-                    }
-                }
-            } else {
-                const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
-                char inj0[32];
-                int il0 = snprintf(inj0, sizeof(inj0),
-                    "Connection: %s\r\n", conn_val);
-                if (eol0 && fwd_n + il0 <= (int)w->pool.buf_size) {
-                    size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
-                    memmove(rbuf + le + il0, rbuf + le, (size_t)fwd_n - le);
-                    memcpy(rbuf + le, inj0, (size_t)il0);
-                    fwd_n += il0;
-                }
-            }
-            if (use_ka) {
-                struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-                cold->backend_content_length = 0;
-                cold->backend_body_recv      = 0;
-            }
-        }
+        fwd_n = rewrite_backend_connection_header(w, cid, h, rbuf, fwd_n, false);
         if (backend_uses_tls(w, cid)) {
             if (backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n) < 0) {
                 send_bad_gateway_and_close(w, cid);
