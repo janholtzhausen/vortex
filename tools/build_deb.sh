@@ -113,8 +113,8 @@ patchelf --set-rpath /usr/lib/vortex "$STAGING/usr/bin/vortex" 2>/dev/null || \
 # BPF object
 install -m 644 "$BUILD_DIR/vortex_xdp.bpf.o" "$STAGING/usr/share/vortex/vortex_xdp.bpf.o"
 
-# Bundled OpenSSL 4.0 libs (from /opt/openssl-4.0)
-OPENSSL_DIR="/opt/openssl-4.0/lib64"
+# Bundled OpenSSL 4.0 libs
+OPENSSL_DIR="${OPENSSL_ROOT_DIR}/lib64"
 for lib in libcrypto.so.4 libssl.so.4; do
     if [ -f "$OPENSSL_DIR/$lib" ]; then
         install -m 755 "$OPENSSL_DIR/$lib" "$STAGING/usr/lib/vortex/$lib"

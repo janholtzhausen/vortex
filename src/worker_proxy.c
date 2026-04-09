@@ -319,11 +319,23 @@ static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool
             h->last_active_tsc = rdtsc();
             w->accepted++;
 
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-            if (!sqe) { conn_close(w, cid, true); return -1; }
-            PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            if (h->flags & CONN_FLAG_TCP_TUNNEL) {
+                struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
+                struct io_uring_sqe *sqe_b = io_uring_get_sqe(&w->uring.ring);
+                if (!sqe_c || !sqe_b) { conn_close(w, cid, true); return -1; }
+                PREP_RECV(w, sqe_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_RECV(w, cid));
+                sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT_WS, cid);
+                PREP_RECV(w, sqe_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+                    conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+                sqe_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
+            } else {
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+                if (!sqe) { conn_close(w, cid, true); return -1; }
+                PREP_RECV(w, sqe, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+                sqe->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            }
             uring_submit(&w->uring);
         }
         return 0;
@@ -972,6 +984,8 @@ static void process_tls_result(struct worker *w,
     {
         int route_idx = res->tls_route_idx;
         if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
+            if (w->cfg->routes[route_idx].route_type == ROUTE_TYPE_TCP_TUNNEL)
+                th->flags |= CONN_FLAG_TCP_TUNNEL;
             if (route_and_connect(w, hcid, route_idx, false) < 0)
                 return;
             if (th->flags & CONN_FLAG_BACKEND_CONNECTING)
@@ -1911,11 +1925,24 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
         sqe_s->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
         uring_submit(&w->uring);
     } else {
-        struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
-        if (!sqe_c) { conn_close(w, cid, true); return; }
-        PREP_RECV(w, sqe_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
-            conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-        sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        if (h->flags & CONN_FLAG_TCP_TUNNEL) {
+            /* TCP tunnel: arm both recv directions simultaneously */
+            struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
+            struct io_uring_sqe *sqe_b = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe_c || !sqe_b) { conn_close(w, cid, true); return; }
+            PREP_RECV(w, sqe_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_recv_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_RECV(w, cid));
+            sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT_WS, cid);
+            PREP_RECV(w, sqe_b, h->backend_fd, FIXED_FD_BACKEND(w, cid),
+                conn_send_buf(&w->pool, cid), w->pool.buf_size, 0, SEND_IDX_SEND(w, cid));
+            sqe_b->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_BACKEND_WS, cid);
+        } else {
+            struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe_c) { conn_close(w, cid, true); return; }
+            PREP_RECV(w, sqe_c, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+            sqe_c->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+        }
         uring_submit(&w->uring);
     }
 }

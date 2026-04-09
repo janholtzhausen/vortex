@@ -39,6 +39,7 @@ typedef enum {
 #define CONN_FLAG_BACKEND_COUNTED    (1 << 14) /* counted in shared least_conn backend load */
 #define CONN_FLAG_BACKEND_TLS_PENDING (1 << 15) /* backend TLS handshake is running in tls_pool */
 #define CONN_FLAG_COMPRESS_PENDING   (1 << 16) /* response compression is running in compress_pool */
+#define CONN_FLAG_TCP_TUNNEL         (1 << 17) /* raw TCP tunnel: skip HTTP, bidirectional raw forward */
 
 /* Hot connection data — 2 cache lines (128 bytes), accessed per-packet */
 struct __attribute__((aligned(64))) conn_hot {

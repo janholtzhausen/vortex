@@ -28,6 +28,11 @@ typedef enum {
     XDP_MODE_SKB,
 } xdp_mode_t;
 
+typedef enum {
+    ROUTE_TYPE_HTTP = 0,
+    ROUTE_TYPE_TCP_TUNNEL,  /* TLS terminated; raw TCP forwarded to backend */
+} route_type_t;
+
 struct backend_config {
     char     address[256];
     char     sni[256];
@@ -89,6 +94,7 @@ struct route_config {
     struct backend_config backends[VORTEX_MAX_BACKENDS];
     uint8_t  backend_count;
     lb_algo_t lb_algo;
+    route_type_t route_type;   /* ROUTE_TYPE_HTTP (default) or ROUTE_TYPE_TCP_TUNNEL */
 
     cert_provider_type_t cert_provider;
     char cert_path[PATH_MAX];

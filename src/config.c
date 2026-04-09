@@ -287,6 +287,10 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "server_header"))      snprintf(r->server_header, sizeof(r->server_header), "%s", !strcmp(val,"none") ? "" : val);
         else if (!strcmp(k, "congestion_control")) snprintf(r->congestion_control, sizeof(r->congestion_control), "%s", val);
         else if (!strcmp(k, "hostname"))     snprintf(r->hostname, sizeof(r->hostname), "%s", val);
+        else if (!strcmp(k, "protocol")) {
+            if (!strcmp(val, "tcp")) r->route_type = ROUTE_TYPE_TCP_TUNNEL;
+            else                     r->route_type = ROUTE_TYPE_HTTP;
+        }
         else if (!strcmp(k, "load_balancing")) {
             if      (!strcmp(val,"weighted_round_robin")) r->lb_algo = LB_WEIGHTED_ROUND_ROBIN;
             else if (!strcmp(val,"least_conn"))           r->lb_algo = LB_LEAST_CONN;
