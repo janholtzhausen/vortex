@@ -199,7 +199,14 @@ static __always_inline int conntrack_tcp_v4(struct vortex_metrics *m,
         struct conn_state new_state = {0};
         new_state.tcp_state = CT_SYN_SENT;
         new_state.last_seen_ns = now;
-        bpf_map_update_elem(&conn_track_map, &key, &new_state, BPF_ANY);
+        /* BPF_NOEXIST prevents a SYN flood from overwriting ESTABLISHED entries in the
+         * LRU map.  If the entry already exists, only refresh last_seen_ns when the
+         * existing state is itself CT_SYN_SENT (retransmitted SYN). */
+        if (bpf_map_update_elem(&conn_track_map, &key, &new_state, BPF_NOEXIST) != 0) {
+            struct conn_state *cs_exist = bpf_map_lookup_elem(&conn_track_map, &key);
+            if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT)
+                cs_exist->last_seen_ns = now;
+        }
         return XDP_PASS;
     }
 
@@ -261,7 +268,11 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m,
         struct conn_state new_state = {0};
         new_state.tcp_state = CT_SYN_SENT;
         new_state.last_seen_ns = now;
-        bpf_map_update_elem(&conn_track_map_v6, &key, &new_state, BPF_ANY);
+        if (bpf_map_update_elem(&conn_track_map_v6, &key, &new_state, BPF_NOEXIST) != 0) {
+            struct conn_state *cs_exist = bpf_map_lookup_elem(&conn_track_map_v6, &key);
+            if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT)
+                cs_exist->last_seen_ns = now;
+        }
         return XDP_PASS;
     }
 
@@ -316,6 +327,8 @@ int vortex_xdp_main(struct xdp_md *ctx)
                     goto pass_invalid;
                 nexthdr = opt->nexthdr;
                 off += ((__u32)opt->hdrlen + 1) * 8;
+                if (off > 128)
+                    goto drop_invalid;
                 if ((void *)ip6 + off > data_end)
                     goto pass_invalid;
                 continue;
@@ -338,6 +351,8 @@ int vortex_xdp_main(struct xdp_md *ctx)
 
         struct tcphdr *tcp6 = (void *)ip6 + off;
         if ((void *)(tcp6 + 1) > data_end)
+            goto pass_invalid;
+        if (tcp6->doff < 5 || (void *)tcp6 + tcp6->doff * 4 > data_end)
             goto pass_invalid;
 
         struct ip6_addr src_ip6 = {0}, dst_ip6 = {0};
@@ -363,6 +378,8 @@ int vortex_xdp_main(struct xdp_md *ctx)
 
     struct tcphdr *tcp = (void *)ip + ip_hlen;
     if ((void *)(tcp + 1) > data_end)
+        goto pass_invalid;
+    if (tcp->doff < 5 || (void *)tcp + tcp->doff * 4 > data_end)
         goto pass_invalid;
 
     if (conntrack_tcp_v4(m, ip->saddr, ip->daddr, tcp) == XDP_DROP)

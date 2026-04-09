@@ -63,7 +63,15 @@ static void setup_signals(void)
 
 static int write_pid_file(const char *path)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    if (fd < 0 && errno == EEXIST) {
+        /* Stale PID file — verify it is a regular file owned by root before removing */
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0) {
+            unlink(path);
+            fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+        }
+    }
     if (fd < 0) {
         log_warn("pid_file", "cannot write pid file %s: %s", path, strerror(errno));
         return -1;
@@ -361,10 +369,20 @@ static void cert_manager_reload_static(void)
     }
 
     /* Publish new route_count AFTER all ssl_ctx values have been stored.
+     * Only advance to the highest contiguous successfully-loaded new route;
+     * if a new route's tls_create_ctx_from_pem failed, its ssl_ctx is NULL —
+     * stop before that index so workers never see a NULL ssl_ctx slot.
      * A full sequential barrier ensures workers that load the new route_count
      * will also see all the ssl_ctx writes that precede it. */
-    if (g_cfg.route_count > g_tls.route_count)
-        __atomic_store_n(&g_tls.route_count, g_cfg.route_count, __ATOMIC_SEQ_CST);
+    if (g_cfg.route_count > g_tls.route_count) {
+        int new_route_count = g_tls.route_count;
+        for (int i = g_tls.route_count; i < g_cfg.route_count; i++) {
+            if (!g_tls.routes[i].ssl_ctx) break;
+            new_route_count = i + 1;
+        }
+        if (new_route_count > g_tls.route_count)
+            __atomic_store_n(&g_tls.route_count, new_route_count, __ATOMIC_SEQ_CST);
+    }
 }
 #endif /* VORTEX_PHASE_TLS */
 

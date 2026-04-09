@@ -1005,7 +1005,17 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
     log_debug("accept_cqe", "worker=%d res=%d flags=0x%x",
         w->worker_id, cqe->res, cqe->flags);
     if (client_fd < 0) {
-        /* Multishot accept will continue unless !IORING_CQE_F_MORE */
+        /* Multishot accept terminated — re-arm if the listen fd is still open */
+        if (!(cqe->flags & IORING_CQE_F_MORE) && w->listen_fd >= 0) {
+            log_warn("accept_cqe", "worker=%d multishot accept terminated (res=%d); re-arming",
+                w->worker_id, cqe->res);
+            struct io_uring_sqe *rasqe = io_uring_get_sqe(&w->uring.ring);
+            if (rasqe) {
+                io_uring_prep_multishot_accept(rasqe, w->listen_fd, NULL, NULL, 0);
+                rasqe->user_data = URING_UD_ENCODE(VORTEX_OP_ACCEPT, 0);
+                uring_submit(&w->uring);
+            }
+        }
         return;
     }
 

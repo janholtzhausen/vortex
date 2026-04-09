@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <stdatomic.h>
 /*
  * worker.c — worker thread lifecycle, connection pool initialization, and
  * public API (worker_init, worker_start, worker_stop, worker_join,
@@ -21,6 +22,8 @@ static void *worker_thread(void *arg)
         log_error("worker_thread", "uring_init failed");
         return NULL;
     }
+    if (!(w->uring.ring.features & IORING_FEAT_NODROP))
+        log_warn("worker_thread", "id=%d kernel lacks IORING_FEAT_NODROP — CQ overflow possible; upgrade kernel", w->worker_id);
 
     /* Register fixed buffers — one iovec per recv/send slot.
      * recv_buf[cid] → index cid, send_buf[cid] → index (capacity + cid).
@@ -83,7 +86,7 @@ static void *worker_thread(void *arg)
     }
     uring_submit(&w->uring);
 
-    while (!w->stop) {
+    while (!atomic_load_explicit(&w->stop, memory_order_relaxed)) {
         struct io_uring_cqe *cqe;
         unsigned head;
         unsigned count = 0;
@@ -435,7 +438,7 @@ int worker_start(struct worker *w)
 
 void worker_stop(struct worker *w)
 {
-    w->stop = 1;
+    atomic_store_explicit(&w->stop, 1, memory_order_relaxed);
 
     /* Wake the worker immediately instead of waiting for the 1s timeout.
      * This also cancels the multishot accept / TLS-done pipe SQEs before

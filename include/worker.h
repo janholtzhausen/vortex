@@ -99,7 +99,7 @@ struct worker {
         uint64_t last_ns;
     } route_rl[VORTEX_MAX_ROUTES];
 
-    volatile int     stop;
+    _Atomic int      stop;   /* set by worker_stop() from another thread */
 };
 
 /* Create listening socket bound to addr:port.

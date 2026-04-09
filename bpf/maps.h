@@ -65,7 +65,7 @@ struct rate_config {
 #define CT_TIMEOUT_FIN_NS  (30ULL  * 1000000000ULL)  /* 30 s: half-closed          */
 
 /* Maximum number of simultaneously tracked connections */
-#define CT_MAP_MAX_ENTRIES 131072
+#define CT_MAP_MAX_ENTRIES 524288
 
 /* 5-tuple connection key (all fields in network byte order) */
 struct conn_tuple {
