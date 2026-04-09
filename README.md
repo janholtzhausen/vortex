@@ -776,6 +776,17 @@ Vortex is original software but is built on the shoulders of several excellent o
 | **[ngtcp2](https://github.com/ngtcp2/ngtcp2)** | 1.16.0 | MIT | QUIC transport protocol (HTTP/3) |
 | **[nghttp3](https://github.com/ngtcp2/nghttp3)** | 1.8.0 | MIT | HTTP/3 application layer over QUIC |
 
+### License compatibility
+
+Vortex itself is released under the **GNU General Public License v3.0 (GPLv3)**. All dependencies are compatible:
+
+- MIT, BSD-2-Clause — permissive, compatible with GPLv3.
+- LGPL-2.1 — compatible with GPLv3 when linked dynamically (libbpf, liburing, libyaml are system shared libraries).
+- Apache 2.0 (OpenSSL 4.0) — compatible with GPLv3 per the FSF's clarification.
+- GPL-2.0 (kernel BPF program, vmlinux.h) — the XDP program is a separate kernel-space component; it is explicitly GPL-2.0 as required by the kernel's module ABI.
+
+Commercial entities wishing to use Vortex without complying with the GPLv3 (for example, in a proprietary product) must obtain a separate commercial licence from the author.
+
 ### Kernel interfaces
 
 - **XDP (eXpress Data Path)** — in-kernel packet processing framework, part of the Linux kernel (GPL-2.0).  
