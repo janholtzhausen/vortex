@@ -586,50 +586,6 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 
 ## Implementation Notes
 
-### Phase history
-
-The codebase was developed in phases; `VORTEX_PHASE=7` is the current build target:
-
-| Phase | Feature |
-|---|---|
-| 1 | Config parser (YAML), structured logging, unit tests |
-| 2 | io_uring workers, connection pool, SNI routing |
-| 3 | TLS termination (OpenSSL 4.0), kTLS offload |
-| 4 | Response caching (RAM+disk), header rewrites, Basic Auth |
-| 5 | XDP/eBPF: IP blocklist, per-IP rate limiting |
-| 6 | ACME cert management, Prometheus metrics |
-| 7 | HTTP/3 via ngtcp2+nghttp3, Alt-Svc advertisement |
-
-**Features added beyond the original phase plan:**
-- Tarpit mode with automatic XDP blocklist escalation
-- WebSocket passthrough (detect Upgrade, relay via io_uring)
-- TCP tunnel mode (`protocol: tcp`) for non-HTTP protocols over TLS
-- Stateful L4 TCP connection tracking in XDP (CT_SYN_SENT → CT_ESTABLISHED → CT_FIN_WAIT → CT_CLOSING)
-- SYN flood protection via `BPF_NOEXIST` CT insert; 512 K-entry LRU map
-- IPv6 extension header walk hardening; TCP doff validation
-- Connection-rate limiting applied SYN-only (not per-packet)
-- Cache ETag support with If-None-Match / 304 responses
-- Optional SHA-256-derived ETag generation for cached bodies
-- Cache-Control rewrite + Pragma stripping based on URL patterns
-- CRC32C cache integrity verification
-- Partial send handling in io_uring (kTLS record boundary flush)
-- Authorization header stripping before backend forward
-- Server header masquerade
-- X-Api-Key injection per route
-- Environment variable expansion in config
-- Config hot-reload on SIGHUP (blocklist, rate limits, static certs)
-- Foreground-by-default runtime with optional `-d` daemon mode
-- PID file management with `O_EXCL|O_NOFOLLOW` symlink protection
-- Privilege drop (`run_as_user`, `PR_SET_NO_NEW_PRIVS`)
-- Request header block size limit
-- URI length enforcement (reject instead of truncate)
-- DNS-01 ACME challenge with Cloudflare provider
-- TLS cert expiry in Prometheus metrics
-- Multishot accept re-arm on unexpected termination
-- `IORING_FEAT_NODROP` check at startup
-- Hardened build flags: `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, `-Werror=format-security`
-- libFuzzer target for HTTP/1.1 parser
-
 ### BPF maps
 
 All maps pinned under `/sys/fs/bpf/vortex/`:
