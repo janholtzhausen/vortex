@@ -3,8 +3,41 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <strings.h>
 #ifdef __SSE4_2__
 #include <nmmintrin.h>
+#endif
+
+/* ── Safe memory primitives ──────────────────────────────────────────────────
+ * These replace raw memcpy/strncpy at trust boundaries.  They return 0 on
+ * success, -1 on overflow, and never copy a partial result on failure.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Bounded memcpy: returns -1 (copies nothing) if n exceeds dst_sz. */
+static inline int vortex_memcpy(void *dst, size_t dst_sz,
+                                 const void *src, size_t n)
+{
+    if (__builtin_expect(n > dst_sz, 0)) return -1;
+    memcpy(dst, src, n);
+    return 0;
+}
+
+/* Bounded string copy: always NUL-terminates; returns -1 if src would be
+ * truncated (caller should treat the destination as invalid on -1). */
+static inline int vortex_strncpy(char *dst, size_t sz, const char *src)
+{
+    if (__builtin_expect(!sz, 0)) return -1;
+    size_t n = strnlen(src, sz);
+    if (__builtin_expect(n >= sz, 0)) return -1;
+    memcpy(dst, src, n + 1);
+    return 0;
+}
+
+/* Zero memory that the compiler must not optimise away (secrets scrubbing). */
+#ifndef explicit_bzero
+#define explicit_bzero(p, n) \
+    do { volatile unsigned char *_p = (volatile unsigned char *)(p); \
+         size_t _n = (n); while (_n--) *_p++ = 0; } while (0)
 #endif
 
 /* Branch prediction hints */

@@ -6,7 +6,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
+#include <pwd.h>
+#include <grp.h>
 #include <getopt.h>
+
+#include "util.h"  /* vortex_memcpy, vortex_strncpy, explicit_bzero */
 
 #include "log.h"
 #include "config.h"
@@ -257,6 +262,9 @@ static int cert_manager_init(struct vortex_config *cfg)
             } else {
                 log_warn("cert_manager", "DNS provider init failed");
             }
+            /* Scrub the token from memory now that it has been consumed by
+             * the DNS provider.  The provider must make its own copy. */
+            explicit_bzero(cfg->acme.dns_api_token, sizeof(cfg->acme.dns_api_token));
         } else {
             log_warn("cert_manager", "unknown dns_provider '%s'",
                 cfg->acme.dns_provider);
@@ -560,6 +568,32 @@ int main(int argc, char *argv[])
     bool need_compress_pool = g_cfg.compress_pool_threads > 0;
     if (need_compress_pool)
         compress_pool_init(g_cfg.compress_pool_threads);
+
+    /* Drop privileges now: listen sockets and BPF programs are loaded.
+     * After this point we no longer need root. */
+    if (g_cfg.run_as_user[0] != '\0') {
+        struct passwd *pw = getpwnam(g_cfg.run_as_user);
+        if (!pw) {
+            log_error("main", "run_as_user '%s' not found", g_cfg.run_as_user);
+            if (xdp_loaded) bpf_loader_detach();
+            return 1;
+        }
+        if (setgroups(0, NULL) != 0 ||
+            setgid(pw->pw_gid) != 0 ||
+            setuid(pw->pw_uid) != 0) {
+            log_error("main", "privilege drop to '%s' failed: %s",
+                g_cfg.run_as_user, strerror(errno));
+            if (xdp_loaded) bpf_loader_detach();
+            return 1;
+        }
+        /* Prevent re-escalation via exec of any setuid binary */
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+            log_warn("main", "PR_SET_NO_NEW_PRIVS failed: %s", strerror(errno));
+        log_info("main", "privileges dropped to user=%s uid=%d gid=%d",
+            pw->pw_name, (int)pw->pw_uid, (int)pw->pw_gid);
+    } else if (getuid() == 0) {
+        log_warn("main", "running as root — set run_as_user in config to drop privileges");
+    }
 
     /* Create one SO_REUSEPORT listen socket per worker.
      * The kernel distributes incoming connections across them by hashing the

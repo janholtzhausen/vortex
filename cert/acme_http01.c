@@ -217,7 +217,7 @@ void acme_http01_stop(struct acme_http01_server *srv)
     if (!srv->running) return;
     srv->running = 0;
     if (srv->stop_pipe[1] >= 0) {
-        write(srv->stop_pipe[1], "x", 1);
+        (void)write(srv->stop_pipe[1], "x", 1);
     }
     pthread_join(srv->thread, NULL);
     if (srv->listen_fd >= 0) { close(srv->listen_fd); srv->listen_fd = -1; }

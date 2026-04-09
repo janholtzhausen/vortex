@@ -26,12 +26,21 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(VORTEX_MARCH "native" CACHE STRING "GCC/Clang -march value (native, x86-64-v3, znver3, etc.)")
-set(CMAKE_C_FLAGS_RELEASE        "-O3 -march=${VORTEX_MARCH} -mtune=${VORTEX_MARCH} -DNDEBUG -flto")
+set(CMAKE_C_FLAGS_RELEASE        "-O3 -march=${VORTEX_MARCH} -mtune=${VORTEX_MARCH} -DNDEBUG -flto -D_FORTIFY_SOURCE=2 -fstack-protector-strong")
 set(CMAKE_C_FLAGS_DEBUG          "-O0 -g3 -fsanitize=address,undefined -DVORTEX_DEBUG")
-set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -D_FORTIFY_SOURCE=2 -fstack-protector-strong")
 
-# Common warnings
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-stringop-truncation)
+# Common warnings.
+# -Werror=format-security: format-string vulnerabilities are always hard errors.
+# -Wno-deprecated-declarations: suppress OpenSSL 4.0 API deprecation noise until
+#   the SSL_set1_host / SSL_SESSION_get_time replacement pass is done.
+add_compile_options(
+    -Wall -Wextra -Wno-unused-parameter -Wno-stringop-truncation
+    -Wformat -Wformat-security -Werror=format-security
+    -Wno-deprecated-declarations
+)
+
+option(VORTEX_FUZZ "Build libFuzzer targets" OFF)
 
 # ---- Dependencies ----
 find_package(PkgConfig REQUIRED)
@@ -257,6 +266,14 @@ target_compile_definitions(vortex PRIVATE VORTEX_PHASE=7)
 
 # ---- Tests ----
 add_subdirectory(tests)
+
+# ---- Fuzzer targets (clang only, -DVORTEX_FUZZ=ON) ----
+if(VORTEX_FUZZ)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "VORTEX_FUZZ requires clang (libFuzzer is clang-only)")
+    endif()
+    add_subdirectory(fuzz)
+endif()
 
 # ---- Install ----
 install(TARGETS vortex RUNTIME DESTINATION bin)

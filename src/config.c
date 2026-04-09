@@ -73,7 +73,9 @@ void config_set_defaults(struct vortex_config *cfg)
     snprintf(cfg->log_format,    sizeof(cfg->log_format),    "%s", "json");
     snprintf(cfg->pid_file,      sizeof(cfg->pid_file),      "%s", "/run/vortex.pid");
     snprintf(cfg->server_header, sizeof(cfg->server_header), "%s", "CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)");
-    cfg->max_request_body_bytes = 8U * 1024U * 1024U;
+    cfg->max_request_body_bytes   = 8U * 1024U * 1024U;
+    cfg->max_request_header_bytes = 32U * 1024U;  /* 32 KB — covers any legitimate header block */
+    cfg->run_as_user[0]           = '\0';          /* no privilege drop by default */
 
     /* TLS defaults */
     cfg->tls.min_version = 0x0303; /* TLS 1.2 */
@@ -214,6 +216,8 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "congestion_control"))  snprintf(c->congestion_control, sizeof(c->congestion_control), "%s", val);
         else if (!strcmp(k, "max_request_body_mb")) c->max_request_body_bytes = (uint32_t)atol(val) * 1024U * 1024U;
         else if (!strcmp(k, "max_request_body_bytes")) c->max_request_body_bytes = (uint32_t)atol(val);
+        else if (!strcmp(k, "max_request_header_bytes")) c->max_request_header_bytes = (uint32_t)atol(val);
+        else if (!strcmp(k, "run_as_user")) snprintf(c->run_as_user, sizeof(c->run_as_user), "%s", val);
         break;
 
     case P_TLS:

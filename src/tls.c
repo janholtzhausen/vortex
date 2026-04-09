@@ -83,7 +83,7 @@ static struct tls_ctx *tls_from_ssl(SSL *ssl)
     return (struct tls_ctx *)SSL_CTX_get_ex_data(ctx, g_tls_ctx_ex_index);
 }
 
-static struct tls_ctx *tls_from_ctx(SSL_CTX *ctx)
+__attribute__((unused)) static struct tls_ctx *tls_from_ctx(SSL_CTX *ctx)
 {
     if (!ctx || g_tls_ctx_ex_index < 0)
         return NULL;
@@ -325,7 +325,7 @@ static SSL_SESSION *tls_session_cache_lookup(struct tls_ctx *tls,
     return sess;
 }
 
-static void tls_session_cache_remove(struct tls_ctx *tls, SSL_SESSION *sess)
+__attribute__((unused)) static void tls_session_cache_remove(struct tls_ctx *tls, SSL_SESSION *sess)
 {
     unsigned int id_len = 0;
     const unsigned char *id;
@@ -1042,7 +1042,7 @@ static SSL_CTX *tls_create_ctx_from_pem_for_route(struct tls_ctx *tls,
     }
 
     /* Load OCSP response from the full PEM chain before freeing the BIO */
-    BIO_reset(cert_bio);
+    (void)BIO_reset(cert_bio);
     maybe_load_ocsp_from_chain_bio(route_ctx, cert_bio);
     BIO_free(cert_bio);
 

@@ -197,7 +197,7 @@ int parse_http_request_line(const uint8_t *buf, int len,
     sp = (const char *)memchr(p, ' ', (size_t)(end - p));
     if (!sp || sp == p) return -1;
     size_t ulen = (size_t)(sp - p);
-    if (ulen >= url_max) ulen = url_max - 1;
+    if (ulen >= url_max) return -1;   /* URI too long — reject, don't silently truncate */
     memcpy(url_out, p, ulen);
     url_out[ulen] = '\0';
     p = sp + 1;
@@ -1259,6 +1259,23 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
     if (n == 0) { conn_close(w, cid, false); return; } /* Client EOF */
     RECV_WINDOW_GROW(h, n, w->pool.buf_size);
     h->bytes_in += (uint32_t)n;
+
+    /* Enforce header block size limit before any further processing.
+     * If we haven't seen \r\n\r\n yet and the buffer is already at or above
+     * max_request_header_bytes, the client is sending an oversized header
+     * block — reject immediately.  After \r\n\r\n the limit no longer applies
+     * (body limits are handled separately). */
+    {
+        uint32_t hdr_limit = w->cfg->max_request_header_bytes;
+        if (hdr_limit > 0 && (size_t)n >= (size_t)hdr_limit) {
+            const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+            if (memmem(rbuf, (size_t)n, "\r\n\r\n", 4) == NULL) {
+                log_warn("bad_request", "conn=%u header block exceeds %u bytes", cid, hdr_limit);
+                send_bad_request_and_close(w, cid);
+                return;
+            }
+        }
+    }
 
     /* Reconnect to backend if previous response consumed the connection */
     if (h->backend_fd < 0) {

@@ -212,6 +212,15 @@ struct vortex_config {
      * 0 disables the limit. */
     uint32_t max_request_body_bytes;
 
+    /* Maximum HTTP/1.1 request header block size (request line + all headers
+     * up to and including \r\n\r\n).  Requests exceeding this are rejected
+     * with 400 before any routing.  Default: 32768 (32 KB). */
+    uint32_t max_request_header_bytes;
+
+    /* Drop privileges to this user after socket/BPF init.
+     * Empty string = do not drop (run as current user). */
+    char run_as_user[64];
+
     struct tls_config      tls;
     struct xdp_config      xdp;
     struct cache_config    cache;
