@@ -9,7 +9,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 ## Feature Summary
 
 ### Core Proxy
-- **io_uring async I/O** — multishot accept, zero-syscall-per-packet data path
+- **io_uring async I/O** — multishot accept, zero-syscall-per-packet data path; re-arms automatically on termination
 - **Per-CPU worker threads** — one io_uring ring per thread, auto-scales to CPU count (max 64)
 - **SNI-based routing** — TLS Server Name Indication routes connections to named backends before the full handshake completes
 - **Wildcard hostname matching** — planned but not yet implemented; current matching is exact (case-insensitive)
@@ -20,6 +20,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **HTTPS backend pooling** — pooled `https://` origins reuse both the TCP socket and live `SSL*` session across client connections when the origin keeps the connection alive
 - **Optional compression offload** — gzip/brotli response compression can run in a dedicated thread pool instead of blocking the io_uring worker thread
 - **WebSocket passthrough** — detects `Upgrade: websocket` and `101 Switching Protocols`; switches to paired io_uring recv/send chains for full-duplex streaming
+- **TCP tunnel mode** — TLS-terminated raw TCP passthrough; after SNI routing, bytes are forwarded verbatim to the backend with no HTTP parsing. Used for SSH-over-TLS (`protocol: tcp` in route config)
 - **HTTP/2 and HTTP/3** — HTTP/3 via ngtcp2 + nghttp3 (conditional compile); `Alt-Svc: h3=":443"` injected into HTTP/1.x responses to advertise QUIC
 
 ### TLS (OpenSSL 4.0)
@@ -41,13 +42,15 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **IP blocklist** — kernel-space drop before packet reaches userspace; loaded from file on startup and SIGHUP reload
 - **Per-IP token-bucket rate limiting** — applied to new connection SYNs; configurable RPS and burst; LRU map auto-evicts stale entries
 - **Stateful L4 TCP connection tracking** — fully stateful state machine in XDP:
-  - SYN → creates `CT_SYN_SENT` entry (after rate limit check)
+  - SYN → creates `CT_SYN_SENT` entry via `BPF_NOEXIST` (SYN flood cannot overwrite ESTABLISHED entries)
   - ACK (client completing handshake) → advances to `CT_ESTABLISHED`
   - FIN → `CT_FIN_WAIT`, then `CT_CLOSING`
   - RST → deletes CT entry, always passes
   - Non-SYN with no CT entry → **XDP_DROP** (drops ACK scans, spoofed packets, mid-stream injection attempts)
   - Idle timeouts: 30 s (SYN), 120 s (ESTABLISHED), 30 s (FIN)
-  - Map capacity: 128 K connections (LRU_HASH, auto-evicts)
+  - Map capacity: 512 K connections (LRU_HASH, auto-evicts)
+  - IPv6 extension header walk capped at 128-byte offset to prevent oversized EH chains
+  - TCP `doff` field validated before conntrack; invalid offsets passed to kernel without CT processing
 - BPF maps pinned under `/sys/fs/bpf/vortex` for external inspection
 - Per-CPU metrics: `rx_packets`, `rx_bytes`, `passed`, `dropped_ratelimit`, `dropped_blocklist`, `dropped_invalid`, `dropped_conntrack`
 
@@ -112,15 +115,17 @@ python3 tools/vortex-passwd.py admin
 ### Operations
 - Foreground by default; `systemd` should supervise the process directly
 - `-d` enables background daemonisation for non-`systemd` use
-- PID file written only in daemon mode to `/run/vortex.pid` (configurable)
+- PID file written only in daemon mode to `/run/vortex.pid` (configurable); created with `O_EXCL|O_NOFOLLOW` to prevent symlink attacks
 - **SIGHUP** — hot-reload config, refresh XDP blocklist and rate-limit config, re-read static certs from disk; route/backend topology changes are rejected and require a restart
 - **SIGTERM / SIGINT** — graceful shutdown: stops workers, closes connections, detaches XDP, removes PID file
 - `-t` — test config and exit
 - `-v` — force debug logging
 - `-X` — disable XDP (run without BPF acceleration)
 - `-T` — disable TLS (plain HTTP only)
-- `-b <path>` — path to BPF object file (default: must be supplied alongside `-b`)
+- `-b <path>` — path to BPF object file
 - Environment variable expansion in config values: `${VAR}` and `$VAR`
+
+---
 
 ## Architecture
 
@@ -152,7 +157,7 @@ NIC ──► XDP program ──────►  │  blocklist drop            
                           │  ┌─────▼─────┐ │    │                │
                           │  │route/LB   │ │    │                │
                           │  └─────┬─────┘ │    │                │
-                          │        │        │    │                │
+                          │        │ HTTP or TCP tunnel           │
                           │  ┌─────▼──────────────────────────┐ │
                           │  │ io_uring data path             │ │
                           │  │  RECV_CLIENT → SEND_BACKEND    │ │
@@ -173,7 +178,7 @@ Separate threads:
 ### Connection State Machine (XDP)
 
 ```
-               SYN (rate-limit OK)
+               SYN (rate-limit OK, BPF_NOEXIST)
 [no entry] ─────────────────────► CT_SYN_SENT
                                        │
                               ACK from client
@@ -195,12 +200,15 @@ Separate threads:
 RST at any state → delete entry, XDP_PASS
 Non-SYN with no entry → XDP_DROP (dropped_conntrack++)
 Idle timeout exceeded → delete entry, XDP_DROP (dropped_conntrack++)
+SYN on existing ESTABLISHED entry → BPF_NOEXIST fails; existing state preserved
 ```
 
 ### io_uring Connection State Machine (userspace)
 
 ```
 ACCEPT ──► [TLS handshake] ──► RECV_CLIENT
+                                    │
+                           (TCP tunnel?) ──► RECV_CLIENT_WS ⇄ RECV_BACKEND_WS (raw relay)
                                     │
                            (cache hit?) ──► SEND_CLIENT ──► RECV_CLIENT
                                     │
@@ -224,7 +232,7 @@ ACCEPT ──► [TLS handshake] ──► RECV_CLIENT
 | Dependency | Package | Notes |
 |---|---|---|
 | CMake 3.20+ | `cmake` | |
-| clang | `clang` | BPF compiler |
+| clang | `clang` | BPF compiler; also needed for `-DVORTEX_FUZZ=ON` |
 | libbpf | `libbpf-dev` | eBPF/XDP |
 | liburing | `liburing-dev` | io_uring |
 | libyaml | `libyaml-dev` | config parsing |
@@ -233,8 +241,16 @@ ACCEPT ──► [TLS handshake] ──► RECV_CLIENT
 | ngtcp2 1.16 | build from source | HTTP/3 (optional) |
 | nghttp3 1.8 | build from source | HTTP/3 (optional) |
 
-OpenSSL 4.0 is expected at `/opt/openssl-4.0`. ngtcp2 and nghttp3 build dirs
-are expected at `/tmp/ngtcp2-1.16-build` and `/tmp/nghttp3-build`.
+Pass paths via CMake variables; none are assumed to be at a fixed system location:
+
+```sh
+cmake -B build \
+  -DOPENSSL_ROOT_DIR=/path/to/openssl-4.0 \
+  -DNGTCP2_BUILD_DIR=/path/to/ngtcp2/build \
+  -DNGHTTP3_BUILD_DIR=/path/to/nghttp3/build \
+  -DNGTCP2_SRC_DIR=/path/to/ngtcp2-1.16.0 \
+  -DNGHTTP3_SRC_DIR=/path/to/nghttp3-1.8.0
+```
 
 ### Debug build
 
@@ -245,28 +261,31 @@ cmake --build build -j$(nproc)
 
 Debug builds enable AddressSanitizer and UBSan.
 
-### Release build (Zen 3 optimised)
+### Release build
 
 ```sh
 cmake -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j$(nproc)
 ```
 
+Release builds enable `-fstack-protector-strong` and `-D_FORTIFY_SOURCE=2`. `-Werror=format-security` is enforced across all build types.
+
 ### Run tests
 
 ```sh
-cmake --build build-release
 ctest --test-dir build-release --output-on-failure
 ```
 
-### Custom paths
+### Fuzzer (clang only)
 
 ```sh
-cmake -B build \
-  -DOPENSSL_ROOT_DIR=/opt/openssl-4.0 \
-  -DNGTCP2_BUILD_DIR=/opt/ngtcp2/build \
-  -DNGHTTP3_BUILD_DIR=/opt/nghttp3/build
+cmake -B build-fuzz -DVORTEX_FUZZ=ON -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_COMPILER=clang
+cmake --build build-fuzz --target fuzz_http_parser
+./build-fuzz/fuzz/fuzz_http_parser fuzz/corpus_seeds.txt -max_len=16384
 ```
+
+Covers the HTTP/1.1 request-line parser under libFuzzer with ASan and UBSan enabled.
 
 ### Build outputs
 
@@ -289,7 +308,8 @@ highest version it can find from `VERSION`, git tags, and local `.deb`
 artifacts, and refuses version regressions.
 
 ```sh
-bash tools/build_deb.sh 1.0.0   # produces vortex_1.0.0_amd64.deb
+OPENSSL_ROOT_DIR=/path/to/openssl-4.0 bash tools/build_deb.sh 1.0.0
+# produces vortex_1.0.0_amd64.deb
 ```
 
 ### Installing on a fresh machine
@@ -348,9 +368,10 @@ sudo systemctl reload vortex
 sudo systemctl stop vortex
 ```
 
-**Root is required** to attach XDP programs and create BPF maps. Running without
-`-b` or without the network interface configured skips XDP silently. `-X`
-disables XDP explicitly. `-T` disables TLS.
+**Root is required at startup** to attach XDP programs, pin BPF maps, and bind
+to privileged ports. Set `run_as_user` in config to drop privileges immediately
+after initialisation. Running without `-b` or without a network interface
+configured skips XDP silently. `-X` disables XDP explicitly. `-T` disables TLS.
 
 ---
 
@@ -358,28 +379,33 @@ disables XDP explicitly. `-T` disables TLS.
 
 ```yaml
 global:
-  workers: auto            # Number of worker threads (default: auto = nproc)
-  compress_pool_threads: 0 # 0 = synchronous compression in worker thread; 2-4 recommended for offload
-  ipv4_only: true          # false = AF_INET6 dual-stack listener with IPV6_V6ONLY=0
+  workers: auto             # Number of worker threads (default: auto = nproc)
+  compress_pool_threads: 0  # 0 = synchronous compression in worker; 2-4 = offload pool
+  ipv4_only: true           # false = AF_INET6 dual-stack with IPV6_V6ONLY=0
   bind_address: "0.0.0.0"
   bind_port: 443
-  http_port: 80            # Used by ACME HTTP-01 challenge server
-  interface: "eth0"        # Network interface for XDP attachment
-  log_level: "info"        # debug | info | warn | error
-  log_format: "json"       # json | text
+  http_port: 80             # Used by ACME HTTP-01 challenge server
+  interface: "eth0"         # Network interface for XDP attachment
+  log_level: "info"         # debug | info | warn | error
+  log_format: "json"        # json | text
   pid_file: "/run/vortex.pid"
+  run_as_user: ""           # Drop privileges to this user after socket/BPF init.
+                            # Empty = run as current user (warn if root).
+                            # Example: "vortex"
+  max_request_header_bytes: 32768  # Reject HTTP/1.1 requests whose header block
+                                   # exceeds this size (default 32 KB).
 
 tls:
-  min_version: "1.2"       # "1.2" or "1.3"
+  min_version: "1.2"        # "1.2" or "1.3"
   max_version: "1.3"
   ciphersuites: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
-  session_timeout: 3600          # TLS session cache lifetime (seconds)
-  session_ticket_rotation: 3600  # Rotate session ticket keys every N seconds
-  ktls: true               # Enable kernel TLS offload (requires kernel 4.13+)
+  session_timeout: 3600           # TLS session cache lifetime (seconds)
+  session_ticket_rotation: 3600   # Rotate session ticket keys every N seconds
+  ktls: true                # Enable kernel TLS offload (requires kernel 4.13+)
 
 xdp:
-  mode: "auto"             # auto | native | skb
-  blocklist_file: "/etc/vortex/blocklist.txt"  # One IPv4 or IPv6 literal per line, # comments
+  mode: "auto"              # auto | native | skb
+  blocklist_file: "/etc/vortex/blocklist.txt"  # One IPv4 or IPv6 literal per line
   rate_limit:
     enabled: true
     requests_per_second: 1000   # New connections per second per source IP
@@ -387,14 +413,14 @@ xdp:
 
 cache:
   enabled: true
-  etag_sha256: false      # Use SHA-256-derived 64-bit ETags instead of xxhash64
-  verify_crc: false       # Verify cached headers+body with CRC32C on fetch
-  index_entries: 16384     # Number of URL slots (power of 2 recommended)
-  slab_size_mb: 64         # RAM slab size; default = 30% of system RAM
-  default_ttl: 300         # Default TTL in seconds
-  use_hugepages: true      # Use 2 MB hugepages for the index
-  disk_cache_path: ""      # Path for disk-backed slab (empty = RAM only)
-  disk_slab_size_mb: 0     # 0 = auto (50% of free space)
+  etag_sha256: false        # Use SHA-256-derived 64-bit ETags instead of xxhash64
+  verify_crc: false         # Verify cached headers+body with CRC32C on fetch
+  index_entries: 16384      # Number of URL slots (power of 2 recommended)
+  slab_size_mb: 64          # RAM slab size; default = 30% of system RAM
+  default_ttl: 300          # Default TTL in seconds
+  use_hugepages: true       # Use 2 MB hugepages for the index
+  disk_cache_path: ""       # Path for disk-backed slab (empty = RAM only)
+  disk_slab_size_mb: 0      # 0 = auto (50% of free space)
 
 acme:
   enabled: false
@@ -406,7 +432,7 @@ acme:
   preferred_challenge: "http-01"   # http-01 | dns-01
   dns_provider: "cloudflare"       # Required for dns-01
   dns_provider_config:
-    api_token: "${CF_API_TOKEN}"   # Environment variable expansion supported
+    api_token: "${CF_API_TOKEN}"   # Env-var expansion; zeroed from memory after init
 
 metrics:
   enabled: true
@@ -415,12 +441,14 @@ metrics:
   path: "/metrics"
 
 routes:
-  - hostname: "api.example.com"   # Exact match (case-insensitive)
-    load_balancing: "round_robin" # round_robin | weighted_round_robin | least_conn | ip_hash
-    cert_provider: "static_file"  # static_file | acme_http01 | acme_dns01
+  # HTTP reverse proxy route
+  - hostname: "api.example.com"
+    load_balancing: "round_robin"  # round_robin | weighted_round_robin | least_conn | ip_hash
+    cert_provider: "static_file"   # static_file | acme_http01 | acme_dns01
     cert_path: "/etc/ssl/api.crt"
-    key_path: "/etc/ssl/api.key"
-    x_api_key: ""                 # If set, injected as X-Api-Key to backend
+    key_path:  "/etc/ssl/api.key"
+    x_api_key: ""                  # Injected as X-Api-Key to backend if set
+    backend_timeout_ms: 30000      # Max ms to wait for first byte from backend
     backends:
       - address: "10.0.0.1:8080"
         weight: 3
@@ -435,6 +463,25 @@ routes:
       file: "/etc/vortex/auth/api-users.auth"
       users:
         - "alice:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc="
+    rate_limit:
+      enabled: false
+      rps: 100
+      burst: 200
+
+  # TCP tunnel route — TLS terminated at proxy, raw bytes forwarded to backend.
+  # Use for SSH-over-TLS or any non-HTTP protocol that should travel over port 443.
+  - hostname: "shell.example.com"
+    protocol: "tcp"
+    cert_provider: "static_file"
+    cert_path: "/etc/ssl/shell.crt"
+    key_path:  "/etc/ssl/shell.key"
+    backends:
+      - address: "192.168.1.10:22"
+```
+
+Connect via SSH over TLS:
+```sh
+ssh -o 'ProxyCommand=openssl s_client -connect shell.example.com:443 -quiet' user@shell.example.com
 ```
 
 For dual-stack ingress, set:
@@ -496,21 +543,44 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 
 ---
 
-## Security Features
+## Security
 
 ### XDP Layer (kernel space)
 - **IP blocklist** — drop packets from known-bad IPs before they consume any CPU
 - **Connection-rate limiting** — token bucket per source IP, applied to SYN packets only
 - **Stateful TCP conntrack** — non-SYN packets with no matching state are dropped; prevents ACK scans, spoofed mid-stream injection, and half-open attacks
 - **Conntrack timeouts** — stale entries expire (30 s SYN, 120 s idle, 30 s FIN)
+- **SYN flood protection** — `BPF_NOEXIST` on CT insert prevents a SYN flood from evicting ESTABLISHED entries from the LRU map
+- **IPv6 EH loop cap** — extension header walk stops at 128-byte offset; oversized EH chains are dropped
+- **TCP doff validation** — packets with a data-offset that points outside the packet are passed to the kernel without CT tracking rather than processed
 
 ### Application Layer
 - **Tarpit** — unrecognised SNI connections are held open with a 1-byte TCP window; `/dev/urandom` noise confuses scanners; persistent offenders escalate to the XDP blocklist automatically
 - **Blocklist TTL** — IPs added by tarpit escalation expire after 60 minutes; removed cleanly on shutdown
+- **Request header limit** — HTTP/1.1 requests rejected before routing if the header block reaches `max_request_header_bytes` (default 32 KB) without `\r\n\r\n`
+- **URI length enforcement** — request lines with a URI exceeding the parser's output buffer are rejected with 400 (not silently truncated)
+- **Ambiguous framing rejection** — requests with both `Transfer-Encoding` and `Content-Length` are rejected (HTTP request smuggling defence)
 - **Authorization header stripping** — proxy credentials are never forwarded to backends
 - **Server header masquerade** — backend identity hidden behind `CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)` to mislead automated vulnerability scanners
 - **HTTP Basic Auth** — per-route credential enforcement at the proxy level
 - **SNI pre-check** — TLS ClientHello is peeked before the full handshake; unrecognised SNI → tarpit without handshake cost
+
+### Privilege Model
+- Vortex starts as root to attach XDP and bind to privileged ports
+- Set `run_as_user` to drop to an unprivileged user immediately after initialisation; `setgroups/setgid/setuid` are called in that order
+- `PR_SET_NO_NEW_PRIVS` is set after the drop to prevent re-escalation via exec
+- A warning is logged at startup if running as root with no `run_as_user` configured
+
+### Secrets Handling
+- ACME/DNS API tokens are zeroed with `explicit_bzero` from the config struct immediately after being passed to the DNS provider's `init` function
+- `X-Api-Key` values are stored in the config struct and never written to logs
+- PID file is created with `O_EXCL|O_NOFOLLOW` — pre-existing symlinks are rejected; a stale regular file owned by root is removed and retried
+
+### Build Hardening
+- Release builds: `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`
+- All build types: `-Werror=format-security` (format-string bugs are hard compile errors)
+- Debug builds: AddressSanitizer + UBSan
+- libFuzzer target for HTTP/1.1 parser available via `-DVORTEX_FUZZ=ON`
 
 ---
 
@@ -533,23 +603,32 @@ The codebase was developed in phases; `VORTEX_PHASE=7` is the current build targ
 **Features added beyond the original phase plan:**
 - Tarpit mode with automatic XDP blocklist escalation
 - WebSocket passthrough (detect Upgrade, relay via io_uring)
+- TCP tunnel mode (`protocol: tcp`) for non-HTTP protocols over TLS
+- Stateful L4 TCP connection tracking in XDP (CT_SYN_SENT → CT_ESTABLISHED → CT_FIN_WAIT → CT_CLOSING)
+- SYN flood protection via `BPF_NOEXIST` CT insert; 512 K-entry LRU map
+- IPv6 extension header walk hardening; TCP doff validation
 - Connection-rate limiting applied SYN-only (not per-packet)
 - Cache ETag support with If-None-Match / 304 responses
 - Optional SHA-256-derived ETag generation for cached bodies
 - Cache-Control rewrite + Pragma stripping based on URL patterns
+- CRC32C cache integrity verification
 - Partial send handling in io_uring (kTLS record boundary flush)
 - Authorization header stripping before backend forward
 - Server header masquerade
 - X-Api-Key injection per route
-- Wildcard hostname matching planned; current routing is exact and case-insensitive
 - Environment variable expansion in config
 - Config hot-reload on SIGHUP (blocklist, rate limits, static certs)
 - Foreground-by-default runtime with optional `-d` daemon mode
-- PID file management in daemon mode
-- `-X` / `-T` runtime flags to disable XDP / TLS
+- PID file management with `O_EXCL|O_NOFOLLOW` symlink protection
+- Privilege drop (`run_as_user`, `PR_SET_NO_NEW_PRIVS`)
+- Request header block size limit
+- URI length enforcement (reject instead of truncate)
 - DNS-01 ACME challenge with Cloudflare provider
 - TLS cert expiry in Prometheus metrics
-- **Stateful L4 TCP connection tracking in XDP** (CT_SYN_SENT → CT_ESTABLISHED → CT_FIN_WAIT → CT_CLOSING)
+- Multishot accept re-arm on unexpected termination
+- `IORING_FEAT_NODROP` check at startup
+- Hardened build flags: `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, `-Werror=format-security`
+- libFuzzer target for HTTP/1.1 parser
 
 ### BPF maps
 
@@ -563,8 +642,8 @@ All maps pinned under `/sys/fs/bpf/vortex/`:
 | `blocklist_map_v6` | HASH (10K) | src IPv6 | u8 flag | IP blocklist |
 | `metrics_map` | PERCPU_ARRAY (1) | 0 | `vortex_metrics` | per-CPU counters |
 | `rate_config_map` | ARRAY (1) | 0 | `rate_config` | global rate limit config |
-| `conn_track_map` | LRU_HASH (128K) | `conn_tuple` (5-tuple) | `conn_state` | TCP state machine |
-| `conn_track_map_v6` | LRU_HASH (128K) | `conn_tuple_v6` (5-tuple) | `conn_state` | TCP state machine |
+| `conn_track_map` | LRU_HASH (512K) | `conn_tuple` (5-tuple) | `conn_state` | TCP state machine |
+| `conn_track_map_v6` | LRU_HASH (512K) | `conn_tuple_v6` (5-tuple) | `conn_state` | TCP state machine |
 
 ### kTLS fast path
 
@@ -574,6 +653,7 @@ When OpenSSL negotiates kTLS (`SSL_CTX_set_options` with `SSL_OP_ENABLE_KTLS`):
 3. The `SSL*` object is freed; io_uring operates directly on the fd
 4. `CONN_FLAG_KTLS_TX` and `CONN_FLAG_KTLS_RX` flags track which directions are offloaded
 5. `EIO` on a kTLS recv is treated as `close_notify` / TLS alert (normal close path)
+6. `begin_splice` and `send_zc` are gated on `!CONN_FLAG_KTLS_TX` — splice and zero-copy send are incompatible with kTLS TX on kernel 6.8
 
 When kTLS is not available (negotiated cipher not supported, older kernel), the SSL* object is kept and `SSL_read`/`SSL_write` are used via the standard OpenSSL data path.
 
@@ -589,14 +669,14 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 ## Known Limitations
 
-- **IPv6 extension headers** in the XDP program are allowlisted: plain TCP plus common hop-by-hop, routing, destination-options, and initial-fragment layouts are handled; unknown extension chains and non-initial fragments are dropped at XDP
+- **IPv6 extension headers** in the XDP program are allowlisted: plain TCP plus common hop-by-hop, routing, destination-options, and initial-fragment layouts are handled; unknown extension chains and non-initial fragments are dropped at XDP; EH chains extending beyond 128 bytes are also dropped
 - **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
-- **Backend connections** use async non-blocking connect; origin I/O remains protocol-specific after connect
-- **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can still stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (for example `5000`) for TLS backend routes to limit the blast radius. Pooled TLS backends reuse the live origin socket and `SSL*` state across requests when the response is framing-safe to return to the pool; repeated fresh connections also reuse cached client TLS sessions when the origin permits resumption.
+- **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (e.g. `5000`) for TLS backend routes to limit the blast radius.
 - **Backend TLS verification** is enabled by default. Per backend, set `verify_peer: false` or `insecure_skip_verify: true` to ignore certificate-chain and hostname validity checks for that origin.
 - **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
 - **WebSocket relay** uses one in-flight io_uring recv/send chain per direction and relies on socket backpressure rather than deep proxy-side queues
 - **Config reload** rejects route/backend topology changes on SIGHUP; changing route order, backend order, or backend counts still requires a restart
+- **Wildcard hostname matching** — not yet implemented; routing is exact and case-insensitive
 
 ---
 
@@ -606,14 +686,14 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 ```
 src/        Core proxy engine
-  main.c            Entry point, signal handling, lifecycle
+  main.c            Entry point, signal handling, lifecycle, privilege drop
   worker.c          Worker init/teardown and io_uring event loop
   worker_accept.c   Accept path, SNI pre-check, tarpit
   worker_backend.c  Backend connect and HTTPS origin handling
   worker_cache.c    Cache hit/store helpers
   worker_compress.c Response compression helpers
   worker_h2.c       HTTP/2 frontend path
-  worker_proxy.c    HTTP/1.x proxy state machine and header rewrites
+  worker_proxy.c    HTTP/1.x proxy state machine, header rewrites, TCP tunnel relay
   conn.c            Connection pool (hot/cold split, cache-line aligned)
   router.c          SNI route lookup, backend selection (LB algorithms)
   tls.c             OpenSSL 4.0 TLS context, accept, kTLS install, cert rotation
@@ -630,7 +710,9 @@ src/        Core proxy engine
   uring.c           io_uring helpers (init, submit, timeout)
   quic.c            HTTP/3 server (ngtcp2 + nghttp3, conditional)
   simd.c            SIMD helpers and CPU-feature probes
-  util.h            utility helpers
+
+include/
+  util.h            vortex_memcpy, vortex_strncpy, explicit_bzero, misc helpers
 
 bpf/
   vortex_xdp.bpf.c  XDP kernel program
@@ -646,15 +728,22 @@ cert/
   acme_dns01.c       DNS-01 challenge orchestration
   dns_cloudflare.c   Cloudflare DNS API provider
 
+fuzz/
+  fuzz_http_parser.c  libFuzzer target for HTTP/1.1 request-line parser
+  corpus_seeds.txt    Initial seed corpus
+
 tests/
   test_config.c
   test_cache.c
   test_log.c
   test_router.c
+  test_auth.c
 
 tools/
   gen_vmlinux.sh     Regenerate bpf/vmlinux.h from running kernel
+  build_deb.sh       Build a self-contained .deb package
   bench.sh           wrk/hey benchmark runner
+  vortex-passwd.py   Generate scrypt password verifiers for Basic Auth
   test_phase6.sh     Integration tests for Phase 6 features
   test_phase7.sh     Integration tests for Phase 7 (HTTP/3)
   test_xdp.sh        XDP map inspection and drop counter validation
@@ -694,14 +783,3 @@ Vortex is original software but is built on the shoulders of several excellent o
 - **io_uring** — Linux kernel async I/O subsystem (GPL-2.0). Vortex uses the userspace `liburing` wrapper.
 - **kTLS** — Kernel TLS offload (Linux 4.13+, GPL-2.0). After TLS handshake, the kernel handles symmetric crypto.
 - **`bpf/vmlinux.h`** — auto-generated from the running kernel's BTF type information via `bpftool btf dump`. Reflects the kernel's own type definitions and is covered by the kernel's GPL-2.0 license.
-
-### License compatibility
-
-Vortex itself is released under the **GNU General Public License v3.0 (GPLv3)**. All dependencies are compatible:
-
-- MIT, BSD-2-Clause — permissive, compatible with GPLv3.
-- LGPL-2.1 — compatible with GPLv3 when linked dynamically (libbpf, liburing, libyaml are system shared libraries).
-- Apache 2.0 (OpenSSL 4.0) — compatible with GPLv3 per the FSF's clarification.
-- GPL-2.0 (kernel BPF program, vmlinux.h) — the XDP program is a separate kernel-space component; it is explicitly GPL-2.0 as required by the kernel's module ABI.
-
-Commercial entities wishing to use Vortex without complying with the GPLv3 (for example, in a proprietary product) must obtain a separate commercial licence from the author.
