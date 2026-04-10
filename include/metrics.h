@@ -1,6 +1,5 @@
 #pragma once
 
-#include "cache.h"
 #include "worker.h"
 #include "../bpf/maps.h"
 #include <stdint.h>
@@ -19,7 +18,6 @@ struct metrics_server {
     /* Pointers to live data */
     struct worker        **workers;
     int                   num_workers;
-    struct cache          *cache;
     uint64_t               start_time;
 
     /* TLS cert expiry (optional) */
@@ -29,8 +27,7 @@ struct metrics_server {
 
 int  metrics_init(struct metrics_server *ms,
                   const char *bind_addr, uint16_t port,
-                  struct worker **workers, int num_workers,
-                  struct cache *cache);
+                  struct worker **workers, int num_workers);
 int  metrics_start(struct metrics_server *ms);
 void metrics_stop(struct metrics_server *ms);
 void metrics_join(struct metrics_server *ms);

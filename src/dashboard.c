@@ -342,12 +342,14 @@ static int build_snapshot_json(struct dashboard_server *ds,
         }
     }
 
-    if (ds->cache) {
-        cache_hits = ds->cache->hits;
-        cache_misses = ds->cache->misses;
-        cache_evictions = ds->cache->evictions;
-        cache_stores = ds->cache->stores;
-        cache_slab_size = ds->cache->slab_size;
+    for (int wi = 0; wi < ds->num_workers; wi++) {
+        struct cache *c = ds->workers[wi]->cache;
+        if (!c) continue;
+        cache_hits       += c->hits;
+        cache_misses     += c->misses;
+        cache_evictions  += c->evictions;
+        cache_stores     += c->stores;
+        cache_slab_size  += c->slab_size;
     }
 
     double hit_rate = 0.0;
@@ -679,12 +681,11 @@ static void *dashboard_thread(void *arg)
 int dashboard_init(struct dashboard_server *ds,
                    const char *bind_addr, uint16_t port,
                    struct worker **workers, int num_workers,
-                   struct cache *cache, struct vortex_config *cfg)
+                   struct vortex_config *cfg)
 {
     memset(ds, 0, sizeof(*ds));
     ds->workers = workers;
     ds->num_workers = num_workers;
-    ds->cache = cache;
     ds->cfg = cfg;
     ds->start_time = (uint64_t)time(NULL);
     ds->listen_fd = -1;

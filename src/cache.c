@@ -103,7 +103,6 @@ int cache_init(struct cache *c, uint32_t index_entries,
                bool etag_sha256, bool verify_crc)
 {
     memset(c, 0, sizeof(*c));
-    pthread_mutex_init(&c->lock, NULL);
     c->etag_sha256 = etag_sha256;
     c->verify_crc = verify_crc;
 
@@ -124,7 +123,6 @@ int cache_init(struct cache *c, uint32_t index_entries,
 
     c->slab = alloc_aligned(slab_size, try_hugepages);
     if (!c->slab) {
-        pthread_mutex_destroy(&c->lock);
         munmap(c->index, index_bytes);
         c->index = NULL;
         return -1;
@@ -184,7 +182,6 @@ int cache_init(struct cache *c, uint32_t index_entries,
 
 void cache_destroy(struct cache *c)
 {
-    pthread_mutex_destroy(&c->lock);
     if (c->index) {
         munmap(c->index, c->index_capacity * sizeof(struct cache_index_entry));
     }
@@ -250,10 +247,7 @@ static struct cache_index_entry *cache_lookup_locked(struct cache *c,
 struct cache_index_entry *cache_lookup(struct cache *c,
     const char *url, size_t url_len)
 {
-    pthread_mutex_lock(&c->lock);
-    struct cache_index_entry *e = cache_lookup_locked(c, url, url_len);
-    pthread_mutex_unlock(&c->lock);
-    return e;
+    return cache_lookup_locked(c, url, url_len);
 }
 
 int cache_store(struct cache *c, const char *url, size_t url_len,
@@ -261,12 +255,9 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
                 const uint8_t *headers, size_t header_len,
                 const uint8_t *body, size_t body_len)
 {
-    pthread_mutex_lock(&c->lock);
     size_t total = header_len + body_len;
-    if (total == 0) {
-        pthread_mutex_unlock(&c->lock);
+    if (total == 0)
         return -1;
-    }
 
     /* Compute ETag from body */
     uint64_t etag = cache_compute_body_etag(c->etag_sha256, body, body_len);
@@ -277,7 +268,8 @@ int cache_store(struct cache *c, const char *url, size_t url_len,
 
     if (total > c->slab_size / 4) {
         /* Too large for RAM slab; try disk slab */
-        if (!c->disk_slab || total > c->disk_slab_size / 4) return -1;
+        if (!c->disk_slab || total > c->disk_slab_size / 4)
+            return -1;
         use_disk = true;
     }
 
@@ -365,7 +357,6 @@ insert_retry:
         if (!(e->flags & CACHE_FLAG_VALID)) {
             *e = new_entry;
             c->stores++;
-            pthread_mutex_unlock(&c->lock);
             return 0;
         }
 
@@ -373,7 +364,6 @@ insert_retry:
             /* Update existing */
             *e = new_entry;
             c->stores++;
-            pthread_mutex_unlock(&c->lock);
             return 0;
         }
 
@@ -397,7 +387,6 @@ insert_retry:
         slot = hash & c->index_mask;
         goto insert_retry;
     }
-    pthread_mutex_unlock(&c->lock);
     return -1;
 }
 
@@ -405,18 +394,14 @@ int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
                      struct cached_response *out)
 {
     memset(out, 0, sizeof(*out));
-    pthread_mutex_lock(&c->lock);
     struct cache_index_entry *e = cache_lookup_locked(c, url, url_len);
-    if (!e || !cache_entry_valid(e)) {
-        pthread_mutex_unlock(&c->lock);
+    if (!e || !cache_entry_valid(e))
         return -1;
-    }
 
     const uint8_t *resp = cache_response_ptr(c, e);
     size_t total = e->header_len + e->body_len;
     if (!resp || total == 0) {
         if (e) e->flags = 0;
-        pthread_mutex_unlock(&c->lock);
         return -1;
     }
     if (c->verify_crc) {
@@ -427,21 +412,17 @@ int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
             e->flags = 0;
             c->evictions++;
             c->misses++;
-            pthread_mutex_unlock(&c->lock);
             return -1;
         }
     }
     out->data = malloc(total);
-    if (!out->data) {
-        pthread_mutex_unlock(&c->lock);
+    if (!out->data)
         return -1;
-    }
     memcpy(out->data, resp, total);
     out->header_len = e->header_len;
     out->body_len = e->body_len;
     out->status_code = e->status_code;
     out->body_etag = e->body_etag;
-    pthread_mutex_unlock(&c->lock);
     return 0;
 }
 

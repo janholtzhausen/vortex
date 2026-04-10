@@ -124,7 +124,8 @@ static bool config_uses_backend_tls(const struct vortex_config *cfg)
 #define MAX_WORKERS 64
 static struct worker  g_workers[MAX_WORKERS];
 static int            g_num_workers = 0;
-static struct cache   g_shared_cache;
+static struct cache   g_worker_caches[MAX_WORKERS];
+static int            g_cache_initialized_count = 0;
 static struct metrics_server g_metrics;
 static struct dashboard_server g_dashboard;
 static int            g_dashboard_started = 0;
@@ -541,23 +542,37 @@ int main(int argc, char *argv[])
     /* Shared backend connection pool — must be initialised before workers start */
     global_pool_init();
 
-    struct cache *shared_cache = NULL;
-    if (g_cfg.cache.enabled) {
-        uint32_t entries = g_cfg.cache.index_entries > 0 ?
+    bool cache_enabled = g_cfg.cache.enabled;
+    if (cache_enabled) {
+        uint32_t total_entries = g_cfg.cache.index_entries > 0 ?
             g_cfg.cache.index_entries : 16384;
-        size_t slab_bytes = g_cfg.cache.slab_size_bytes > 0 ?
+        size_t total_slab = g_cfg.cache.slab_size_bytes > 0 ?
             g_cfg.cache.slab_size_bytes : (64ULL * 1024 * 1024);
-        size_t disk_bytes = (size_t)g_cfg.cache.disk_slab_size_bytes;
+        /* disk slab: one shared path not split — per-worker RAM only */
         const char *disk_path = g_cfg.cache.disk_cache_path[0] ?
             g_cfg.cache.disk_cache_path : NULL;
-        if (cache_init(&g_shared_cache, entries, slab_bytes,
-                       g_cfg.cache.use_hugepages, disk_path, disk_bytes,
-                       g_cfg.cache.etag_sha256,
-                       g_cfg.cache.verify_crc) == 0) {
-            shared_cache = &g_shared_cache;
-        } else {
-            log_warn("main", "shared cache init failed — running without cache");
+        size_t disk_bytes = (size_t)g_cfg.cache.disk_slab_size_bytes;
+
+        uint32_t entries_per = total_entries / (uint32_t)num_workers;
+        if (entries_per < 64) entries_per = 64;
+        size_t slab_per = total_slab / (size_t)num_workers;
+        if (slab_per < 1024 * 1024) slab_per = 1024 * 1024;
+
+        for (int i = 0; i < num_workers; i++) {
+            if (cache_init(&g_worker_caches[i], entries_per, slab_per,
+                           g_cfg.cache.use_hugepages, disk_path, disk_bytes,
+                           g_cfg.cache.etag_sha256,
+                           g_cfg.cache.verify_crc) == 0) {
+                g_cache_initialized_count++;
+                /* Only the first worker gets the disk slab to avoid double-mapping */
+                disk_path = NULL;
+                disk_bytes = 0;
+            } else {
+                log_warn("main", "worker %d cache init failed — worker will run without cache", i);
+            }
         }
+        if (g_cache_initialized_count == 0)
+            cache_enabled = false;
     }
 
 #ifdef VORTEX_PHASE_TLS
@@ -566,8 +581,6 @@ int main(int argc, char *argv[])
     if (need_tls_pool) tls_pool_init();
 #endif
     bool need_compress_pool = g_cfg.compress_pool_threads > 0;
-    if (need_compress_pool)
-        compress_pool_init(g_cfg.compress_pool_threads);
 
     /* Drop privileges now: listen sockets and BPF programs are loaded.
      * After this point we no longer need root. */
@@ -608,13 +621,18 @@ int main(int argc, char *argv[])
             num_workers = i;
             break;
         }
+        struct cache *wcache = (cache_enabled && i < g_cache_initialized_count)
+                              ? &g_worker_caches[i] : NULL;
         if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr,
-                        shared_cache) != 0) {
+                        wcache) != 0) {
             log_error("main", "worker_init failed for worker %d", i);
             close(lfd);
             num_workers = i;
             break;
         }
+        if (need_compress_pool)
+            compress_pool_init(&g_workers[i].compress_pool,
+                               g_cfg.compress_pool_threads);
         if (worker_start(&g_workers[i]) != 0) {
             log_error("main", "worker_start failed for worker %d", i);
             num_workers = i;
@@ -632,7 +650,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < num_workers; i++) worker_ptrs[i] = &g_workers[i];
     if (g_cfg.metrics.enabled) {
         metrics_init(&g_metrics, g_cfg.metrics.bind_address,
-            g_cfg.metrics.port, worker_ptrs, num_workers, shared_cache);
+            g_cfg.metrics.port, worker_ptrs, num_workers);
 #ifdef VORTEX_PHASE_TLS
         /* Populate cert expiry info for Prometheus */
         g_cert_info_count = 0;
@@ -659,7 +677,7 @@ int main(int argc, char *argv[])
     if (g_cfg.dashboard.enabled) {
         if (dashboard_init(&g_dashboard, g_cfg.dashboard.bind_address,
                            g_cfg.dashboard.port, worker_ptrs, num_workers,
-                           shared_cache, &g_cfg) == 0) {
+                           &g_cfg) == 0) {
             if (dashboard_start(&g_dashboard) != 0) {
                 log_warn("main", "dashboard thread start failed");
                 if (g_dashboard.listen_fd >= 0) {
@@ -676,7 +694,7 @@ int main(int argc, char *argv[])
 #ifdef VORTEX_QUIC
     /* Start QUIC/HTTP3 server (needs TLS to have been set up) */
     if (tls_ptr && tls_ptr->route_count > 0) {
-        if (quic_server_init(&g_quic, tls_ptr, shared_cache, &g_cfg,
+        if (quic_server_init(&g_quic, tls_ptr, NULL, &g_cfg,
                              g_cfg.bind_address, g_cfg.bind_port) == 0) {
             if (quic_server_start(g_quic) != 0) {
                 log_warn("main", "QUIC thread start failed");
@@ -748,14 +766,14 @@ int main(int argc, char *argv[])
         g_dashboard_started = 0;
     }
     for (int i = 0; i < num_workers; i++) worker_stop(&g_workers[i]);
-    for (int i = 0; i < num_workers; i++) {
+    for (int i = 0; i < num_workers; i++)
         worker_join(&g_workers[i]);
+    if (need_compress_pool) {
+        for (int i = 0; i < num_workers; i++)
+            compress_pool_destroy(&g_workers[i].compress_pool);
     }
-    if (need_compress_pool)
-        compress_pool_destroy();
-    for (int i = 0; i < num_workers; i++) {
+    for (int i = 0; i < num_workers; i++)
         worker_destroy(&g_workers[i]);
-    }
     global_pool_destroy();
 #ifdef VORTEX_PHASE_TLS
     if (need_tls_pool) tls_pool_destroy();
@@ -764,10 +782,8 @@ int main(int argc, char *argv[])
         metrics_stop(&g_metrics);
         metrics_join(&g_metrics);
     }
-    if (shared_cache) {
-        cache_destroy(shared_cache);
-        shared_cache = NULL;
-    }
+    for (int i = 0; i < g_cache_initialized_count; i++)
+        cache_destroy(&g_worker_caches[i]);
 
     log_info("vortex_shutdown", "shutting down");
 

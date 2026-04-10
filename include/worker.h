@@ -57,7 +57,8 @@ struct worker {
     uint64_t         tls13_count;   /* TLS 1.3 handshakes */
     uint64_t         ktls_count;    /* connections using kTLS */
 
-    struct cache    *cache;
+    struct cache          *cache;
+    struct compress_pool   compress_pool;
 
     /* Tarpit: unrecognised-SNI connections held with window=1 */
     int              tarpit_fds[WORKER_TARPIT_MAX];

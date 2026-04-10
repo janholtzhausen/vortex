@@ -54,9 +54,7 @@ struct compress_pool {
     bool                shutdown;
 };
 
-extern struct compress_pool g_compress_pool;
-
-void compress_pool_init(int thread_count);
-void compress_pool_destroy(void);
-bool compress_pool_submit(struct compress_job job);
-void compress_pool_snapshot(struct compress_pool_stats *out);
+void compress_pool_init(struct compress_pool *pool, int thread_count);
+void compress_pool_destroy(struct compress_pool *pool);
+bool compress_pool_submit(struct compress_pool *pool, struct compress_job job);
+void compress_pool_snapshot(struct compress_pool *pool, struct compress_pool_stats *out);

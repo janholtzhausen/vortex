@@ -840,7 +840,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                             h->flags |= CONN_FLAG_COMPRESS_PENDING;
                             h->send_buf_off = 0;
                             h->send_buf_len = (uint32_t)n;
-                            if (compress_pool_submit(job))
+                            if (compress_pool_submit(&w->compress_pool, job))
                                 return;
                             h->flags &= ~CONN_FLAG_COMPRESS_PENDING;
                         }

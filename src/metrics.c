@@ -109,7 +109,16 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
 
     {
         struct compress_pool_stats compress_stats = {0};
-        compress_pool_snapshot(&compress_stats);
+        for (int i = 0; i < ms->num_workers; i++) {
+            struct compress_pool_stats ws = {0};
+            compress_pool_snapshot(&ms->workers[i]->compress_pool, &ws);
+            compress_stats.queue_depth     += ws.queue_depth;
+            compress_stats.active_jobs     += ws.active_jobs;
+            compress_stats.submitted_total += ws.submitted_total;
+            compress_stats.completed_total += ws.completed_total;
+            compress_stats.failed_total    += ws.failed_total;
+            compress_stats.dropped_total   += ws.dropped_total;
+        }
         write_metric_gauge(buf, &pos, bufsz,
             "vortex_compress_pool_queue_depth", "Pending compression jobs in the pool queue",
             compress_stats.queue_depth);
@@ -145,12 +154,14 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
 
     uint64_t cache_hits = 0, cache_misses = 0, cache_evictions = 0;
     uint64_t cache_stores = 0, cache_slab_bytes = 0;
-    if (ms->cache) {
-        cache_hits       = ms->cache->hits;
-        cache_misses     = ms->cache->misses;
-        cache_evictions  = ms->cache->evictions;
-        cache_stores     = ms->cache->stores;
-        cache_slab_bytes = ms->cache->slab_size;
+    for (int i = 0; i < ms->num_workers; i++) {
+        struct cache *c = ms->workers[i]->cache;
+        if (!c) continue;
+        cache_hits       += c->hits;
+        cache_misses     += c->misses;
+        cache_evictions  += c->evictions;
+        cache_stores     += c->stores;
+        cache_slab_bytes += c->slab_size;
     }
     if (cache_hits || cache_misses || cache_evictions || cache_stores || cache_slab_bytes) {
         write_metric_counter(buf, &pos, bufsz,
@@ -238,13 +249,11 @@ static void *metrics_thread(void *arg)
 
 int metrics_init(struct metrics_server *ms,
                  const char *bind_addr, uint16_t port,
-                 struct worker **workers, int num_workers,
-                 struct cache *cache)
+                 struct worker **workers, int num_workers)
 {
     memset(ms, 0, sizeof(*ms));
     ms->workers     = workers;
     ms->num_workers = num_workers;
-    ms->cache       = cache;
     ms->start_time  = (uint64_t)time(NULL);
     ms->listen_fd   = -1;
 

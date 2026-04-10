@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <pthread.h>
 #include <time.h>
 
 /* Cache entry flags */
@@ -50,7 +49,6 @@ _Static_assert(sizeof(struct cache_index_entry) == 64,
 #define CACHE_SLAB_DISK_FLAG (1u << 31)
 
 struct cache {
-    pthread_mutex_t lock;
     struct cache_index_entry *index;   /* mmap'd, hugepage-backed if available */
     size_t index_capacity;             /* Power of 2 */
     size_t index_mask;
