@@ -61,6 +61,8 @@ struct uring_ctx {
     bool             bufs_registered; /* io_uring fixed buffers registered */
     bool             files_registered;/* io_uring fixed files registered */
     unsigned int     file_slots;      /* total fixed file slots */
+    bool             defer_submit;    /* batch SQEs; flush with uring_flush() */
+    bool             needs_flush;     /* unflushed SQEs are pending */
 
     /* Multishot recv buf ring — used for H2 client recv.
      * Separate allocation from the fixed-buffer registration; the existing
@@ -112,8 +114,13 @@ static inline uint8_t *uring_recv_ring_buf(const struct uring_ctx *ctx,
     return ctx->recv_ring_mem + (size_t)buf_id * buf_size;
 }
 
-/* Submit all pending SQEs */
+/* Submit all pending SQEs immediately (bypasses defer_submit mode) */
 int uring_submit(struct uring_ctx *ctx);
+
+/* Flush deferred SQEs — call once per event-loop iteration after processing
+ * all CQEs.  No-op if needs_flush is false.  In non-deferred mode this is
+ * equivalent to uring_submit. */
+int uring_flush(struct uring_ctx *ctx);
 
 /* Wait for at least min_events completions, process up to max_events.
  * Returns number processed, or -1 on error. */

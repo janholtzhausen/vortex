@@ -2,6 +2,7 @@
 #include "worker_internal.h"
 #include "log.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -39,9 +40,24 @@ static void *compress_pool_worker_thread(void *arg)
         if (res.total_len > 0)
             res.ok = true;
 
-        ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
-        if (wr != (ssize_t)sizeof(res))
-            log_error("compress_pool", "result pipe write failed cid=%u", job.cid);
+        if (job.result_ring) {
+            uint32_t idx = atomic_fetch_add_explicit(&job.result_ring->tail, 1,
+                               memory_order_relaxed) % COMPRESS_RESULT_RING_CAP;
+            while (atomic_load_explicit(&job.result_ring->slots[idx].ready,
+                                         memory_order_acquire) != 0)
+                ;
+            job.result_ring->slots[idx].data = res;
+            atomic_store_explicit(&job.result_ring->slots[idx].ready, 1,
+                                   memory_order_release);
+            const uint8_t wake = 1;
+            ssize_t wr = write(job.result_pipe_wr, &wake, sizeof(wake));
+            if (wr != 1)
+                log_error("compress_pool", "wakeup pipe write failed cid=%u", job.cid);
+        } else {
+            ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
+            if (wr != (ssize_t)sizeof(res))
+                log_error("compress_pool", "result pipe write failed cid=%u", job.cid);
+        }
 
         pthread_mutex_lock(&pool->mu);
         if (res.ok) pool->completed_total++;

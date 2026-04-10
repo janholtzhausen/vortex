@@ -163,25 +163,40 @@ int uring_remove_fd(struct uring_ctx *ctx, unsigned int slot)
     return 0;
 }
 
-int uring_submit(struct uring_ctx *ctx)
+static int uring_submit_real(struct uring_ctx *ctx)
 {
-    int ret;
-    if (ctx->sqpoll) {
-        /* In SQPOLL mode the kernel thread picks up SQEs without a syscall.
-         * io_uring_submit() checks IORING_SQ_NEED_WAKEUP and only calls
-         * io_uring_enter(IORING_ENTER_SQ_WAKEUP) when the thread has gone
-         * idle — so this is usually a pure ring-write with zero syscalls. */
-        ret = io_uring_submit(&ctx->ring);
-    } else {
-        /* Non-SQPOLL: submit and flush any pending COOP_TASKRUN work so CQEs
-         * are delivered promptly without an extra wait_cqe round-trip. */
-        ret = io_uring_submit(&ctx->ring);
-    }
+    /* In SQPOLL mode the kernel thread picks up SQEs without a syscall.
+     * io_uring_submit() checks IORING_SQ_NEED_WAKEUP and only calls
+     * io_uring_enter(IORING_ENTER_SQ_WAKEUP) when the thread has gone idle —
+     * so this is usually a pure ring-write with zero syscalls.
+     *
+     * Non-SQPOLL: cooperative task-run work is flushed on the next
+     * io_uring_wait_cqe_timeout call, so a separate flush step is not needed. */
+    int ret = io_uring_submit(&ctx->ring);
     if (ret < 0 && ret != -EBUSY) {
         log_error("uring_submit", "failed: %s", strerror(-ret));
         return ret;
     }
     return ret;
+}
+
+int uring_submit(struct uring_ctx *ctx)
+{
+    if (ctx->defer_submit) {
+        /* Just mark that a flush is needed; callers queue SQEs but the actual
+         * syscall is deferred to uring_flush() at end of the CQE batch. */
+        ctx->needs_flush = true;
+        return 0;
+    }
+    return uring_submit_real(ctx);
+}
+
+int uring_flush(struct uring_ctx *ctx)
+{
+    if (!ctx->needs_flush)
+        return 0;
+    ctx->needs_flush = false;
+    return uring_submit_real(ctx);
 }
 
 int uring_wait(struct uring_ctx *ctx, unsigned int min_events)

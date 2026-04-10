@@ -103,6 +103,13 @@ int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
                      struct cached_response *out);
 void cache_cached_response_free(struct cached_response *resp);
 
+/* Zero-copy variant: sets out->data to a direct pointer into the slab.
+ * The pointer is valid until the next cache_store() call on this cache.
+ * Do NOT call cache_cached_response_free() on the result — out->data is
+ * not heap-allocated.  Returns 0 on hit, -1 on miss or CRC failure. */
+int cache_fetch_ptr(struct cache *c, const char *url, size_t url_len,
+                    struct cached_response *out);
+
 /* Get pointer to start of full stored response (headers + body) */
 static inline const uint8_t *cache_response_ptr(struct cache *c,
     const struct cache_index_entry *entry)

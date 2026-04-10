@@ -86,6 +86,10 @@ static void *worker_thread(void *arg)
     }
     uring_submit(&w->uring);
 
+    /* Batch all SQEs from within a CQE iteration and flush once per batch.
+     * This reduces io_uring_submit syscalls from ~N-per-batch to 1. */
+    w->uring.defer_submit = true;
+
     while (!atomic_load_explicit(&w->stop, memory_order_relaxed)) {
         struct io_uring_cqe *cqe;
         unsigned head;
@@ -166,6 +170,8 @@ static void *worker_thread(void *arg)
             (void)head;
         }
         io_uring_cq_advance(&w->uring.ring, count);
+        /* Flush all SQEs queued during this batch in a single syscall */
+        uring_flush(&w->uring);
     }
 
     log_info("worker_stop", "id=%d accepted=%llu completed=%llu errors=%llu",

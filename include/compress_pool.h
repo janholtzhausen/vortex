@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -24,9 +25,28 @@ struct compress_result {
     size_t   total_len;
 };
 
+/*
+ * MPSC result ring for compression results — same design as tls_result_ring.
+ * CAP = 256 > COMPRESS_POOL_QUEUE(128) + max pool threads.
+ */
+#define COMPRESS_RESULT_RING_CAP 256
+
+struct compress_result_slot {
+    struct compress_result data;
+    _Atomic uint8_t        ready;
+};
+
+struct compress_result_ring {
+    _Atomic uint32_t          tail;
+    char                      _pad[60];
+    uint32_t                  head;
+    struct compress_result_slot slots[COMPRESS_RESULT_RING_CAP];
+};
+
 struct compress_job {
     uint32_t cid;
     int      result_pipe_wr;
+    struct compress_result_ring *result_ring;
     uint8_t *src;
     size_t   src_len;
     uint8_t *headers;

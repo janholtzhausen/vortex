@@ -17,6 +17,7 @@
 #include "tls.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <openssl/ssl.h>
 
@@ -52,13 +53,34 @@ struct tls_handshake_result {
     SSL_SESSION *backend_session; /* cached resumable session for HTTPS origins */
 };
 
+/*
+ * MPSC result ring — pool threads push completed handshake results here;
+ * the worker drains it when the 1-byte wakeup signal arrives on the pipe.
+ * CAP = 256 > TLS_POOL_QUEUE(128) + TLS_POOL_THREADS(4), so producers never
+ * need to spin waiting for a slot.
+ */
+#define TLS_RESULT_RING_CAP 256
+
+struct tls_result_slot {
+    struct tls_handshake_result data;
+    _Atomic uint8_t             ready;  /* 0 = empty, 1 = result available */
+};
+
+struct tls_result_ring {
+    _Atomic uint32_t      tail;              /* next write index (producers) */
+    char                  _pad[60];          /* isolate tail from head */
+    uint32_t              head;              /* read index (consumer only) */
+    struct tls_result_slot slots[TLS_RESULT_RING_CAP];
+};
+
 /* Job submitted by the worker to the pool */
 struct tls_handshake_job {
     tls_handshake_kind_t kind;
     int             client_fd;
     uint32_t        cid;
     struct tls_ctx *tls;
-    int             result_pipe_wr; /* write end of per-worker result pipe */
+    int                   result_pipe_wr;  /* write end of per-worker wakeup pipe */
+    struct tls_result_ring *result_ring;  /* per-worker MPSC result ring */
     SSL_CTX        *backend_tls_client_ctx;
     uint32_t        timeout_ms;
     bool            verify_peer;

@@ -827,15 +827,16 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                         if (w->cfg->compress_pool_threads > 0 &&
                             w->compress_done_pipe_wr >= 0) {
                             struct compress_job job = {
-                                .cid = cid,
+                                .cid         = cid,
                                 .result_pipe_wr = w->compress_done_pipe_wr,
-                                .src = sbuf_gz + body_off,
-                                .src_len = body_len,
-                                .headers = sbuf_gz,
-                                .header_len = hdr_end_off + 4,
-                                .scratch = scratch,
-                                .use_brotli = use_br,
-                                .buf_size = w->pool.buf_size,
+                                .result_ring = &w->compress_result_ring,
+                                .src         = sbuf_gz + body_off,
+                                .src_len     = body_len,
+                                .headers     = sbuf_gz,
+                                .header_len  = hdr_end_off + 4,
+                                .scratch     = scratch,
+                                .use_brotli  = use_br,
+                                .buf_size    = w->pool.buf_size,
                             };
                             h->flags |= CONN_FLAG_COMPRESS_PENDING;
                             h->send_buf_off = 0;
@@ -1030,6 +1031,19 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
     int lowat = WORKER_BUF_SIZE;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 
+    /* Backpressure: at 90% capacity, actively reject with 503 rather than
+     * silently dropping once the pool is exhausted. This lets upstream load
+     * balancers retry a different instance instead of waiting for a timeout. */
+    if (w->pool.active >= w->pool.capacity * 9 / 10) {
+        static const char r503[] =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Length: 19\r\nConnection: close\r\n\r\n"
+            "Service Unavailable";
+        send(client_fd, r503, sizeof(r503) - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+        close(client_fd);
+        return;
+    }
+
     uint32_t new_cid = conn_alloc(&w->pool);
     if (new_cid != CONN_INVALID) {
         /* Record client address for X-Forwarded-For */
@@ -1085,6 +1099,7 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
                 .cid            = new_cid,
                 .tls            = w->tls,
                 .result_pipe_wr = w->tls_done_pipe_wr,
+                .result_ring    = &w->tls_result_ring,
             };
             if (!tls_pool_submit(job)) {
                 /* Queue full — drop the connection */
@@ -1133,7 +1148,7 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
 #ifdef VORTEX_PHASE_TLS
 static void handle_tls_done(struct worker *w, struct io_uring_cqe *cqe)
 {
-    /* Re-arm pipe read for the next result before processing this one */
+    /* Re-arm pipe read for the next 1-byte wakeup signal */
     struct io_uring_sqe *rpsqe = io_uring_get_sqe(&w->uring.ring);
     if (rpsqe) {
         io_uring_prep_read(rpsqe, w->tls_done_pipe_rd,
@@ -1142,21 +1157,20 @@ static void handle_tls_done(struct worker *w, struct io_uring_cqe *cqe)
     }
     uring_submit(&w->uring);
 
-    if (cqe->res != (int)sizeof(struct tls_handshake_result)) {
-        /* Partial or error read — nothing we can do, pipe stays armed */
-        return;
-    }
+    if (cqe->res <= 0)
+        return; /* pipe closed or error — stay armed */
 
-    struct tls_handshake_result res;
-    memcpy(&res, w->tls_pipe_buf, sizeof(res));
-    process_tls_result(w, &res);
-
-    /* Drain any additional results queued in the pipe */
+    /* Drain all completed results from the MPSC ring */
+    struct tls_result_ring *ring = &w->tls_result_ring;
     for (;;) {
-        struct tls_handshake_result extra;
-        ssize_t nr = read(w->tls_done_pipe_rd, &extra, sizeof(extra));
-        if (nr != (ssize_t)sizeof(extra)) break;
-        process_tls_result(w, &extra);
+        uint32_t slot = ring->head % TLS_RESULT_RING_CAP;
+        if (atomic_load_explicit(&ring->slots[slot].ready,
+                                  memory_order_acquire) == 0)
+            break;
+        struct tls_handshake_result res = ring->slots[slot].data;
+        atomic_store_explicit(&ring->slots[slot].ready, 0, memory_order_release);
+        ring->head++;
+        process_tls_result(w, &res);
     }
 }
 #endif
@@ -1184,18 +1198,19 @@ static void handle_compress_done(struct worker *w, struct io_uring_cqe *cqe)
     }
     uring_submit(&w->uring);
 
-    if (cqe->res != (int)sizeof(struct compress_result))
+    if (cqe->res <= 0)
         return;
 
-    struct compress_result res;
-    memcpy(&res, w->compress_pipe_buf, sizeof(res));
-    process_compress_result(w, &res);
-
+    struct compress_result_ring *ring = &w->compress_result_ring;
     for (;;) {
-        struct compress_result extra;
-        ssize_t nr = read(w->compress_done_pipe_rd, &extra, sizeof(extra));
-        if (nr != (ssize_t)sizeof(extra)) break;
-        process_compress_result(w, &extra);
+        uint32_t slot = ring->head % COMPRESS_RESULT_RING_CAP;
+        if (atomic_load_explicit(&ring->slots[slot].ready,
+                                  memory_order_acquire) == 0)
+            break;
+        struct compress_result res = ring->slots[slot].data;
+        atomic_store_explicit(&ring->slots[slot].ready, 0, memory_order_release);
+        ring->head++;
+        process_compress_result(w, &res);
     }
 }
 
@@ -1440,7 +1455,7 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
             char cache_key[640];
             make_cache_key(rbuf, (size_t)n, url, cache_key, sizeof(cache_key));
             struct cached_response cached;
-            if (cache_fetch_copy(w->cache, cache_key, strlen(cache_key), &cached) == 0) {
+            if (cache_fetch_ptr(w->cache, cache_key, strlen(cache_key), &cached) == 0) {
                 /* Check If-None-Match for conditional GET */
                 char req_etag[64] = {0};
                 const uint8_t *inm = (const uint8_t *)memmem(rbuf, (size_t)n,
@@ -1486,7 +1501,7 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
                             conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
                         sqer->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
                         uring_submit(&w->uring);
-                        cache_cached_response_free(&cached);
+                        /* cached.data is a slab pointer — no free needed */
                         log_debug("cache_304", "conn=%u url=%s", cid, url);
                         return;
                     }
@@ -1503,9 +1518,9 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
                 uint8_t *sbuf = conn_send_buf(&w->pool, cid);
 
                 if (serve_len <= w->pool.buf_size && cached.header_len >= 4) {
-                    /* Copy headers minus the blank-line terminator (\r\n).
-                     * The last header's own \r\n stays so extra headers
-                     * splice in cleanly without merging onto the same line. */
+                    /* Copy directly from slab into the send buffer.
+                     * Headers minus the blank-line terminator, then injected
+                     * ETag/X-Cache headers, then the blank line, then the body. */
                     size_t hdr_body = cached.header_len - 2;
                     memcpy(sbuf, cached.data, hdr_body);
                     memcpy(sbuf + hdr_body, extra, (size_t)extra_len);
@@ -1522,12 +1537,11 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
                             sbuf, serve_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
                         sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT, cid);
                         uring_submit(&w->uring);
-                        cache_cached_response_free(&cached);
+                        /* cached.data is a slab pointer — no free needed */
                         log_debug("cache_hit", "conn=%u url=%s", cid, url);
                         return;
                     }
                 }
-                cache_cached_response_free(&cached);
                 /* Fall through to backend if response too large or no sqe */
             }
         }
@@ -2006,6 +2020,7 @@ static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t 
                 .client_fd = h->backend_fd,
                 .cid = cid,
                 .result_pipe_wr = w->tls_done_pipe_wr,
+                .result_ring    = &w->tls_result_ring,
                 .backend_tls_client_ctx = w->backend_tls_client_ctx,
                 .timeout_ms = w->cfg->routes[h->route_idx].backend_timeout_ms
                               ? w->cfg->routes[h->route_idx].backend_timeout_ms : 30000,

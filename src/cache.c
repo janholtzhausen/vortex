@@ -432,6 +432,40 @@ void cache_cached_response_free(struct cached_response *resp)
     memset(resp, 0, sizeof(*resp));
 }
 
+int cache_fetch_ptr(struct cache *c, const char *url, size_t url_len,
+                    struct cached_response *out)
+{
+    memset(out, 0, sizeof(*out));
+    struct cache_index_entry *e = cache_lookup_locked(c, url, url_len);
+    if (!e || !cache_entry_valid(e))
+        return -1;
+
+    const uint8_t *resp = cache_response_ptr(c, e);
+    size_t total = e->header_len + e->body_len;
+    if (!resp || total == 0) {
+        if (e) e->flags = 0;
+        return -1;
+    }
+    if (c->verify_crc) {
+        uint32_t actual = crc32c_hw(resp, total);
+        if (actual != e->crc32c) {
+            log_warn("cache_crc", "crc mismatch url=%.*s expected=%08x actual=%08x",
+                     (int)url_len, url, e->crc32c, actual);
+            e->flags = 0;
+            c->evictions++;
+            c->misses++;
+            return -1;
+        }
+    }
+    /* Return direct slab pointer — caller must NOT free out->data */
+    out->data        = (uint8_t *)resp;
+    out->header_len  = e->header_len;
+    out->body_len    = e->body_len;
+    out->status_code = e->status_code;
+    out->body_etag   = e->body_etag;
+    return 0;
+}
+
 const uint8_t *cache_body_ptr(struct cache *c,
     const struct cache_index_entry *entry)
 {

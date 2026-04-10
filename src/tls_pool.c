@@ -1,6 +1,7 @@
 #include "tls_pool.h"
 #include "log.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -190,14 +191,32 @@ static void *tls_pool_worker_thread(void *arg)
             job.resume_session = NULL;
         }
 
-        /* Write result — sizeof(result) <= PIPE_BUF so this is atomic */
-        ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
-        if (wr != (ssize_t)sizeof(res)) {
-            log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
-            if (res.ssl && !res.ktls_tx)
-                SSL_free(res.ssl);
-            if (res.backend_session)
-                SSL_SESSION_free(res.backend_session);
+        /* Push result to the per-worker MPSC ring, then send a 1-byte wakeup.
+         * The ring slot is always available because CAP(256) > max in-flight. */
+        if (job.result_ring) {
+            uint32_t idx = atomic_fetch_add_explicit(&job.result_ring->tail, 1,
+                               memory_order_relaxed) % TLS_RESULT_RING_CAP;
+            /* Spin until the consumer has cleared this slot (should be instant) */
+            while (atomic_load_explicit(&job.result_ring->slots[idx].ready,
+                                         memory_order_acquire) != 0)
+                ;
+            job.result_ring->slots[idx].data = res;
+            atomic_store_explicit(&job.result_ring->slots[idx].ready, 1,
+                                   memory_order_release);
+            const uint8_t wake = 1;
+            ssize_t wr = write(job.result_pipe_wr, &wake, sizeof(wake));
+            if (wr != 1)
+                log_error("tls_pool", "wakeup pipe write failed cid=%u", job.cid);
+        } else {
+            /* Fallback: write full struct to pipe (old path, should not occur) */
+            ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
+            if (wr != (ssize_t)sizeof(res)) {
+                log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
+                if (res.ssl && !res.ktls_tx)
+                    SSL_free(res.ssl);
+                if (res.backend_session)
+                    SSL_SESSION_free(res.backend_session);
+            }
         }
 
         pthread_mutex_lock(&pool->mu);

@@ -70,14 +70,18 @@ struct worker {
     int              urandom_fd;    /* /dev/urandom for tarpit noise */
     FILE            *tarpit_log;    /* /var/log/vortex/tarpit.log */
 
-    /* Pipe for receiving completed TLS handshake results from tls_pool */
+    /* Pipe for waking the worker when pool threads finish (1-byte signals only).
+     * Actual result data is transferred via the MPSC rings below. */
     int              tls_done_pipe_rd; /* read end — polled by io_uring */
     int              tls_done_pipe_wr; /* write end — passed to pool threads */
-    /* Buffer for a single read from the result pipe (one result at a time) */
-    uint8_t          tls_pipe_buf[sizeof(struct tls_handshake_result)];
-    int              compress_done_pipe_rd; /* read end — polled by io_uring */
-    int              compress_done_pipe_wr; /* write end — passed to pool threads */
-    uint8_t          compress_pipe_buf[sizeof(struct compress_result)];
+    uint8_t          tls_pipe_buf[1];  /* 1-byte wakeup read target */
+    int              compress_done_pipe_rd;
+    int              compress_done_pipe_wr;
+    uint8_t          compress_pipe_buf[1];
+
+    /* MPSC result rings — pool threads write here; worker drains on wakeup */
+    struct tls_result_ring     tls_result_ring;
+    struct compress_result_ring compress_result_ring;
 
     /* XDP blocklist expiry ring — FIFO, oldest at head */
     struct blocked_entry blocked_list[WORKER_BLOCKED_MAX];
