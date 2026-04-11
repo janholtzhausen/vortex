@@ -32,12 +32,9 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -D_FORTIFY_SOURCE=2 -fstack-pr
 
 # Common warnings.
 # -Werror=format-security: format-string vulnerabilities are always hard errors.
-# -Wno-deprecated-declarations: suppress OpenSSL 4.0 API deprecation noise until
-#   the SSL_set1_host / SSL_SESSION_get_time replacement pass is done.
 add_compile_options(
     -Wall -Wextra -Wno-unused-parameter -Wno-stringop-truncation
     -Wformat -Wformat-security -Werror=format-security
-    -Wno-deprecated-declarations
 )
 
 option(VORTEX_FUZZ "Build libFuzzer targets" OFF)
@@ -67,17 +64,17 @@ else()
     message(STATUS "nghttp2: not found — HTTP/2 disabled (apt-get install libnghttp2-dev)")
 endif()
 
-# ---- OpenSSL 4.0 (required for Phase 3+) ----
-set(OPENSSL_ROOT_DIR "/opt/openssl-4.0" CACHE PATH "OpenSSL 4.0 installation prefix")
-if(EXISTS "${OPENSSL_ROOT_DIR}/include/openssl/ssl.h")
-    set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include")
-    set(OPENSSL_SSL_LIBRARY "${OPENSSL_ROOT_DIR}/lib64/libssl.so")
-    set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_ROOT_DIR}/lib64/libcrypto.so")
-    set(OPENSSL_AVAILABLE TRUE)
-    message(STATUS "OpenSSL 4.0 found at ${OPENSSL_ROOT_DIR}")
+# ---- picotls (required for TLS phase) ----
+set(PICOTLS_SRC_DIR "/tmp/picotls" CACHE PATH "picotls source dir")
+set(PICOTLS_BUILD_DIR "/tmp/picotls/build" CACHE PATH "picotls build dir")
+if(EXISTS "${PICOTLS_SRC_DIR}/include/picotls.h" AND
+   EXISTS "${PICOTLS_BUILD_DIR}/libpicotls-core.a" AND
+   EXISTS "${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a")
+    set(PICOTLS_AVAILABLE TRUE)
+    message(STATUS "picotls found at ${PICOTLS_SRC_DIR}")
 else()
-    set(OPENSSL_AVAILABLE FALSE)
-    message(WARNING "OpenSSL 4.0 not found at ${OPENSSL_ROOT_DIR} — TLS phase will not compile")
+    set(PICOTLS_AVAILABLE FALSE)
+    message(WARNING "picotls not found at ${PICOTLS_SRC_DIR} — TLS phase will not compile")
 endif()
 
 # ---- BPF compilation ----
@@ -153,19 +150,14 @@ set(VORTEX_SRCS
     src/simd.c
 )
 
-if(OPENSSL_AVAILABLE)
+if(PICOTLS_AVAILABLE)
     list(APPEND VORTEX_SRCS src/tls.c)
     list(APPEND VORTEX_SRCS src/tls_pool.c)
     if(NGHTTP2_FOUND)
         list(APPEND VORTEX_SRCS src/worker_h2.c)
     endif()
-    list(APPEND VORTEX_SRCS
-        cert/static_file.c
-        cert/acme_client.c
-        cert/acme_http01.c
-        cert/acme_dns01.c
-        cert/dns_cloudflare.c
-    )
+    list(APPEND VORTEX_SRCS cert/static_file.c)
+    list(APPEND VORTEX_SRCS cert/acme_client.c cert/acme_http01.c cert/acme_dns01.c cert/dns_cloudflare.c)
 endif()
 
 # ---- HTTP/3 via ngtcp2 + nghttp3 (static, linked against OpenSSL 4.0) ----
@@ -174,17 +166,8 @@ set(NGHTTP3_BUILD_DIR "/tmp/nghttp3-build"      CACHE PATH "nghttp3 build dir")
 set(NGTCP2_SRC_DIR    "/tmp/ngtcp2-1.16.0"      CACHE PATH "ngtcp2 source dir")
 set(NGHTTP3_SRC_DIR   "/tmp/nghttp3-1.8.0"      CACHE PATH "nghttp3 source dir")
 
-if(OPENSSL_AVAILABLE AND
-   EXISTS "${NGTCP2_BUILD_DIR}/lib/libngtcp2.a" AND
-   EXISTS "${NGTCP2_BUILD_DIR}/crypto/ossl/libngtcp2_crypto_ossl.a" AND
-   EXISTS "${NGHTTP3_BUILD_DIR}/lib/libnghttp3.a")
-    set(QUIC_AVAILABLE TRUE)
-    list(APPEND VORTEX_SRCS src/quic.c)
-    message(STATUS "HTTP/3 (ngtcp2+nghttp3): enabled")
-else()
-    set(QUIC_AVAILABLE FALSE)
-    message(STATUS "HTTP/3: disabled (build ngtcp2/nghttp3 first)")
-endif()
+set(QUIC_AVAILABLE FALSE)
+message(STATUS "HTTP/3: disabled (ngtcp2 requires OpenSSL; migrated to picotls)")
 
 add_executable(vortex ${VORTEX_SRCS})
 add_dependencies(vortex bpf_prog)
@@ -233,18 +216,16 @@ target_link_directories(vortex PRIVATE
     ${YAML_LIBRARY_DIRS}
 )
 
-# TLS support via OpenSSL 4.0
-if(OPENSSL_AVAILABLE)
+# TLS support via picotls + minicrypto
+if(PICOTLS_AVAILABLE)
     target_compile_definitions(vortex PRIVATE VORTEX_PHASE_TLS=1)
-    target_include_directories(vortex PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(vortex ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
-    target_link_directories(vortex PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
-    # Embed rpath so the binary finds the right libssl at runtime.
-    # BUILD_RPATH points to the local build tree; INSTALL_RPATH points to
-    # the location used in the installed .deb package (/usr/lib/vortex).
-    set_target_properties(vortex PROPERTIES
-        BUILD_RPATH "${OPENSSL_ROOT_DIR}/lib64"
-        INSTALL_RPATH "/usr/lib/vortex"
+    target_include_directories(vortex PRIVATE
+        ${PICOTLS_SRC_DIR}/include
+        ${PICOTLS_SRC_DIR}/deps/micro-ecc
+    )
+    target_link_libraries(vortex
+        ${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a
+        ${PICOTLS_BUILD_DIR}/libpicotls-core.a
     )
 endif()
 
@@ -289,7 +270,7 @@ message(STATUS "  -march:         ${VORTEX_MARCH}")
 message(STATUS "  libbpf:         ${LIBBPF_VERSION}")
 message(STATUS "  liburing:       ${LIBURING_VERSION}")
 message(STATUS "  libyaml:        ${YAML_VERSION}")
-message(STATUS "  OpenSSL 4.0:    ${OPENSSL_AVAILABLE}")
+message(STATUS "  picotls (TLS):  ${PICOTLS_AVAILABLE}")
 message(STATUS "  nghttp2 (H2):   ${NGHTTP2_FOUND}")
 message(STATUS "  BPF compiler:   ${CLANG_BPF}")
 message(STATUS "===================================")

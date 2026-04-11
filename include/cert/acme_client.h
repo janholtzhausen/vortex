@@ -3,11 +3,6 @@
 #include "cert_provider.h"
 #include "acme_http01.h"
 
-#ifdef VORTEX_PHASE_TLS
-#include <openssl/evp.h>
-#include <openssl/ssl.h>
-#endif
-
 #include <stdint.h>
 
 /*
@@ -15,6 +10,8 @@
  *
  * Supports HTTP-01 challenge only (Phase 6).
  * DNS-01 added in Phase 7.
+ *
+ * Crypto backend: picotls minicrypto + micro-ecc (no OpenSSL).
  */
 
 #define ACME_MAX_URL 512
@@ -28,9 +25,9 @@ struct acme_client {
     int    renewal_days;
 
 #ifdef VORTEX_PHASE_TLS
-    OSSL_LIB_CTX *libctx;    /* Borrowed from tls_ctx; used for outbound HTTPS */
-    SSL_CTX      *https_ctx; /* TLS client context for ACME API calls */
-    EVP_PKEY     *account_key;
+    void   *https_ctx;              /* ptls_context_t* for ACME HTTPS calls */
+    uint8_t account_key_priv[32];   /* raw P-256 private key */
+    uint8_t account_key_pub[64];    /* raw P-256 public key X||Y */
 #endif
 
     /* ACME directory endpoints (fetched at init) */

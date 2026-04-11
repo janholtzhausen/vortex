@@ -1,6 +1,12 @@
 /*
  * acme_dns01.c — ACME DNS-01 challenge provider.
  *
+ * Migrated from OpenSSL to picotls minicrypto + micro-ecc:
+ *   - HTTPS: reuses https_request() from acme_client.c (TCP + picotls)
+ *   - JWS:   reuses make_jws() from acme_client.c
+ *   - CSR:   reuses make_csr_der() from acme_client.c
+ *   - SHA-256: ptls_minicrypto_sha256
+ *
  * Protocol flow:
  *   1. newOrder
  *   2. getAuthz
@@ -15,6 +21,7 @@
  */
 
 #include "acme_dns01.h"
+#include "acme_internal.h"
 #include "dns_cloudflare.h"
 #include "log.h"
 
@@ -29,50 +36,9 @@
 
 #ifdef VORTEX_PHASE_TLS
 
-#include <openssl/evp.h>
-#include <openssl/ec.h>
-#include <openssl/pem.h>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-#include <openssl/bio.h>
-#include <openssl/sha.h>
-#include <openssl/bn.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/provider.h>
-
-/* ══════════════════════════════════════════════════════
- *  Local base64url (duplicated from acme_client.c — static there)
- * ══════════════════════════════════════════════════════ */
-
-static const char B64URL_DNS[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-static int dns01_b64url_encode(const unsigned char *in, size_t in_len,
-                                char *out, size_t out_max)
-{
-    size_t i, o = 0;
-    for (i = 0; i + 2 < in_len; i += 3) {
-        if (o + 4 >= out_max) return -1;
-        out[o++] = B64URL_DNS[(in[i]   >> 2)                    & 0x3F];
-        out[o++] = B64URL_DNS[((in[i]  << 4) | (in[i+1] >> 4)) & 0x3F];
-        out[o++] = B64URL_DNS[((in[i+1]<< 2) | (in[i+2] >> 6)) & 0x3F];
-        out[o++] = B64URL_DNS[ in[i+2]                          & 0x3F];
-    }
-    if (i < in_len) {
-        if (o + 2 >= out_max) return -1;
-        out[o++] = B64URL_DNS[(in[i] >> 2) & 0x3F];
-        if (i + 1 < in_len) {
-            out[o++] = B64URL_DNS[((in[i] << 4) | (in[i+1] >> 4)) & 0x3F];
-            if (o + 1 >= out_max) return -1;
-            out[o++] = B64URL_DNS[(in[i+1] << 2) & 0x3F];
-        } else {
-            out[o++] = B64URL_DNS[(in[i] << 4) & 0x3F];
-        }
-    }
-    out[o] = '\0';
-    return (int)o;
-}
+#include <picotls.h>
+#include <picotls/minicrypto.h>
+#include <uECC.h>
 
 /* ══════════════════════════════════════════════════════
  *  Local JSON helpers
@@ -163,320 +129,19 @@ static int dns01_find_dns01_challenge(const char *json,
 }
 
 /* ══════════════════════════════════════════════════════
- *  HTTPS client (mirrors acme_client.c pattern)
+ *  Nonce / request wrappers
  * ══════════════════════════════════════════════════════ */
-
-static int dns01_parse_url(const char *url,
-                            char *host, size_t host_max,
-                            int *port,
-                            char *path, size_t path_max)
-{
-    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0)
-        return -1;
-    int is_https = (url[4] == 's');
-    const char *p = url + (is_https ? 8 : 7);
-
-    const char *slash = strchr(p, '/');
-    const char *colon = strchr(p, ':');
-
-    if (colon && (!slash || colon < slash)) {
-        size_t hlen = (size_t)(colon - p);
-        if (hlen >= host_max) return -1;
-        memcpy(host, p, hlen); host[hlen] = '\0';
-        *port = atoi(colon + 1);
-    } else {
-        size_t hlen = slash ? (size_t)(slash - p) : strlen(p);
-        if (hlen >= host_max) return -1;
-        memcpy(host, p, hlen); host[hlen] = '\0';
-        *port = is_https ? 443 : 80;
-    }
-
-    if (slash) {
-        strncpy(path, slash, path_max - 1);
-        path[path_max - 1] = '\0';
-    } else {
-        strncpy(path, "/", path_max - 1);
-    }
-    return 0;
-}
-
-/*
- * Make an HTTPS request using the acme_client's https_ctx.
- * Returns 0 on success, -1 on failure.
- * *resp_out is heap-allocated (caller frees).
- */
-static int dns01_https_request(struct acme_client *cl,
-                                const char *method,
-                                const char *url,
-                                const char *body,
-                                size_t body_len,
-                                int  *status_out,
-                                char *location_out, size_t loc_max,
-                                char *nonce_out,    size_t nonce_max,
-                                char **resp_out,    size_t *resp_len_out)
-{
-    char host[256], path[512];
-    int port;
-
-    if (dns01_parse_url(url, host, sizeof(host), &port, path, sizeof(path)) < 0) {
-        log_error("acme_dns01", "bad url: %s", url);
-        return -1;
-    }
-
-    char hostport[280];
-    snprintf(hostport, sizeof(hostport), "%s:%d", host, port);
-
-    BIO *bio = BIO_new_ssl_connect(cl->https_ctx);
-    if (!bio) {
-        log_error("acme_dns01", "BIO_new_ssl_connect failed");
-        return -1;
-    }
-
-    SSL *ssl_ptr = NULL;
-    BIO_get_ssl(bio, &ssl_ptr);
-    if (ssl_ptr) SSL_set_tlsext_host_name(ssl_ptr, host);
-
-    BIO_set_conn_hostname(bio, hostport);
-
-    if (BIO_do_connect(bio) <= 0) {
-        log_error("acme_dns01", "connect to %s failed", hostport);
-        BIO_free_all(bio);
-        return -1;
-    }
-
-    char req_hdr[2048];
-    int hdr_len;
-    if (body && body_len > 0) {
-        hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-            "%s %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Content-Type: application/jose+json\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n"
-            "User-Agent: vortex/0.1\r\n"
-            "\r\n",
-            method, path, host, body_len);
-    } else {
-        hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-            "%s %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Connection: close\r\n"
-            "User-Agent: vortex/0.1\r\n"
-            "\r\n",
-            method, path, host);
-    }
-
-    if (BIO_write(bio, req_hdr, hdr_len) != hdr_len) goto io_err;
-    if (body && body_len > 0) {
-        if (BIO_write(bio, body, (int)body_len) != (int)body_len) goto io_err;
-    }
-    (void)BIO_flush(bio);
-
-    size_t total = 0, cap = 65536;
-    char *rbuf = malloc(cap);
-    if (!rbuf) { BIO_free_all(bio); return -1; }
-
-    for (;;) {
-        if (total + 1 >= cap) {
-            cap *= 2;
-            char *tmp = realloc(rbuf, cap);
-            if (!tmp) { free(rbuf); BIO_free_all(bio); return -1; }
-            rbuf = tmp;
-        }
-        int n = BIO_read(bio, rbuf + total, (int)(cap - total - 1));
-        if (n <= 0) break;
-        total += (size_t)n;
-    }
-    rbuf[total] = '\0';
-    BIO_free_all(bio);
-
-    if (total == 0) {
-        free(rbuf);
-        log_error("acme_dns01", "empty response from %s", url);
-        return -1;
-    }
-
-    *status_out = 0;
-    if (sscanf(rbuf, "HTTP/%*d.%*d %d", status_out) != 1) {
-        free(rbuf);
-        log_error("acme_dns01", "bad status line");
-        return -1;
-    }
-
-    if (location_out) location_out[0] = '\0';
-    if (nonce_out)    nonce_out[0]    = '\0';
-
-    char *hdrs_end = strstr(rbuf, "\r\n\r\n");
-    if (!hdrs_end) hdrs_end = rbuf + total;
-
-    if (nonce_out && nonce_max > 0) {
-        const char *nh = strcasestr(rbuf, "\r\nReplay-Nonce:");
-        if (nh) {
-            nh += 15;
-            while (*nh == ' ') nh++;
-            const char *ne = strstr(nh, "\r\n");
-            size_t nlen = ne ? (size_t)(ne - nh) : strlen(nh);
-            if (nlen >= nonce_max) nlen = nonce_max - 1;
-            memcpy(nonce_out, nh, nlen);
-            nonce_out[nlen] = '\0';
-        }
-    }
-
-    if (location_out && loc_max > 0) {
-        const char *lh = strcasestr(rbuf, "\r\nLocation:");
-        if (lh) {
-            lh += 11;
-            while (*lh == ' ') lh++;
-            const char *le = strstr(lh, "\r\n");
-            size_t llen = le ? (size_t)(le - lh) : strlen(lh);
-            if (llen >= loc_max) llen = loc_max - 1;
-            memcpy(location_out, lh, llen);
-            location_out[llen] = '\0';
-        }
-    }
-
-    char *body_start = hdrs_end ? hdrs_end + 4 : rbuf + total;
-    size_t body_sz = (size_t)(rbuf + total - body_start);
-
-    if (resp_out) {
-        char *copy = malloc(body_sz + 1);
-        if (!copy) { free(rbuf); return -1; }
-        memcpy(copy, body_start, body_sz);
-        copy[body_sz] = '\0';
-        *resp_out = copy;
-        if (resp_len_out) *resp_len_out = body_sz;
-    }
-
-    free(rbuf);
-    return 0;
-
-io_err:
-    log_error("acme_dns01", "I/O error writing to %s", hostport);
-    BIO_free_all(bio);
-    return -1;
-}
-
-/* ══════════════════════════════════════════════════════
- *  JWK / JWS helpers (duplicated locally — static in acme_client.c)
- * ══════════════════════════════════════════════════════ */
-
-static int dns01_eckey_to_jwk(EVP_PKEY *pkey, char *out, size_t out_max)
-{
-    unsigned char pub[65];
-    size_t pub_len = sizeof(pub);
-    if (EVP_PKEY_get_octet_string_param(pkey, "pub", pub, pub_len, &pub_len) <= 0)
-        return -1;
-    if (pub_len != 65 || pub[0] != 0x04) return -1;
-
-    char xb64[64], yb64[64];
-    if (dns01_b64url_encode(pub + 1,  32, xb64, sizeof(xb64)) < 0) return -1;
-    if (dns01_b64url_encode(pub + 33, 32, yb64, sizeof(yb64)) < 0) return -1;
-
-    int n = snprintf(out, out_max,
-        "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"%s\",\"y\":\"%s\"}",
-        xb64, yb64);
-    return (n > 0 && (size_t)n < out_max) ? 0 : -1;
-}
-
-static int dns01_ecdsa_sign_raw(EVP_PKEY *pkey,
-                                 const unsigned char *msg, size_t msg_len,
-                                 unsigned char *sig_out, size_t *sig_len_out)
-{
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) return -1;
-
-    unsigned char der_sig[128];
-    size_t der_len = sizeof(der_sig);
-
-    if (EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, pkey) != 1 ||
-        EVP_DigestSign(mdctx, der_sig, &der_len, msg, msg_len) != 1)
-    {
-        EVP_MD_CTX_free(mdctx);
-        return -1;
-    }
-    EVP_MD_CTX_free(mdctx);
-
-    ECDSA_SIG *esig = d2i_ECDSA_SIG(NULL, &(const unsigned char *){ der_sig },
-                                     (long)der_len);
-    if (!esig) return -1;
-
-    const BIGNUM *r, *s;
-    ECDSA_SIG_get0(esig, &r, &s);
-
-    *sig_len_out = 64;
-    memset(sig_out, 0, 64);
-    int rlen = BN_num_bytes(r), slen = BN_num_bytes(s);
-    BN_bn2bin(r, sig_out + 32 - rlen);
-    BN_bn2bin(s, sig_out + 64 - slen);
-    ECDSA_SIG_free(esig);
-    return 0;
-}
-
-/*
- * Build a JWS-signed request body.
- * kid != NULL → use kid header; kid == NULL → embed JWK (for newAccount only).
- */
-static char *dns01_make_jws(EVP_PKEY *pkey,
-                              const char *nonce,
-                              const char *url,
-                              const char *payload_json,
-                              const char *kid)
-{
-    char hdr_json[1024];
-    if (kid && kid[0]) {
-        snprintf(hdr_json, sizeof(hdr_json),
-            "{\"alg\":\"ES256\",\"nonce\":\"%s\",\"url\":\"%s\","
-            "\"kid\":\"%s\"}",
-            nonce, url, kid);
-    } else {
-        char jwk[256];
-        if (dns01_eckey_to_jwk(pkey, jwk, sizeof(jwk)) < 0) return NULL;
-        snprintf(hdr_json, sizeof(hdr_json),
-            "{\"alg\":\"ES256\",\"nonce\":\"%s\",\"url\":\"%s\","
-            "\"jwk\":%s}",
-            nonce, url, jwk);
-    }
-
-    char hdr_b64[1024], pay_b64[4096];
-    if (dns01_b64url_encode((unsigned char *)hdr_json, strlen(hdr_json),
-                             hdr_b64, sizeof(hdr_b64)) < 0) return NULL;
-
-    const char *payload = payload_json ? payload_json : "";
-    if (dns01_b64url_encode((unsigned char *)payload, strlen(payload),
-                             pay_b64, sizeof(pay_b64)) < 0) return NULL;
-
-    char si[8192];
-    int si_len = snprintf(si, sizeof(si), "%s.%s", hdr_b64, pay_b64);
-    if (si_len <= 0 || (size_t)si_len >= sizeof(si)) return NULL;
-
-    unsigned char raw_sig[64];
-    size_t raw_sig_len;
-    if (dns01_ecdsa_sign_raw(pkey, (unsigned char *)si, (size_t)si_len,
-                              raw_sig, &raw_sig_len) < 0) return NULL;
-
-    char sig_b64[128];
-    if (dns01_b64url_encode(raw_sig, raw_sig_len, sig_b64, sizeof(sig_b64)) < 0)
-        return NULL;
-
-    size_t jws_max = strlen(hdr_b64) + strlen(pay_b64) + strlen(sig_b64) + 256;
-    char *jws = malloc(jws_max);
-    if (!jws) return NULL;
-    snprintf(jws, jws_max,
-        "{\"protected\":\"%s\",\"payload\":\"%s\",\"signature\":\"%s\"}",
-        hdr_b64, pay_b64, sig_b64);
-    return jws;
-}
 
 static int dns01_get_nonce(struct acme_client *cl,
                             char *nonce, size_t nmax)
 {
     int status;
     char loc[8] = "";
-    if (dns01_https_request(cl, "HEAD", cl->newNonce_url,
-                             NULL, 0,
-                             &status, loc, sizeof(loc),
-                             nonce, nmax,
-                             NULL, NULL) < 0) return -1;
+    if (https_request(cl, "HEAD", cl->newNonce_url,
+                      NULL, NULL, 0,
+                      &status, loc, sizeof(loc),
+                      nonce, nmax,
+                      NULL, NULL) < 0) return -1;
     if (nonce[0] == '\0') {
         log_error("acme_dns01", "no nonce in HEAD response");
         return -1;
@@ -484,64 +149,31 @@ static int dns01_get_nonce(struct acme_client *cl,
     return 0;
 }
 
-/* ══════════════════════════════════════════════════════
- *  CSR generation (duplicated locally — static in acme_client.c)
- * ══════════════════════════════════════════════════════ */
-
-static int dns01_make_csr_der(const char *domain,
-                               EVP_PKEY **pkey_out,
-                               unsigned char **csr_der, size_t *csr_len)
+/* Convenience wrapper: POST with JWS body, capture nonce from response. */
+static int dns01_post(struct acme_client *cl,
+                      const char *url,
+                      const char *payload_json,  /* NULL for POST-as-GET */
+                      char *nonce,               /* in: current nonce; out: fresh nonce */
+                      size_t nonce_max,
+                      char *loc_out, size_t loc_max,
+                      int *status_out,
+                      char **body_out)
 {
-    EVP_PKEY_CTX *pkctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
-    if (!pkctx) return -1;
-    EVP_PKEY *pkey = NULL;
-    if (EVP_PKEY_keygen_init(pkctx) <= 0 ||
-        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pkctx, NID_X9_62_prime256v1) <= 0 ||
-        EVP_PKEY_generate(pkctx, &pkey) <= 0)
-    {
-        EVP_PKEY_CTX_free(pkctx);
-        return -1;
-    }
-    EVP_PKEY_CTX_free(pkctx);
+    char *jws = make_jws(cl->account_key_priv, cl->account_key_pub,
+                         nonce, url,
+                         payload_json, cl->account_url,
+                         cl->jwk_thumbprint);
+    if (!jws) return -1;
 
-    X509_REQ *req = X509_REQ_new();
-    if (!req) { EVP_PKEY_free(pkey); return -1; }
-
-    X509_REQ_set_pubkey(req, pkey);
-
-    X509_NAME *name = (X509_NAME *)X509_REQ_get_subject_name(req);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-        (unsigned char *)domain, -1, -1, 0);
-
-    STACK_OF(X509_EXTENSION) *exts = sk_X509_EXTENSION_new_null();
-    char san[320];
-    snprintf(san, sizeof(san), "DNS:%s", domain);
-    X509V3_CTX v3ctx;
-    X509V3_set_ctx_nodb(&v3ctx);
-    X509V3_set_ctx(&v3ctx, NULL, NULL, req, NULL, 0);
-    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, &v3ctx,
-                           NID_subject_alt_name, san);
-    if (ext) {
-        sk_X509_EXTENSION_push(exts, ext);
-        X509_REQ_add_extensions(req, exts);
-        sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
-    }
-
-    if (X509_REQ_sign(req, pkey, EVP_sha256()) == 0) {
-        X509_REQ_free(req);
-        EVP_PKEY_free(pkey);
-        return -1;
-    }
-
-    *csr_len = (size_t)i2d_X509_REQ(req, NULL);
-    *csr_der = malloc(*csr_len);
-    if (!*csr_der) { X509_REQ_free(req); EVP_PKEY_free(pkey); return -1; }
-    unsigned char *p = *csr_der;
-    i2d_X509_REQ(req, &p);
-    X509_REQ_free(req);
-
-    *pkey_out = pkey;
-    return 0;
+    int r = https_request(cl, "POST", url,
+                          "application/jose+json",
+                          jws, strlen(jws),
+                          status_out,
+                          loc_out, loc_max,
+                          nonce, nonce_max,
+                          body_out, NULL);
+    free(jws);
+    return r;
 }
 
 /* ══════════════════════════════════════════════════════
@@ -561,18 +193,13 @@ static int dns01_poll_for_status(struct acme_client *cl,
 
         if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) return -1;
 
-        char *jws = dns01_make_jws(cl->account_key, nonce, url,
-                                   NULL /* POST-as-GET */,
-                                   cl->account_url);
-        if (!jws) return -1;
-
-        int r = dns01_https_request(cl, "POST", url,
-                                     jws, strlen(jws),
-                                     &status, loc, sizeof(loc),
-                                     nonce, sizeof(nonce),
-                                     &body, NULL);
-        free(jws);
-        if (r < 0) { free(body); return -1; }
+        if (dns01_post(cl, url, NULL /* POST-as-GET */,
+                       nonce, sizeof(nonce),
+                       loc, sizeof(loc),
+                       &status, &body) < 0) {
+            free(body);
+            return -1;
+        }
 
         char obj_status[64] = "";
         dns01_json_get_str(body ? body : "", "status",
@@ -627,8 +254,9 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     char txt_name[320]      = "";
     int  txt_created        = 0;
 
-    /* Track domain key for cleanup on error paths */
-    EVP_PKEY *domain_key = NULL;
+    /* Domain key (raw 32-byte P-256 private key) — cleared on done */
+    uint8_t domain_key_priv[32];
+    memset(domain_key_priv, 0, sizeof(domain_key_priv));
 
     /* ── 1. new-order ── */
     if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) goto done;
@@ -636,16 +264,11 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
         char pay[512];
         snprintf(pay, sizeof(pay),
             "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"%s\"}]}", domain);
-        char *jws = dns01_make_jws(cl->account_key, nonce, cl->newOrder_url,
-                                   pay, cl->account_url);
-        if (!jws) goto done;
-        int r = dns01_https_request(cl, "POST", cl->newOrder_url,
-                                     jws, strlen(jws),
-                                     &status, loc, sizeof(loc),
-                                     nonce, sizeof(nonce),
-                                     &resp, NULL);
-        free(jws);
-        if (r < 0 || (status != 201 && status != 200)) {
+        if (dns01_post(cl, cl->newOrder_url, pay,
+                       nonce, sizeof(nonce),
+                       loc, sizeof(loc),
+                       &status, &resp) < 0
+            || (status != 201 && status != 200)) {
             log_error("acme_dns01", "newOrder returned %d: %s",
                       status, resp ? resp : "");
             goto done;
@@ -671,22 +294,17 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) goto done;
     {
         char loc2[8] = "";
-        char *jws = dns01_make_jws(cl->account_key, nonce, authz_url,
-                                   NULL /* POST-as-GET */, cl->account_url);
-        if (!jws) goto done;
-        int r = dns01_https_request(cl, "POST", authz_url,
-                                     jws, strlen(jws),
-                                     &status, loc2, sizeof(loc2),
-                                     nonce, sizeof(nonce),
-                                     &resp, NULL);
-        free(jws);
-        if (r < 0 || status != 200) {
+        if (dns01_post(cl, authz_url, NULL /* POST-as-GET */,
+                       nonce, sizeof(nonce),
+                       loc2, sizeof(loc2),
+                       &status, &resp) < 0
+            || status != 200) {
             log_error("acme_dns01", "get authz returned %d", status);
             goto done;
         }
     }
 
-    char challenge_token[256]      = "";
+    char challenge_token[256]        = "";
     char challenge_url[ACME_MAX_URL] = "";
     if (dns01_find_dns01_challenge(resp ? resp : "",
                                    challenge_token, sizeof(challenge_token),
@@ -697,7 +315,6 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     free(resp); resp = NULL;
 
     /* ── 3. Compute key_auth and TXT value ── */
-    /* key_auth = token + "." + thumbprint */
     char key_auth[512];
     {
         int n = snprintf(key_auth, sizeof(key_auth), "%s.%s",
@@ -711,20 +328,12 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     /* txt_value = base64url(SHA-256(key_auth)) */
     char txt_value[64] = "";
     {
-        unsigned char digest[32];
-        unsigned int dlen = 0;
-        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-        if (!mdctx) goto done;
-        if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1 ||
-            EVP_DigestUpdate(mdctx, key_auth, strlen(key_auth)) != 1 ||
-            EVP_DigestFinal_ex(mdctx, digest, &dlen) != 1)
-        {
-            EVP_MD_CTX_free(mdctx);
-            log_error("acme_dns01", "SHA-256 of key_auth failed");
-            goto done;
-        }
-        EVP_MD_CTX_free(mdctx);
-        if (dns01_b64url_encode(digest, 32, txt_value, sizeof(txt_value)) < 0) {
+        ptls_hash_context_t *hctx = ptls_minicrypto_sha256.create();
+        if (!hctx) goto done;
+        uint8_t digest[PTLS_SHA256_DIGEST_SIZE];
+        hctx->update(hctx, key_auth, strlen(key_auth));
+        hctx->final(hctx, digest, PTLS_HASH_FINAL_MODE_FREE);
+        if (b64url_encode(digest, 32, txt_value, sizeof(txt_value)) < 0) {
             log_error("acme_dns01", "base64url of digest failed");
             goto done;
         }
@@ -754,16 +363,11 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) goto done;
     {
         char loc2[8] = "";
-        char *jws = dns01_make_jws(cl->account_key, nonce, challenge_url,
-                                   "{}", cl->account_url);
-        if (!jws) goto done;
-        int r = dns01_https_request(cl, "POST", challenge_url,
-                                     jws, strlen(jws),
-                                     &status, loc2, sizeof(loc2),
-                                     nonce, sizeof(nonce),
-                                     &resp, NULL);
-        free(jws);
-        if (r < 0 || (status != 200 && status != 202)) {
+        if (dns01_post(cl, challenge_url, "{}",
+                       nonce, sizeof(nonce),
+                       loc2, sizeof(loc2),
+                       &status, &resp) < 0
+            || (status != 200 && status != 202)) {
             log_error("acme_dns01", "respond to challenge returned %d: %s",
                       status, resp ? resp : "");
             goto done;
@@ -789,9 +393,9 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     }
 
     /* ── 9. Generate CSR ── */
-    unsigned char *csr_der = NULL;
+    uint8_t *csr_der = NULL;
     size_t csr_len = 0;
-    if (dns01_make_csr_der(domain, &domain_key, &csr_der, &csr_len) < 0) {
+    if (make_csr_der(domain, domain_key_priv, &csr_der, &csr_len) < 0) {
         log_error("acme_dns01", "CSR generation failed");
         goto done;
     }
@@ -799,7 +403,7 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     /* ── 10. Finalize order ── */
     {
         char csr_b64[4096];
-        if (dns01_b64url_encode(csr_der, csr_len, csr_b64, sizeof(csr_b64)) < 0) {
+        if (b64url_encode(csr_der, csr_len, csr_b64, sizeof(csr_b64)) < 0) {
             free(csr_der);
             log_error("acme_dns01", "base64url encode of CSR failed");
             goto done;
@@ -812,17 +416,11 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
         if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) goto done;
 
         char loc2[8] = "";
-        char *jws = dns01_make_jws(cl->account_key, nonce, finalize_url,
-                                   pay, cl->account_url);
-        if (!jws) goto done;
-
-        int r = dns01_https_request(cl, "POST", finalize_url,
-                                     jws, strlen(jws),
-                                     &status, loc2, sizeof(loc2),
-                                     nonce, sizeof(nonce),
-                                     &resp, NULL);
-        free(jws);
-        if (r < 0 || (status != 200 && status != 201)) {
+        if (dns01_post(cl, finalize_url, pay,
+                       nonce, sizeof(nonce),
+                       loc2, sizeof(loc2),
+                       &status, &resp) < 0
+            || (status != 200 && status != 201)) {
             log_error("acme_dns01", "finalize returned %d: %s",
                       status, resp ? resp : "");
             goto done;
@@ -842,16 +440,11 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     {
         if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) goto done;
         char loc2[8] = "";
-        char *jws = dns01_make_jws(cl->account_key, nonce, order_url,
-                                   NULL /* POST-as-GET */, cl->account_url);
-        if (!jws) goto done;
-        int r = dns01_https_request(cl, "POST", order_url,
-                                     jws, strlen(jws),
-                                     &status, loc2, sizeof(loc2),
-                                     nonce, sizeof(nonce),
-                                     &resp, NULL);
-        free(jws);
-        if (r < 0 || status != 200) {
+        if (dns01_post(cl, order_url, NULL /* POST-as-GET */,
+                       nonce, sizeof(nonce),
+                       loc2, sizeof(loc2),
+                       &status, &resp) < 0
+            || status != 200) {
             log_error("acme_dns01", "order fetch returned %d", status);
             goto done;
         }
@@ -871,16 +464,11 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     if (dns01_get_nonce(cl, nonce, sizeof(nonce)) < 0) goto done;
     {
         char loc2[8] = "";
-        char *jws = dns01_make_jws(cl->account_key, nonce, cert_url,
-                                   NULL /* POST-as-GET */, cl->account_url);
-        if (!jws) goto done;
-        int r = dns01_https_request(cl, "POST", cert_url,
-                                     jws, strlen(jws),
-                                     &status, loc2, sizeof(loc2),
-                                     nonce, sizeof(nonce),
-                                     &resp, NULL);
-        free(jws);
-        if (r < 0 || status != 200) {
+        if (dns01_post(cl, cert_url, NULL /* POST-as-GET */,
+                       nonce, sizeof(nonce),
+                       loc2, sizeof(loc2),
+                       &status, &resp) < 0
+            || status != 200) {
             log_error("acme_dns01", "cert download returned %d", status);
             goto done;
         }
@@ -888,20 +476,14 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
 
     /* resp contains the PEM certificate chain */
 
-    /* Encode domain private key to PEM */
-    BIO *keybio = BIO_new(BIO_s_mem());
-    if (!keybio) { free(resp); goto done; }
-    PEM_write_bio_PrivateKey(keybio, domain_key, NULL, NULL, 0, NULL, NULL);
-    BUF_MEM *bm = NULL;
-    BIO_get_mem_ptr(keybio, &bm);
-    char *key_pem = malloc(bm->length + 1);
-    if (key_pem) {
-        memcpy(key_pem, bm->data, bm->length);
-        key_pem[bm->length] = '\0';
+    /* Encode domain private key as PKCS#8 PEM */
+    char key_pem_buf[256];
+    if (pkcs8_pem_from_priv(domain_key_priv, key_pem_buf, sizeof(key_pem_buf)) < 0) {
+        free(resp);
+        log_error("acme_dns01", "failed to encode domain key as PEM");
+        goto done;
     }
-    BIO_free(keybio);
-    EVP_PKEY_free(domain_key); domain_key = NULL;
-
+    char *key_pem = strdup(key_pem_buf);
     if (!key_pem) { free(resp); goto done; }
 
     /* ── 14. Save cert.pem and key.pem to storage_path/domain/ ── */
@@ -937,23 +519,18 @@ int acme_obtain_dns01(struct acme_dns01_ctx *dctx,
     out->key_pem   = key_pem;
     out->not_after = 0;
     {
-        BIO *bio = BIO_new_mem_buf(out->cert_pem, -1);
-        X509 *x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-        BIO_free(bio);
-        if (x509) {
-            const ASN1_TIME *na = X509_get0_notAfter(x509);
-            struct tm tm_val;
-            memset(&tm_val, 0, sizeof(tm_val));
-            ASN1_TIME_to_tm(na, &tm_val);
-            out->not_after = timegm(&tm_val);
-            X509_free(x509);
+        size_t der_len = 0;
+        uint8_t *der = pem_cert_to_der(out->cert_pem, &der_len);
+        if (der) {
+            out->not_after = der_cert_not_after(der, der_len);
+            free(der);
         }
     }
     rc = 0;
 
 done:
     free(resp);
-    if (domain_key) EVP_PKEY_free(domain_key);
+    memset(domain_key_priv, 0, sizeof(domain_key_priv));
 
     /* Clean up TXT record if something failed after it was created */
     if (txt_created) {
