@@ -160,6 +160,8 @@ typedef enum {
     P_ROUTE_AUTH_USERS,
     P_ROUTE_RATELIMIT,
     P_ROUTE_HEALTH,
+    P_ROUTE_BACKEND_HEADERS,
+    P_ROUTE_BACKEND_HEADER,
 } parse_state_t;
 
 typedef struct {
@@ -168,6 +170,7 @@ typedef struct {
     char                 key[256];
     int                  route_idx;
     int                  backend_idx;
+    int                  backend_header_idx;
     int                  depth;          /* mapping depth */
     int                  seq_depth;      /* sequence depth */
     int                  error;
@@ -290,6 +293,11 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         else if (!strcmp(k, "backend_credentials")) snprintf(r->backend_credentials, sizeof(r->backend_credentials), "%s", val);
         else if (!strcmp(k, "server_header"))      snprintf(r->server_header, sizeof(r->server_header), "%s", !strcmp(val,"none") ? "" : val);
         else if (!strcmp(k, "congestion_control")) snprintf(r->congestion_control, sizeof(r->congestion_control), "%s", val);
+        else if (!strcmp(k, "backend_auth")) {
+            if      (!strcmp(val, "passthrough")) r->backend_auth_mode = BACKEND_AUTH_PASSTHROUGH;
+            else if (!strcmp(val, "rewrite"))     r->backend_auth_mode = BACKEND_AUTH_REWRITE;
+            else                                  r->backend_auth_mode = BACKEND_AUTH_BLOCK;
+        }
         else if (!strcmp(k, "hostname"))     snprintf(r->hostname, sizeof(r->hostname), "%s", val);
         else if (!strcmp(k, "protocol")) {
             if (!strcmp(val, "tcp")) r->route_type = ROUTE_TYPE_TCP_TUNNEL;
@@ -388,6 +396,22 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         break;
     }
 
+    case P_ROUTE_BACKEND_HEADER: {
+        struct route_config *r = &c->routes[ctx->route_idx];
+        if (ctx->backend_header_idx < 0 ||
+            ctx->backend_header_idx >= VORTEX_MAX_BACKEND_HEADER_RULES) break;
+        struct backend_header_rule *hr = &r->backend_headers[ctx->backend_header_idx];
+        if (!strcmp(k, "name")) {
+            snprintf(hr->name, sizeof(hr->name), "%s", val);
+        } else if (!strcmp(k, "action")) {
+            if      (!strcmp(val, "set"))   hr->action = HEADER_ACTION_SET;
+            else                            hr->action = HEADER_ACTION_BLOCK;
+        } else if (!strcmp(k, "value")) {
+            snprintf(hr->value, sizeof(hr->value), "%s", val);
+        }
+        break;
+    }
+
     default: break;
     }
 }
@@ -414,6 +438,7 @@ int config_load(const char *path, struct vortex_config *cfg)
         .state     = P_ROOT,
         .route_idx = -1,
         .backend_idx = -1,
+        .backend_header_idx = -1,
     };
 
     bool got_key    = false;
@@ -453,19 +478,25 @@ int config_load(const char *path, struct vortex_config *cfg)
                     cfg->routes[ctx.route_idx].backend_count = ctx.backend_idx + 1;
                 }
                 ctx.state = P_ROUTE_BACKEND;
+            } else if (ctx.state == P_ROUTE_BACKEND_HEADERS) {
+                ctx.backend_header_idx++;
+                if (ctx.backend_header_idx < VORTEX_MAX_BACKEND_HEADER_RULES)
+                    cfg->routes[ctx.route_idx].backend_header_count = ctx.backend_header_idx + 1;
+                ctx.state = P_ROUTE_BACKEND_HEADER;
             }
             break;
 
         case YAML_MAPPING_END_EVENT:
             ctx.depth--;
             /* Pop state back up the hierarchy */
-            if      (ctx.state == P_ROUTE_BACKEND)    { ctx.state = P_ROUTE_BACKENDS; }
-            else if (ctx.state == P_ROUTE_BACKENDS)   { ctx.state = P_ROUTE; }
-            else if (ctx.state == P_ROUTE_CACHE)      { ctx.state = P_ROUTE; }
-            else if (ctx.state == P_ROUTE_AUTH)       { ctx.state = P_ROUTE; }
-            else if (ctx.state == P_ROUTE_RATELIMIT)  { ctx.state = P_ROUTE; }
-            else if (ctx.state == P_ROUTE_HEALTH)     { ctx.state = P_ROUTE; }
-            else if (ctx.state == P_ROUTE)            { ctx.state = P_ROUTES; }
+            if      (ctx.state == P_ROUTE_BACKEND)         { ctx.state = P_ROUTE_BACKENDS; }
+            else if (ctx.state == P_ROUTE_BACKENDS)        { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_CACHE)           { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_AUTH)            { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_RATELIMIT)       { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_HEALTH)          { ctx.state = P_ROUTE; }
+            else if (ctx.state == P_ROUTE_BACKEND_HEADER)  { ctx.state = P_ROUTE_BACKEND_HEADERS; }
+            else if (ctx.state == P_ROUTE)                 { ctx.state = P_ROUTES; }
             else if (ctx.state == P_ACME_DNS_CFG)     { ctx.state = P_ACME; }
             else if (ctx.state == P_XDP_RATELIMIT)    { ctx.state = P_XDP; }
             /* Section mappings pop back to root */
@@ -487,6 +518,9 @@ int config_load(const char *path, struct vortex_config *cfg)
                 ctx.backend_idx = -1;
             } else if (ctx.state == P_ROUTE_AUTH && !strcmp(ctx.key, "users")) {
                 ctx.state = P_ROUTE_AUTH_USERS;
+            } else if (ctx.state == P_ROUTE && !strcmp(ctx.key, "backend_headers")) {
+                ctx.state = P_ROUTE_BACKEND_HEADERS;
+                ctx.backend_header_idx = -1;
             }
             break;
 
@@ -498,6 +532,8 @@ int config_load(const char *path, struct vortex_config *cfg)
                 ctx.state = P_ROUTE;
             } else if (ctx.state == P_ROUTE_AUTH_USERS) {
                 ctx.state = P_ROUTE_AUTH;
+            } else if (ctx.state == P_ROUTE_BACKEND_HEADERS) {
+                ctx.state = P_ROUTE;
             }
             break;
 
@@ -530,11 +566,12 @@ int config_load(const char *path, struct vortex_config *cfg)
                     ctx.state = P_ACME_DNS_CFG;
                     got_key = false;
                 } else if (ctx.state == P_ROUTE) {
-                    if (!strcmp(sv, "backends"))         ctx.state = P_ROUTE_BACKENDS;
-                    else if (!strcmp(sv, "cache"))       ctx.state = P_ROUTE_CACHE;
-                    else if (!strcmp(sv, "auth"))        ctx.state = P_ROUTE_AUTH;
-                    else if (!strcmp(sv, "rate_limit"))    ctx.state = P_ROUTE_RATELIMIT;
-                    else if (!strcmp(sv, "health_check")) ctx.state = P_ROUTE_HEALTH;
+                    if      (!strcmp(sv, "backends"))        ctx.state = P_ROUTE_BACKENDS;
+                    else if (!strcmp(sv, "cache"))           ctx.state = P_ROUTE_CACHE;
+                    else if (!strcmp(sv, "auth"))            ctx.state = P_ROUTE_AUTH;
+                    else if (!strcmp(sv, "rate_limit"))      ctx.state = P_ROUTE_RATELIMIT;
+                    else if (!strcmp(sv, "health_check"))    ctx.state = P_ROUTE_HEALTH;
+                    else if (!strcmp(sv, "backend_headers")) ctx.state = P_ROUTE_BACKEND_HEADERS;
                 }
             } else {
                 handle_scalar(&ctx, sv);

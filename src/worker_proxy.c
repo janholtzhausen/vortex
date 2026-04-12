@@ -1318,6 +1318,37 @@ static void handle_error(struct worker *w, struct io_uring_cqe *cqe, uint32_t ci
     conn_close(w, cid, is_error);
 }
 
+/* Strip a named request header (case-insensitive: tries original name then
+ * lowercase).  Modifies buf in-place; decrements *n by the removed bytes. */
+static void strip_named_header(uint8_t *buf, int *n, const char *name)
+{
+    size_t nlen = strlen(name);
+    char needle[256];
+    /* \r\n + name + : */
+    snprintf(needle, sizeof(needle), "\r\n%s:", name);
+    uint8_t *h = (uint8_t *)memmem(buf, (size_t)*n, needle, nlen + 3);
+    if (!h) {
+        /* Try lowercase */
+        needle[2] = '\0';  /* truncate to just "\r\n" */
+        char low[256];
+        snprintf(low, sizeof(low), "\r\n");
+        for (size_t i = 0; i < nlen && i + 2 < sizeof(low) - 1; i++)
+            low[i + 2] = (char)tolower((unsigned char)name[i]);
+        low[nlen + 2] = ':';
+        low[nlen + 3] = '\0';
+        h = (uint8_t *)memmem(buf, (size_t)*n, low, nlen + 3);
+    }
+    if (h) {
+        uint8_t *le = (uint8_t *)FIND_CRLF(h + 2, (size_t)(buf + *n - h - 2));
+        if (le) {
+            le += 2;
+            size_t rm = (size_t)(le - h - 2);
+            memmove(h + 2, h + 2 + rm, (size_t)(buf + *n - (h + 2 + rm)));
+            *n -= (int)rm;
+        }
+    }
+}
+
 static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid, struct conn_hot *h)
 {
     int n = cqe->res;
@@ -1636,26 +1667,23 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
             /* When absent: injected in the inject block below */
         }
 
-        /* ---- Strip Authorization header ----
-         * The proxy consumed it for its own auth check; never forward
-         * our proxy credentials to the backend. */
-        {
-            uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
-            if (!ah)
-                ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
-            if (ah) {
-                uint8_t *line_end = (uint8_t *)FIND_CRLF(ah + 2,
-                    (size_t)(rbuf + fwd_n - ah - 2));
-                if (line_end) {
-                    line_end += 2; /* include the \r\n */
-                    size_t remove = (size_t)(line_end - ah - 2); /* bytes between \r\n's */
-                    /* We want to remove "\r\nAuthorization: ...\r\n" → replace with "\r\n" */
-                    /* i.e., shift everything after the line's \r\n back by (remove) bytes */
-                    memmove(ah + 2, ah + 2 + remove,
-                        (size_t)(rbuf + fwd_n - (ah + 2 + remove)));
-                    fwd_n -= (int)remove;
-                }
-            }
+        /* ---- Authorization header: block / passthrough / rewrite ----
+         * Determine effective mode: if backend_auth_mode is BLOCK but
+         * backend_credentials is set, treat as REWRITE (backwards compat). */
+        backend_auth_mode_t ba_mode = rc_fwd->backend_auth_mode;
+        if (ba_mode == BACKEND_AUTH_BLOCK && rc_fwd->backend_credentials[0])
+            ba_mode = BACKEND_AUTH_REWRITE;
+
+        if (ba_mode != BACKEND_AUTH_PASSTHROUGH) {
+            /* BLOCK or REWRITE: strip incoming Authorization before forwarding */
+            strip_named_header(rbuf, &fwd_n, "Authorization");
+        }
+
+        /* ---- Custom BLOCK rules (backend_headers) ---- */
+        for (int _ri = 0; _ri < rc_fwd->backend_header_count; _ri++) {
+            const struct backend_header_rule *hr = &rc_fwd->backend_headers[_ri];
+            if (hr->action == HEADER_ACTION_BLOCK)
+                strip_named_header(rbuf, &fwd_n, hr->name);
         }
 
         /* ---- Connection header ----
@@ -1711,14 +1739,21 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
                 inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
                     "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
 
-            /* Backend Basic Auth credentials if configured — inject after
-             * the proxy-level Authorization header has been stripped. */
-            if (rc_fwd->backend_credentials[0]) {
+            /* Backend Basic Auth credentials — injected when in REWRITE mode. */
+            if (ba_mode == BACKEND_AUTH_REWRITE && rc_fwd->backend_credentials[0]) {
                 char b64[512];
                 b64_encode(rc_fwd->backend_credentials,
                            strlen(rc_fwd->backend_credentials), b64, sizeof(b64));
                 inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
                     "Authorization: Basic %s\r\n", b64);
+            }
+
+            /* Custom SET rules (backend_headers) */
+            for (int _ri = 0; _ri < rc_fwd->backend_header_count; _ri++) {
+                const struct backend_header_rule *hr = &rc_fwd->backend_headers[_ri];
+                if (hr->action == HEADER_ACTION_SET)
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "%s: %s\r\n", hr->name, hr->value);
             }
 
             if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
@@ -2029,34 +2064,28 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
             }
         }
 
-        /* Strip Authorization so proxy credentials don't reach backend */
-        {
-            uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
-            if (!ah)
-                ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
-            if (ah) {
-                uint8_t *le = (uint8_t *)FIND_CRLF(ah + 2,
-                    (size_t)(rbuf + fwd_n - ah - 2));
-                if (le) {
-                    le += 2;
-                    size_t rm = (size_t)(le - ah - 2);
-                    memmove(ah + 2, ah + 2 + rm,
-                        (size_t)(rbuf + fwd_n - (ah + 2 + rm)));
-                    fwd_n -= (int)rm;
-                }
-            }
-        }
-
-        fwd_n = rewrite_backend_connection_header(w, cid, h, rbuf, fwd_n, false);
-
-        /* Inject Accept-Encoding (if absent), X-Api-Key, and backend credentials
-         * after the request line.  X-Real-IP/X-Forwarded-For are intentionally
-         * omitted here — they are injected by handle_recv_client on every
-         * subsequent request.  Injecting them on the early-data first request
-         * can change backend behaviour (e.g. Jackett IP-trust checks) compared
-         * to the no-proxy case, causing equivalence regressions. */
+        /* Authorization: block / passthrough / rewrite (mirrors handle_recv_client) */
         {
             const struct route_config *rc_fwd = &w->cfg->routes[h->route_idx];
+            backend_auth_mode_t ba_mode = rc_fwd->backend_auth_mode;
+            if (ba_mode == BACKEND_AUTH_BLOCK && rc_fwd->backend_credentials[0])
+                ba_mode = BACKEND_AUTH_REWRITE;
+
+            if (ba_mode != BACKEND_AUTH_PASSTHROUGH)
+                strip_named_header(rbuf, &fwd_n, "Authorization");
+
+            /* Custom BLOCK rules */
+            for (int _ri = 0; _ri < rc_fwd->backend_header_count; _ri++) {
+                const struct backend_header_rule *hr = &rc_fwd->backend_headers[_ri];
+                if (hr->action == HEADER_ACTION_BLOCK)
+                    strip_named_header(rbuf, &fwd_n, hr->name);
+            }
+
+            fwd_n = rewrite_backend_connection_header(w, cid, h, rbuf, fwd_n, false);
+
+            /* Inject Accept-Encoding (if absent), X-Api-Key, backend credentials,
+             * and custom SET rules.  X-Real-IP/X-Forwarded-For are omitted — see
+             * handle_recv_client comment; they are injected on subsequent requests. */
             const char *eol = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
             if (eol) {
                 size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
@@ -2068,12 +2097,18 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
                 if (rc_fwd->x_api_key[0])
                     inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
                         "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
-                if (rc_fwd->backend_credentials[0]) {
+                if (ba_mode == BACKEND_AUTH_REWRITE && rc_fwd->backend_credentials[0]) {
                     char b64[512];
                     b64_encode(rc_fwd->backend_credentials,
                                strlen(rc_fwd->backend_credentials), b64, sizeof(b64));
                     inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
                         "Authorization: Basic %s\r\n", b64);
+                }
+                for (int _ri = 0; _ri < rc_fwd->backend_header_count; _ri++) {
+                    const struct backend_header_rule *hr = &rc_fwd->backend_headers[_ri];
+                    if (hr->action == HEADER_ACTION_SET)
+                        inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                            "%s: %s\r\n", hr->name, hr->value);
                 }
                 if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
                     memmove(rbuf + line_end + inj_len,

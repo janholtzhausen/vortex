@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -70,8 +71,9 @@
 #define TARPIT_NOISE_INITIAL 256
 #define TARPIT_NOISE_DRIP    64
 #define SNI_PEEK_BUF_SIZE    4096
-/* Preserve the current header injection capacity during naming cleanup. */
-#define HEADER_INJ_BUF_SIZE  640
+/* Header injection buffer — must fit all injected headers including custom
+ * backend_headers SET rules (up to VORTEX_MAX_BACKEND_HEADER_RULES entries). */
+#define HEADER_INJ_BUF_SIZE  2048
 
 /* Base64-encode src (len bytes) into dst (must hold ceil(len/3)*4 + 1 bytes).
  * Returns the number of characters written (excluding NUL). */

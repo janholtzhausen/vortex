@@ -33,6 +33,30 @@ typedef enum {
     ROUTE_TYPE_TCP_TUNNEL,  /* TLS terminated; raw TCP forwarded to backend */
 } route_type_t;
 
+/* Controls what vortex does with the incoming Authorization header when
+ * forwarding requests to the backend. */
+typedef enum {
+    BACKEND_AUTH_BLOCK       = 0,  /* strip Authorization before forwarding (default) */
+    BACKEND_AUTH_PASSTHROUGH = 1,  /* forward Authorization unchanged */
+    BACKEND_AUTH_REWRITE     = 2,  /* replace with backend_credentials value */
+} backend_auth_mode_t;
+
+/* Per-header rule for request headers forwarded to the backend. */
+typedef enum {
+    HEADER_ACTION_BLOCK = 0,  /* strip this header */
+    HEADER_ACTION_SET   = 1,  /* replace/inject header with configured value */
+} header_action_t;
+
+#define VORTEX_MAX_BACKEND_HEADER_RULES  16
+#define VORTEX_MAX_BACKEND_HEADER_NAME  128
+#define VORTEX_MAX_BACKEND_HEADER_VALUE 512
+
+struct backend_header_rule {
+    char            name[VORTEX_MAX_BACKEND_HEADER_NAME];
+    header_action_t action;
+    char            value[VORTEX_MAX_BACKEND_HEADER_VALUE];
+};
+
 struct backend_config {
     char     address[256];
     char     sni[256];
@@ -125,6 +149,19 @@ struct route_config {
      * the global congestion_control setting.  Only effective if the algorithm
      * is loaded on the host (check /proc/sys/net/ipv4/tcp_allowed_congestion_control). */
     char congestion_control[16];
+
+    /* Controls handling of the incoming Authorization header on the backend leg.
+     * BLOCK (default): strip before forwarding; implied REWRITE when
+     * backend_credentials is non-empty.
+     * PASSTHROUGH: forward unchanged (proxy auth still checked if auth.enabled).
+     * REWRITE: strip and inject backend_credentials as Authorization: Basic. */
+    backend_auth_mode_t backend_auth_mode;
+
+    /* Per-route header rules applied to every request forwarded to the backend.
+     * BLOCK rules strip a header; SET rules replace/inject a header with a
+     * fixed value.  Applied after the built-in Authorization/x_api_key logic. */
+    struct backend_header_rule backend_headers[VORTEX_MAX_BACKEND_HEADER_RULES];
+    uint8_t                    backend_header_count;
 };
 
 struct xdp_config {
