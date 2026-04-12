@@ -33,11 +33,12 @@
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#include <ngtcp2/ngtcp2_crypto_picotls.h>
 #include <nghttp3/nghttp3.h>
 
-#include <openssl/ssl.h>
-#include <openssl/rand.h>
+#include <picotls.h>
+#include <picotls/minicrypto.h>
+#include <sys/random.h>
 
 /* ---- Timestamp ---- */
 static ngtcp2_tstamp now_ns(void)
@@ -86,10 +87,10 @@ static uint8_t *dup_http_response(const char *resp, size_t *out_len)
 
 /* ---- Per-connection state ---- */
 struct quic_conn {
-    ngtcp2_conn            *conn;
-    ngtcp2_crypto_ossl_ctx *ossl_ctx;
-    SSL                    *ssl;
-    nghttp3_conn           *h3conn;
+    ngtcp2_conn              *conn;
+    ngtcp2_crypto_picotls_ctx ptls_ctx;
+    ptls_t                   *ptls;
+    nghttp3_conn             *h3conn;
 
     ngtcp2_crypto_conn_ref  conn_ref;
 
@@ -123,8 +124,8 @@ struct quic_server {
     int    udp_fd;
     int    epoll_fd;
 
-    SSL_CTX *ssl_ctx[VORTEX_MAX_ROUTES];
-    int      ssl_ctx_count;
+    ptls_context_t *ptls_ctx[VORTEX_MAX_ROUTES];
+    int             ptls_ctx_count;
 
     struct quic_conn *conns[QUIC_MAX_CONNS];
     int               conn_count;
@@ -526,7 +527,7 @@ static void cb_rand(uint8_t *dest, size_t destlen,
                     const ngtcp2_rand_ctx *rand_ctx)
 {
     (void)rand_ctx;
-    RAND_bytes(dest, (int)destlen);
+    ptls_minicrypto_random_bytes(dest, destlen);
 }
 
 static int cb_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid,
@@ -534,9 +535,9 @@ static int cb_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid,
                                      void *user_data)
 {
     (void)conn; (void)user_data;
-    RAND_bytes(cid->data, (int)cidlen);
+    ptls_minicrypto_random_bytes(cid->data, cidlen);
     cid->datalen = cidlen;
-    RAND_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+    ptls_minicrypto_random_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
     return 0;
 }
 
@@ -544,7 +545,7 @@ static int cb_get_path_challenge_data(ngtcp2_conn *conn, uint8_t *data,
                                        void *user_data)
 {
     (void)conn; (void)user_data;
-    RAND_bytes(data, NGTCP2_PATH_CHALLENGE_DATALEN);
+    ptls_minicrypto_random_bytes(data, NGTCP2_PATH_CHALLENGE_DATALEN);
     return 0;
 }
 
@@ -919,30 +920,27 @@ static struct quic_conn *conn_new(struct quic_server *qs,
     memcpy(&c->peer_addr, peer, peer_addrlen);
     c->peer_addrlen = peer_addrlen;
 
-    SSL_CTX *ctx = qs->ssl_ctx_count > 0 ? qs->ssl_ctx[0] : NULL;
-    if (!ctx) { free(c); return NULL; }
+    ptls_context_t *pctx = qs->ptls_ctx_count > 0 ? qs->ptls_ctx[0] : NULL;
+    if (!pctx) { free(c); return NULL; }
 
-    c->ssl = SSL_new(ctx);
-    if (!c->ssl) { free(c); return NULL; }
-    SSL_set_accept_state(c->ssl);
-
-    if (ngtcp2_crypto_ossl_ctx_new(&c->ossl_ctx, c->ssl) != 0) {
-        SSL_free(c->ssl); free(c); return NULL;
-    }
+    c->ptls = ptls_new(pctx, 1 /* is_server */);
+    if (!c->ptls) { free(c); return NULL; }
 
     c->conn_ref.get_conn  = quic_get_conn;
     c->conn_ref.user_data = c;
-    SSL_set_app_data(c->ssl, &c->conn_ref);
+    *(ngtcp2_crypto_conn_ref **)ptls_get_data_ptr(c->ptls) = &c->conn_ref;
 
-    if (ngtcp2_crypto_ossl_configure_server_session(c->ssl) != 0) {
-        ngtcp2_crypto_ossl_ctx_del(c->ossl_ctx);
-        SSL_free(c->ssl); free(c); return NULL;
+    ngtcp2_crypto_picotls_ctx_init(&c->ptls_ctx);
+    c->ptls_ctx.ptls = c->ptls;
+
+    if (ngtcp2_crypto_picotls_configure_server_session(&c->ptls_ctx) != 0) {
+        ptls_free(c->ptls); c->ptls = NULL; free(c); return NULL;
     }
 
     /* Generate server connection ID */
     ngtcp2_cid scid;
     uint8_t scid_data[NGTCP2_MAX_CIDLEN];
-    RAND_bytes(scid_data, sizeof(scid_data));
+    ptls_minicrypto_random_bytes(scid_data, sizeof(scid_data));
     ngtcp2_cid_init(&scid, scid_data, sizeof(scid_data));
 
     ngtcp2_settings settings;
@@ -974,11 +972,11 @@ static struct quic_conn *conn_new(struct quic_server *qs,
     if (ngtcp2_conn_server_new(&c->conn, &hd.dcid, &scid, &path,
                                 hd.version, &g_quic_cbs,
                                 &settings, &params, NULL, c) != 0) {
-        ngtcp2_crypto_ossl_ctx_del(c->ossl_ctx);
-        SSL_free(c->ssl); free(c); return NULL;
+        ngtcp2_crypto_picotls_deconfigure_session(&c->ptls_ctx);
+        ptls_free(c->ptls); c->ptls = NULL; free(c); return NULL;
     }
 
-    ngtcp2_conn_set_tls_native_handle(c->conn, c->ossl_ctx);
+    ngtcp2_conn_set_tls_native_handle(c->conn, &c->ptls_ctx);
     c->last_active = now_ns();
     log_debug("quic_new", "new connection from %p", (void *)peer);
     return c;
@@ -989,10 +987,10 @@ static void conn_free(struct quic_server *qs, struct quic_conn *c)
     for (int i = 0; i < QUIC_MAX_STREAMS; i++) {
         if (c->streams[i]) stream_free(c, c->streams[i]);
     }
-    if (c->h3conn)  { nghttp3_conn_del(c->h3conn);         c->h3conn  = NULL; }
-    if (c->conn)    { ngtcp2_conn_del(c->conn);             c->conn    = NULL; }
-    if (c->ossl_ctx){ ngtcp2_crypto_ossl_ctx_del(c->ossl_ctx); c->ossl_ctx = NULL; }
-    if (c->ssl)     { SSL_free(c->ssl);                     c->ssl     = NULL; }
+    if (c->h3conn)  { nghttp3_conn_del(c->h3conn);          c->h3conn  = NULL; }
+    if (c->conn)    { ngtcp2_conn_del(c->conn);              c->conn    = NULL; }
+    ngtcp2_crypto_picotls_deconfigure_session(&c->ptls_ctx);
+    if (c->ptls)    { ptls_free(c->ptls);                    c->ptls    = NULL; }
     for (int i = 0; i < QUIC_MAX_CONNS; i++) {
         if (qs->conns[i] == c) { qs->conns[i] = NULL; qs->conn_count--; break; }
     }
@@ -1053,36 +1051,52 @@ static void dispatch_packet(struct quic_server *qs,
     conn_send(c);
 }
 
-/* ---- SSL_CTX for QUIC ---- */
+/* ---- ptls_context_t for QUIC ---- */
 
-static SSL_CTX *make_quic_ssl_ctx(struct tls_ctx *tls, int route_idx)
+/* Minimal on_client_hello for QUIC: accept "h3" ALPN only.
+ * Does NOT access conn_tls_state — the data_ptr holds ngtcp2_crypto_conn_ref. */
+static int quic_on_client_hello(ptls_on_client_hello_t *self,
+                                 ptls_t *tls,
+                                 ptls_on_client_hello_parameters_t *params)
 {
-    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
-    if (!ctx) return NULL;
-
-    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-
-    /* ALPN: h3 */
-    static const unsigned char alpn[] = "\x02h3";
-    SSL_CTX_set_alpn_protos(ctx, alpn + 1, sizeof(alpn) - 2);
-
-    /* Borrow cert+key from the TCP TLS route SSL_CTX */
-    if (tls && route_idx < tls->route_count && tls->routes[route_idx].ssl_ctx) {
-        SSL_CTX *src = tls->routes[route_idx].ssl_ctx;
-        X509 *cert = SSL_CTX_get0_certificate(src);
-        EVP_PKEY *key = SSL_CTX_get0_privatekey(src);
-        if (cert && SSL_CTX_use_certificate(ctx, cert) != 1) {
-            SSL_CTX_free(ctx); return NULL;
+    (void)self;
+    for (size_t i = 0; i < params->negotiated_protocols.count; i++) {
+        ptls_iovec_t p = params->negotiated_protocols.list[i];
+        if (p.len == 2 && memcmp(p.base, "h3", 2) == 0) {
+            ptls_set_negotiated_protocol(tls, "h3", 2);
+            break;
         }
-        if (key && SSL_CTX_use_PrivateKey(ctx, key) != 1) {
-            SSL_CTX_free(ctx); return NULL;
-        }
-    } else {
-        /* No cert — QUIC requires a certificate */
-        SSL_CTX_free(ctx);
-        return NULL;
     }
+    return 0;
+}
+
+static ptls_on_client_hello_t g_quic_on_client_hello = {
+    .cb = quic_on_client_hello
+};
+
+/*
+ * Create a shallow copy of the route's ptls_context_t with QUIC-specific
+ * settings applied (update_traffic_key, omit_end_of_early_data, 0-RTT).
+ * The cert/key/sign_certificate are shared with the TCP context and must
+ * NOT be freed via this copy — only free(ctx) in quic_server_destroy.
+ */
+static ptls_context_t *make_quic_ptls_ctx(struct tls_ctx *tls, int route_idx)
+{
+    if (!tls || route_idx >= tls->route_count || !tls->routes[route_idx].ctx)
+        return NULL;
+
+    ptls_context_t *src = tls->routes[route_idx].ctx;
+
+    ptls_context_t *ctx = malloc(sizeof(*ctx));
+    if (!ctx) return NULL;
+    *ctx = *src;   /* shallow copy — shares cert/key/sign_certificate */
+
+    /* Apply QUIC-specific settings without touching the TCP context */
+    ngtcp2_crypto_picotls_configure_server_context(ctx);
+
+    /* Use a QUIC-specific on_client_hello that accepts "h3" ALPN
+     * (not "h2" — and doesn't touch conn_tls_state via ptls_get_data_ptr) */
+    ctx->on_client_hello = &g_quic_on_client_hello;
 
     return ctx;
 }
@@ -1189,14 +1203,14 @@ int quic_server_init(struct quic_server **out,
     qs->cache = cache;
     if (router_init(&qs->router, cfg) != 0) { free(qs); return -1; }
 
-    /* Build SSL_CTX per route */
+    /* Build ptls_context_t per route */
     int nctx = tls ? tls->route_count : 0;
     for (int i = 0; i < nctx && i < VORTEX_MAX_ROUTES; i++) {
-        qs->ssl_ctx[i] = make_quic_ssl_ctx(tls, i);
-        if (qs->ssl_ctx[i]) qs->ssl_ctx_count = i + 1;
-        else log_warn("quic_init", "no SSL_CTX for route %d — skipping", i);
+        qs->ptls_ctx[i] = make_quic_ptls_ctx(tls, i);
+        if (qs->ptls_ctx[i]) qs->ptls_ctx_count = i + 1;
+        else log_warn("quic_init", "no ptls_ctx for route %d — skipping", i);
     }
-    if (qs->ssl_ctx_count == 0) {
+    if (qs->ptls_ctx_count == 0) {
         log_error("quic_init", "no certs available — QUIC disabled");
         router_destroy(&qs->router); free(qs); return -1;
     }
@@ -1242,7 +1256,6 @@ int quic_server_init(struct quic_server **out,
     }
     pthread_mutex_init(&qs->comp_mu, NULL);
 
-    ngtcp2_crypto_ossl_init();
     log_info("quic_init", "QUIC server ready on %s:%u (fd=%d)", bind_addr, port, fd);
     *out = qs;
     return 0;
@@ -1263,7 +1276,9 @@ void quic_server_destroy(struct quic_server *qs)
     if (qs->comp_efd >= 0) { close(qs->comp_efd);  qs->comp_efd = -1; }
     pthread_mutex_destroy(&qs->comp_mu);
     for (int i = 0; i < VORTEX_MAX_ROUTES; i++) {
-        if (qs->ssl_ctx[i]) { SSL_CTX_free(qs->ssl_ctx[i]); qs->ssl_ctx[i] = NULL; }
+        /* Only free the wrapper — cert/key are owned by the main tls_ctx */
+        free(qs->ptls_ctx[i]);
+        qs->ptls_ctx[i] = NULL;
     }
     router_destroy(&qs->router);
     free(qs);

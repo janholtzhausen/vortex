@@ -160,14 +160,23 @@ if(PICOTLS_AVAILABLE)
     list(APPEND VORTEX_SRCS cert/acme_client.c cert/acme_http01.c cert/acme_dns01.c cert/dns_cloudflare.c)
 endif()
 
-# ---- HTTP/3 via ngtcp2 + nghttp3 (static, linked against OpenSSL 4.0) ----
-set(NGTCP2_BUILD_DIR  "/tmp/ngtcp2-1.16-build" CACHE PATH "ngtcp2 build dir")
-set(NGHTTP3_BUILD_DIR "/tmp/nghttp3-build"      CACHE PATH "nghttp3 build dir")
-set(NGTCP2_SRC_DIR    "/tmp/ngtcp2-1.16.0"      CACHE PATH "ngtcp2 source dir")
-set(NGHTTP3_SRC_DIR   "/tmp/nghttp3-1.8.0"      CACHE PATH "nghttp3 source dir")
+# ---- HTTP/3 via ngtcp2 + nghttp3 (picotls backend, no OpenSSL) ----
+set(NGTCP2_BUILD_DIR  "/tmp/ngtcp2-picotls-build" CACHE PATH "ngtcp2 build dir")
+set(NGHTTP3_BUILD_DIR "/tmp/nghttp3-build"         CACHE PATH "nghttp3 build dir")
+set(NGTCP2_SRC_DIR    "/tmp/ngtcp2-1.16.0"         CACHE PATH "ngtcp2 source dir")
+set(NGHTTP3_SRC_DIR   "/tmp/nghttp3-1.8.0"         CACHE PATH "nghttp3 source dir")
 
-set(QUIC_AVAILABLE FALSE)
-message(STATUS "HTTP/3: disabled (ngtcp2 requires OpenSSL; migrated to picotls)")
+if(PICOTLS_AVAILABLE AND
+   EXISTS "${NGTCP2_BUILD_DIR}/lib/libngtcp2.a" AND
+   EXISTS "${NGTCP2_BUILD_DIR}/crypto/picotls/libngtcp2_crypto_picotls.a" AND
+   EXISTS "${NGHTTP3_BUILD_DIR}/lib/libnghttp3.a")
+    set(QUIC_AVAILABLE TRUE)
+    message(STATUS "HTTP/3: enabled (ngtcp2 + picotls)")
+    list(APPEND VORTEX_SRCS src/quic.c)
+else()
+    set(QUIC_AVAILABLE FALSE)
+    message(STATUS "HTTP/3: disabled (ngtcp2 or nghttp3 not found)")
+endif()
 
 add_executable(vortex ${VORTEX_SRCS})
 add_dependencies(vortex bpf_prog)
@@ -182,17 +191,6 @@ target_include_directories(vortex PRIVATE
     ${LIBURING_INCLUDE_DIRS}
     ${YAML_INCLUDE_DIRS}
 )
-
-if(QUIC_AVAILABLE)
-    target_include_directories(vortex PRIVATE
-        ${NGTCP2_BUILD_DIR}/lib/includes
-        ${NGTCP2_BUILD_DIR}/crypto/includes
-        ${NGTCP2_SRC_DIR}/lib/includes
-        ${NGTCP2_SRC_DIR}/crypto/includes
-        ${NGHTTP3_BUILD_DIR}/lib/includes
-        ${NGHTTP3_SRC_DIR}/lib/includes
-    )
-endif()
 
 target_link_libraries(vortex
     ${LIBBPF_LIBRARIES}
@@ -218,7 +216,7 @@ target_link_directories(vortex PRIVATE
 
 # TLS support via picotls + minicrypto
 if(PICOTLS_AVAILABLE)
-    target_compile_definitions(vortex PRIVATE VORTEX_PHASE_TLS=1)
+    target_compile_definitions(vortex PRIVATE VORTEX_PHASE_TLS=1 VORTEX_ACME=1)
     target_include_directories(vortex PRIVATE
         ${PICOTLS_SRC_DIR}/include
         ${PICOTLS_SRC_DIR}/deps/micro-ecc
@@ -229,16 +227,25 @@ if(PICOTLS_AVAILABLE)
     )
 endif()
 
-# HTTP/3 static link — ngtcp2 + nghttp3 + ngtcp2_crypto_ossl (all vs OpenSSL 4.0)
+# HTTP/3 static link — ngtcp2 + nghttp3 + ngtcp2_crypto_picotls (no OpenSSL)
 if(QUIC_AVAILABLE)
     target_compile_definitions(vortex PRIVATE VORTEX_QUIC=1)
-    # Static archives (link whole-archive to avoid symbol stripping)
+    target_include_directories(vortex PRIVATE
+        ${NGTCP2_BUILD_DIR}/lib/includes
+        ${NGTCP2_BUILD_DIR}/crypto/includes
+        ${NGTCP2_SRC_DIR}/lib/includes
+        ${NGTCP2_SRC_DIR}/crypto/includes
+        ${NGHTTP3_BUILD_DIR}/lib/includes
+        ${NGHTTP3_SRC_DIR}/lib/includes
+    )
+    # Static archives (link whole-archive to pull in crypto callbacks)
     target_link_libraries(vortex
         -Wl,--whole-archive
-        ${NGTCP2_BUILD_DIR}/crypto/ossl/libngtcp2_crypto_ossl.a
+        ${NGTCP2_BUILD_DIR}/crypto/picotls/libngtcp2_crypto_picotls.a
         -Wl,--no-whole-archive
         ${NGTCP2_BUILD_DIR}/lib/libngtcp2.a
         ${NGHTTP3_BUILD_DIR}/lib/libnghttp3.a
+        /tmp/libptls_random.a
     )
 endif()
 

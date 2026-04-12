@@ -197,6 +197,13 @@ struct worker;
 int  h2_session_init(struct worker *w, uint32_t cid);
 void h2_session_free(struct h2_session *sess);
 
+/* Feed pre-decrypted data directly into the H2 session (no ring buffer
+ * involvement).  Used to inject the connection preface that arrived bundled
+ * with the TLS Finished before kTLS took over.  Returns false if nghttp2
+ * failed and the connection has been closed. */
+bool h2_inject_predata(struct worker *w, uint32_t cid,
+                       const uint8_t *data, size_t len);
+
 /* Called from VORTEX_OP_H2_RECV_CLIENT completion.
  * data/buf_id: ring buffer assigned by the kernel (NULL/0 when no recv_ring).
  * multishot_active: true when IORING_CQE_F_MORE is set (SQE still armed). */

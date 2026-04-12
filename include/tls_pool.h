@@ -3,15 +3,14 @@
  * tls_pool — fixed-size thread pool for blocking TLS handshakes.
  *
  * The io_uring event loop cannot block.  tls_accept() is a blocking
- * SSL_accept() call (bounded by the select timeout inside tls_accept).
- * Under a slowloris-style TLS attack a single slow handshake would stall
- * the entire worker's ring.
+ * picotls handshake call.  Under a slowloris-style TLS attack a single
+ * slow handshake would stall the entire worker's ring.
  *
  * Solution: a small shared pool of handshake threads.  The worker submits a
  * job (fd + connection-id + per-worker result pipe) and returns immediately.
  * The pool thread calls tls_accept(), then writes a tls_handshake_result to
- * the worker's pipe.  The worker polls the pipe via io_uring RECV and picks
- * up completed results in the normal event loop.
+ * the per-worker MPSC ring.  The worker polls the ring via io_uring RECV
+ * and picks up completed results in the normal event loop.
  */
 
 #include "tls.h"
@@ -19,7 +18,6 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include <openssl/ssl.h>
 
 #define TLS_POOL_THREADS  4     /* worker threads in the pool */
 #define TLS_POOL_QUEUE   128    /* max pending jobs */
@@ -38,19 +36,24 @@ typedef enum {
     TLS_HANDSHAKE_BACKEND  = 1,
 } tls_handshake_kind_t;
 
-/* Result written to the per-worker pipe after handshake completes */
+/* Result written to the per-worker MPSC ring after handshake completes */
 struct tls_handshake_result {
     tls_handshake_kind_t kind;
-    uint32_t cid;           /* connection id to resume */
-    int      client_fd;     /* original fd (frontend) */
-    int      tls_route_idx; /* SNI-matched route (-1 on error) */
-    SSL     *ssl;           /* NULL if kTLS took over or on error */
-    bool     ok;            /* false = handshake failed, close and free conn */
-    bool     ktls_tx;
-    bool     ktls_rx;
-    bool     h2_negotiated; /* ALPN selected "h2" */
-    int      tls_version;   /* SSL_version() result */
-    SSL_SESSION *backend_session; /* cached resumable session for HTTPS origins */
+    uint32_t  cid;            /* connection id to resume */
+    int       client_fd;      /* original fd (frontend) */
+    int       tls_route_idx;  /* SNI-matched route (-1 on error) */
+    ptls_t   *ssl;            /* NULL if kTLS took over or on error */
+    bool      ok;             /* false = handshake failed, close and free conn */
+    bool      ktls_tx;
+    bool      ktls_rx;
+    bool      h2_negotiated;  /* ALPN selected "h2" */
+    int       tls_version;    /* PTLS_PROTOCOL_VERSION_TLS13 etc. */
+    struct tls_session_ticket *backend_session; /* heap-alloc'd ticket, or NULL */
+    /* Pre-decrypted application data that arrived bundled with the TLS Finished
+     * in the same recv() call.  Common for H2 clients that send the connection
+     * preface immediately after the handshake.  heap-alloc'd; worker must free. */
+    uint8_t  *pending_data;
+    uint32_t  pending_data_len;
 };
 
 /*
@@ -81,13 +84,14 @@ struct tls_handshake_job {
     struct tls_ctx *tls;
     int                   result_pipe_wr;  /* write end of per-worker wakeup pipe */
     struct tls_result_ring *result_ring;  /* per-worker MPSC result ring */
-    SSL_CTX        *backend_tls_client_ctx;
-    uint32_t        timeout_ms;
-    bool            verify_peer;
-    bool            verify_peer_set;
-    char            backend_addr[256];
-    char            backend_sni[256];
-    SSL_SESSION    *resume_session;
+    /* backend-only fields */
+    ptls_context_t  *backend_tls_client_ctx;
+    uint32_t         timeout_ms;
+    bool             verify_peer;
+    bool             verify_peer_set;
+    char             backend_addr[256];
+    char             backend_sni[256];
+    struct tls_session_ticket *resume_session; /* heap-alloc'd, consumed and freed */
 };
 
 struct tls_pool {

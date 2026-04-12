@@ -45,7 +45,7 @@
 #ifdef VORTEX_PHASE_TLS
 #include "tls.h"
 #include "tls_pool.h"
-#include <openssl/ssl.h>
+#include <picotls.h>
 #endif
 
 /* Route all memmem calls through the AVX2-accelerated vx_memmem */

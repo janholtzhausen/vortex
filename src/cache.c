@@ -13,7 +13,8 @@
 #include <sys/statvfs.h>
 
 #ifdef VORTEX_PHASE_TLS
-#include <openssl/evp.h>
+#include <picotls.h>
+#include <picotls/minicrypto.h>
 #endif
 
 #ifndef MAP_HUGETLB
@@ -42,11 +43,12 @@ uint64_t cache_compute_body_etag(bool etag_sha256,
 
 #ifdef VORTEX_PHASE_TLS
     if (etag_sha256) {
-        unsigned char sha[32];
-        unsigned int sha_len = sizeof(sha);
-        uint64_t etag = 0;
-        if (EVP_Digest(body, body_len, sha, &sha_len, EVP_sha256(), NULL) == 1 &&
-            sha_len >= sizeof(etag)) {
+        ptls_hash_context_t *hctx = ptls_minicrypto_sha256.create();
+        if (hctx) {
+            unsigned char sha[PTLS_SHA256_DIGEST_SIZE];
+            hctx->update(hctx, body, body_len);
+            hctx->final(hctx, sha, PTLS_HASH_FINAL_MODE_FREE);
+            uint64_t etag = 0;
             memcpy(&etag, sha, sizeof(etag));
             return etag;
         }

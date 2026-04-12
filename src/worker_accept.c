@@ -186,7 +186,7 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         h->flags &= ~CONN_FLAG_BACKEND_COUNTED;
     }
 #ifdef VORTEX_PHASE_TLS
-    if (h->ssl) { tls_ssl_free((SSL *)h->ssl); h->ssl = NULL; }
+    if (h->ssl) { ptls_free((ptls_t *)h->ssl); h->ssl = NULL; }
 #endif
     if (h->client_fd  >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_CLIENT(w, cid));
@@ -218,7 +218,7 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         }
     }
 #ifdef VORTEX_PHASE_TLS
-    if (cc->backend_ssl) { SSL_free((SSL *)cc->backend_ssl); cc->backend_ssl = NULL; }
+    if (cc->backend_ssl) { ptls_free((ptls_t *)cc->backend_ssl); cc->backend_ssl = NULL; }
 #endif
 #ifdef VORTEX_H2
     if (cc->h2) { h2_session_free(cc->h2); cc->h2 = NULL; }

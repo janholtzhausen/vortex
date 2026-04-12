@@ -31,11 +31,12 @@
 #include "tls_pool.h"
 #include "cert_provider.h"
 #include "static_file.h"
+#include <time.h>
+#ifdef VORTEX_ACME
 #include "acme_client.h"
 #include "acme_http01.h"
 #include "acme_dns01.h"
-#include "dns_cloudflare.h"
-#include <time.h>
+#endif
 #endif
 
 static volatile sig_atomic_t g_running  = 1;
@@ -140,7 +141,14 @@ static int                      g_cert_info_count = 0;
 #ifdef VORTEX_PHASE_TLS
 static struct tls_ctx g_tls;
 
-/* ---- Cert manager ---- */
+/* Renewal background thread */
+static pthread_t g_renewal_thread;
+static int       g_renewal_running = 0;
+static pthread_mutex_t g_renewal_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_renewal_cv = PTHREAD_COND_INITIALIZER;
+
+#ifdef VORTEX_ACME
+/* ---- ACME Cert manager ---- */
 static struct acme_http01_server g_http01_srv;
 static int                       g_http01_started = 0;
 static struct acme_client        g_acme_client;
@@ -149,12 +157,7 @@ static int                       g_acme_inited = 0;
 /* DNS-01 provider context */
 static struct acme_dns01_ctx g_dns01_ctx;
 static int                   g_dns01_inited = 0;
-
-/* Renewal background thread */
-static pthread_t g_renewal_thread;
-static int       g_renewal_running = 0;
-static pthread_mutex_t g_renewal_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_renewal_cv = PTHREAD_COND_INITIALIZER;
+#endif /* VORTEX_ACME */
 
 static void *renewal_thread_fn(void *arg)
 {
@@ -170,6 +173,7 @@ static void *renewal_thread_fn(void *arg)
         pthread_mutex_unlock(&g_renewal_mu);
         if (!g_renewal_running) break;
 
+#ifdef VORTEX_ACME
         if (!g_acme_inited) continue;
 
         for (int i = 0; i < g_cfg.route_count; i++) {
@@ -202,6 +206,7 @@ static void *renewal_thread_fn(void *arg)
             }
             cert_result_free(&res);
         }
+#endif /* VORTEX_ACME */
     }
     return NULL;
 }
@@ -210,6 +215,7 @@ static void *renewal_thread_fn(void *arg)
  * in cfg (so tls_init can load them), start HTTP-01 server and renewal thread. */
 static int cert_manager_init(struct vortex_config *cfg)
 {
+#ifdef VORTEX_ACME
     int need_acme_http01 = 0, need_acme_dns01 = 0;
     for (int i = 0; i < cfg->route_count; i++) {
         if (cfg->routes[i].cert_provider == CERT_PROVIDER_ACME_HTTP01)
@@ -236,7 +242,6 @@ static int cert_manager_init(struct vortex_config *cfg)
         snprintf(g_acme_client.email, sizeof(g_acme_client.email), "%s", cfg->acme.email);
         g_acme_client.renewal_days = cfg->acme.renewal_days > 0
                                    ? cfg->acme.renewal_days : 30;
-        g_acme_client.libctx = g_tls.libctx; /* may be NULL before tls_init */
 
         if (acme_client_init(&g_acme_client) == 0) {
             g_acme_inited = 1;
@@ -249,11 +254,9 @@ static int cert_manager_init(struct vortex_config *cfg)
     /* Init DNS-01 provider if needed */
     if (need_acme_dns01 && cfg->acme.enabled && g_acme_inited) {
         memset(&g_dns01_ctx, 0, sizeof(g_dns01_ctx));
-        /* Copy the shared acme_client config into dns01 ctx */
         g_dns01_ctx.client = g_acme_client;
         g_dns01_ctx.propagation_wait_s = 90;
 
-        /* Select DNS provider */
         if (strcmp(cfg->acme.dns_provider, "cloudflare") == 0) {
             g_dns01_ctx.dns_ops = &cloudflare_dns_provider;
             void *dns_ctx = NULL;
@@ -263,8 +266,6 @@ static int cert_manager_init(struct vortex_config *cfg)
             } else {
                 log_warn("cert_manager", "DNS provider init failed");
             }
-            /* Scrub the token from memory now that it has been consumed by
-             * the DNS provider.  The provider must make its own copy. */
             explicit_bzero(cfg->acme.dns_api_token, sizeof(cfg->acme.dns_api_token));
         } else {
             log_warn("cert_manager", "unknown dns_provider '%s'",
@@ -312,17 +313,19 @@ static int cert_manager_init(struct vortex_config *cfg)
                 }
             }
 
-            /* Point route at the stored cert files */
             snprintf(r->cert_path, sizeof(r->cert_path), "%s", cp);
             snprintf(r->key_path, sizeof(r->key_path), "%s", kp);
         }
     }
 
-    /* Start renewal thread */
     if (g_acme_inited) {
         g_renewal_running = 1;
         pthread_create(&g_renewal_thread, NULL, renewal_thread_fn, NULL);
     }
+#else
+    /* ACME not available — only static cert routes supported */
+    (void)cfg;
+#endif /* VORTEX_ACME */
 
     return 0;
 }
@@ -355,18 +358,18 @@ static void cert_manager_reload_static(void)
             continue;
         }
 
-        if (g_tls.routes[i].ssl_ctx) {
+        if (g_tls.routes[i].ctx) {
             /* Existing route — hot-swap via tls_rotate_cert */
             if (tls_rotate_cert(&g_tls, i, res.cert_pem, res.key_pem) == 0)
                 log_info("cert_reload", "route=%d cert reloaded from %s", i, r->cert_path);
             else
                 log_warn("cert_reload", "route=%d tls_rotate_cert failed", i);
         } else {
-            /* New route — create ssl_ctx with correct hostname */
-            SSL_CTX *ctx = tls_create_ctx_from_pem(&g_tls, res.cert_pem,
-                                                    res.key_pem, r->hostname);
+            /* New route — create context with correct hostname */
+            ptls_context_t *ctx = tls_create_ctx_from_pem(&g_tls, res.cert_pem,
+                                                            res.key_pem, r->hostname);
             if (ctx) {
-                __atomic_store_n(&g_tls.routes[i].ssl_ctx, ctx, __ATOMIC_SEQ_CST);
+                __atomic_store_n(&g_tls.routes[i].ctx, ctx, __ATOMIC_SEQ_CST);
                 g_tls.routes[i].route_idx = i;
                 log_info("cert_reload", "route=%d cert loaded from %s (new route)",
                     i, r->cert_path);
@@ -377,16 +380,16 @@ static void cert_manager_reload_static(void)
         cert_result_free(&res);
     }
 
-    /* Publish new route_count AFTER all ssl_ctx values have been stored.
+    /* Publish new route_count AFTER all ctx values have been stored.
      * Only advance to the highest contiguous successfully-loaded new route;
-     * if a new route's tls_create_ctx_from_pem failed, its ssl_ctx is NULL —
-     * stop before that index so workers never see a NULL ssl_ctx slot.
+     * if a new route's tls_create_ctx_from_pem failed, its ctx is NULL —
+     * stop before that index so workers never see a NULL ctx slot.
      * A full sequential barrier ensures workers that load the new route_count
-     * will also see all the ssl_ctx writes that precede it. */
+     * will also see all the ctx writes that precede it. */
     if (g_cfg.route_count > g_tls.route_count) {
         int new_route_count = g_tls.route_count;
         for (int i = g_tls.route_count; i < g_cfg.route_count; i++) {
-            if (!g_tls.routes[i].ssl_ctx) break;
+            if (!g_tls.routes[i].ctx) break;
             new_route_count = i + 1;
         }
         if (new_route_count > g_tls.route_count)
@@ -788,7 +791,7 @@ int main(int argc, char *argv[])
     log_info("vortex_shutdown", "shutting down");
 
 #ifdef VORTEX_PHASE_TLS
-    /* Stop renewal thread and HTTP-01 server */
+    /* Stop renewal thread */
     if (g_renewal_running) {
         pthread_mutex_lock(&g_renewal_mu);
         g_renewal_running = 0;
@@ -798,6 +801,7 @@ int main(int argc, char *argv[])
         pthread_mutex_destroy(&g_renewal_mu);
         pthread_cond_destroy(&g_renewal_cv);
     }
+#ifdef VORTEX_ACME
     if (g_http01_started) {
         acme_http01_stop(&g_http01_srv);
         g_http01_started = 0;
@@ -811,6 +815,7 @@ int main(int argc, char *argv[])
             g_dns01_ctx.dns_ops->destroy(g_dns01_ctx.dns_ctx);
         g_dns01_inited = 0;
     }
+#endif /* VORTEX_ACME */
     if (tls_ptr) tls_destroy(&g_tls);
 #endif
 

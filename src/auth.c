@@ -7,8 +7,8 @@
 #include <string.h>
 
 #ifdef VORTEX_PHASE_TLS
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
+#include <picotls.h>
+#include <picotls/minicrypto.h>
 #endif
 
 static int b64val(char c)
@@ -51,20 +51,176 @@ static bool auth_parse_u32(const char *s, uint32_t *out)
     return true;
 }
 
+/* Constant-time memory comparison */
+static int ct_memcmp(const void *a, const void *b, size_t n)
+{
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    unsigned int diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= pa[i] ^ pb[i];
+    return diff != 0;
+}
+
+#ifdef VORTEX_PHASE_TLS
+/* ---- PBKDF2-SHA256 (RFC 2898) via picotls HMAC-SHA256 ---- */
+static void pbkdf2_sha256(const uint8_t *pass, size_t pass_len,
+                          const uint8_t *salt, size_t salt_len,
+                          uint32_t c,
+                          uint8_t *dk, size_t dk_len)
+{
+    enum { HLEN = 32 }; /* SHA-256 output size */
+    uint8_t t[HLEN], u[HLEN];
+    uint32_t block_num = 0;
+
+    while (dk_len > 0) {
+        block_num++;
+        /* U1 = HMAC(pass, salt || block_num_be) */
+        uint8_t blk_be[4] = {
+            (uint8_t)(block_num >> 24), (uint8_t)(block_num >> 16),
+            (uint8_t)(block_num >>  8), (uint8_t)(block_num)
+        };
+        ptls_hash_context_t *hmac = ptls_hmac_create(&ptls_minicrypto_sha256,
+                                                      pass, pass_len);
+        hmac->update(hmac, salt, salt_len);
+        hmac->update(hmac, blk_be, 4);
+        hmac->final(hmac, u, PTLS_HASH_FINAL_MODE_FREE);
+        memcpy(t, u, HLEN);
+
+        for (uint32_t i = 1; i < c; i++) {
+            ptls_hash_context_t *h2 = ptls_hmac_create(&ptls_minicrypto_sha256,
+                                                         pass, pass_len);
+            h2->update(h2, u, HLEN);
+            h2->final(h2, u, PTLS_HASH_FINAL_MODE_FREE);
+            for (int j = 0; j < HLEN; j++) t[j] ^= u[j];
+        }
+
+        size_t out_len = dk_len < (size_t)HLEN ? dk_len : (size_t)HLEN;
+        memcpy(dk, t, out_len);
+        dk     += out_len;
+        dk_len -= out_len;
+    }
+    explicit_bzero(t, sizeof(t));
+    explicit_bzero(u, sizeof(u));
+}
+
+/* ---- Salsa20/8 core (used by scrypt BlockMix) ---- */
+static void salsa20_8(uint32_t *b)
+{
+    uint32_t x[16];
+    memcpy(x, b, 64);
+#define R(v,n) (((v) << (n)) | ((v) >> (32 - (n))))
+    for (int i = 0; i < 8; i += 2) {
+        x[ 4] ^= R(x[ 0]+x[12], 7); x[ 8] ^= R(x[ 4]+x[ 0], 9);
+        x[12] ^= R(x[ 8]+x[ 4],13); x[ 0] ^= R(x[12]+x[ 8],18);
+        x[ 9] ^= R(x[ 5]+x[ 1], 7); x[13] ^= R(x[ 9]+x[ 5], 9);
+        x[ 1] ^= R(x[13]+x[ 9],13); x[ 5] ^= R(x[ 1]+x[13],18);
+        x[14] ^= R(x[10]+x[ 6], 7); x[ 2] ^= R(x[14]+x[10], 9);
+        x[ 6] ^= R(x[ 2]+x[14],13); x[10] ^= R(x[ 6]+x[ 2],18);
+        x[ 3] ^= R(x[15]+x[11], 7); x[ 7] ^= R(x[ 3]+x[15], 9);
+        x[11] ^= R(x[ 7]+x[ 3],13); x[15] ^= R(x[11]+x[ 7],18);
+        x[ 1] ^= R(x[ 0]+x[ 3], 7); x[ 2] ^= R(x[ 1]+x[ 0], 9);
+        x[ 3] ^= R(x[ 2]+x[ 1],13); x[ 0] ^= R(x[ 3]+x[ 2],18);
+        x[ 6] ^= R(x[ 5]+x[ 4], 7); x[ 7] ^= R(x[ 6]+x[ 5], 9);
+        x[ 4] ^= R(x[ 7]+x[ 6],13); x[ 5] ^= R(x[ 4]+x[ 7],18);
+        x[11] ^= R(x[10]+x[ 9], 7); x[ 8] ^= R(x[11]+x[10], 9);
+        x[ 9] ^= R(x[ 8]+x[11],13); x[10] ^= R(x[ 9]+x[ 8],18);
+        x[12] ^= R(x[15]+x[14], 7); x[13] ^= R(x[12]+x[15], 9);
+        x[14] ^= R(x[13]+x[12],13); x[15] ^= R(x[14]+x[13],18);
+    }
+#undef R
+    for (int i = 0; i < 16; i++) b[i] += x[i];
+}
+
+/* scrypt BlockMix */
+static void block_mix(uint32_t *b, uint32_t *y, uint32_t r)
+{
+    uint32_t *x = y + 32 * r;
+    memcpy(x, b + (2*r - 1) * 16, 64);
+    for (uint32_t i = 0; i < 2*r; i++) {
+        for (int j = 0; j < 16; j++) x[j] ^= b[i*16 + j];
+        salsa20_8(x);
+        memcpy(y + (i % 2 == 0 ? i/2 : r + i/2) * 16, x, 64);
+    }
+    memcpy(b, y, 128 * r);
+}
+
+/* scrypt ROMix (RFC 7914 section 4) */
+static int romix(uint32_t *b, uint64_t n, uint32_t r)
+{
+    uint32_t *v = malloc(128 * r * n);
+    /* block_mix(x, x+32*r, r) uses (x+32*r)+32*r as scratch → needs 256*r+64 bytes */
+    uint32_t *x = malloc(256 * r + 64);
+    if (!v || !x) { free(v); free(x); return -1; }
+
+    memcpy(x, b, 128 * r);
+    for (uint64_t i = 0; i < n; i++) {
+        memcpy(v + i * 32 * r, x, 128 * r);
+        block_mix(x, x + 32 * r, r);
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t j = ((uint64_t)x[(2*r-1)*16] |
+                      ((uint64_t)x[(2*r-1)*16+1] << 32)) & (n - 1);
+        for (uint32_t k = 0; k < 32 * r; k++) x[k] ^= v[j * 32 * r + k];
+        block_mix(x, x + 32 * r, r);
+    }
+    memcpy(b, x, 128 * r);
+    free(v); free(x);
+    return 0;
+}
+
+/*
+ * scrypt KDF (RFC 7914).
+ * N = 1 << log_n (must be power of 2), r, p: standard scrypt parameters.
+ * Returns 0 on success.
+ */
+static int vortex_scrypt(const uint8_t *pass, size_t pass_len,
+                          const uint8_t *salt, size_t salt_len,
+                          uint64_t N, uint32_t r, uint32_t p,
+                          uint8_t *dk, size_t dk_len)
+{
+    size_t mflen = 128 * r;
+    uint8_t *b = malloc(mflen * p);
+    if (!b) return -1;
+
+    /* Step 1: B[0..p-1] = PBKDF2-SHA256(pass, salt, 1, mflen * p) */
+    pbkdf2_sha256(pass, pass_len, salt, salt_len, 1, b, mflen * p);
+
+    /* Step 2: ROMix each block */
+    for (uint32_t i = 0; i < p; i++) {
+        if (romix((uint32_t *)(b + i * mflen), N, r) != 0) {
+            explicit_bzero(b, mflen * p);
+            free(b);
+            return -1;
+        }
+    }
+
+    /* Step 3: DK = PBKDF2-SHA256(pass, B, 1, dk_len) */
+    pbkdf2_sha256(pass, pass_len, b, mflen * p, 1, dk, dk_len);
+
+    explicit_bzero(b, mflen * p);
+    free(b);
+    return 0;
+}
+#endif /* VORTEX_PHASE_TLS */
+
 static bool auth_verify_password(const struct auth_verifier *verifier,
                                  const char *password)
 {
     uint8_t derived[VORTEX_AUTH_MAX_HASH_LEN];
-    uint64_t maxmem = 64ULL * 1024ULL * 1024ULL;
     if (verifier->hash_len == 0 || verifier->hash_len > sizeof(derived))
         return false;
-    if (EVP_PBE_scrypt(password, strlen(password),
-                       verifier->salt, verifier->salt_len,
-                       1ULL << verifier->log_n, verifier->r, verifier->p,
-                       maxmem, derived, verifier->hash_len) != 1) {
+#ifdef VORTEX_PHASE_TLS
+    if (vortex_scrypt((const uint8_t *)password, strlen(password),
+                      verifier->salt, verifier->salt_len,
+                      1ULL << verifier->log_n, verifier->r, verifier->p,
+                      derived, verifier->hash_len) != 0) {
         return false;
     }
-    return CRYPTO_memcmp(derived, verifier->hash, verifier->hash_len) == 0;
+#else
+    (void)verifier; return false;
+#endif
+    return ct_memcmp(derived, verifier->hash, verifier->hash_len) == 0;
 }
 
 static bool auth_username_match_ct(const char *a, const char *b)

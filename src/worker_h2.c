@@ -1128,6 +1128,37 @@ int h2_session_init(struct worker *w, uint32_t cid)
     return 0;
 }
 
+/*
+ * h2_inject_predata — feed pre-decrypted application data into nghttp2.
+ *
+ * Called from process_tls_result when the client sent the H2 connection
+ * preface bundled with its TLS Finished in the same TCP segment.  The data
+ * is already decrypted (via ptls_receive before kTLS took over), so we can
+ * pass it directly to nghttp2 without touching the io_uring buffer ring.
+ *
+ * Returns true on success, false if nghttp2 failed (connection closed).
+ */
+bool h2_inject_predata(struct worker *w, uint32_t cid,
+                       const uint8_t *data, size_t len)
+{
+    struct conn_cold  *cc   = conn_cold_ptr(&w->pool, cid);
+    struct h2_session *sess = cc->h2;
+    if (!sess) return false;
+
+    ssize_t r = nghttp2_session_mem_recv(sess->ngh2, data, len);
+    if (r < 0) {
+        log_error("h2_predata", "cid=%u nghttp2: %s",
+                  cid, nghttp2_strerror((int)r));
+        conn_close(w, cid, true);
+        return false;
+    }
+
+    h2_send_pending(sess);
+
+    /* h2_send_pending can close the conn on alloc failure */
+    return conn_hot(&w->pool, cid)->state != CONN_STATE_FREE;
+}
+
 void h2_session_free(struct h2_session *sess)
 {
     if (!sess) return;

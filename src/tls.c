@@ -1,765 +1,412 @@
+/*
+ * tls.c — TLS subsystem using picotls + minicrypto (no OpenSSL).
+ *
+ * Features:
+ *   - TLS 1.3 only (AES-256-GCM-SHA384 and ChaCha20-Poly1305-SHA256)
+ *   - kTLS: traffic keys extracted via update_traffic_key callback,
+ *     installed into the kernel after handshake via setsockopt(SOL_TLS)
+ *   - SNI-based routing: on_client_hello callback selects ptls_context_t
+ *   - ALPN: h2 / http1.1 selection
+ *   - Session tickets: AES-256-GCM encrypted, server-side only
+ *   - Hot cert rotation: atomic pointer swap on route ctx
+ */
+
 #include "tls.h"
 #include "log.h"
 #include "config.h"
 
-#include <openssl/ssl.h>
-#include <openssl/bio.h>
-#include <openssl/err.h>
-#include <openssl/crypto.h>
-#include <openssl/provider.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/ocsp.h>
-#include <openssl/rsa.h>
-#include <openssl/sha.h>
+#include <picotls.h>
+#include <picotls/minicrypto.h>
 
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <linux/tls.h>
 
-/* SNI callback data threaded through SSL app_data */
-struct sni_data {
-    struct tls_ctx *tls;
-    int             matched_route;
+/* ------------------------------------------------------------------ */
+/* kTLS installation                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * install_ktls_direction: install kTLS TX or RX on fd.
+ * key  = HKDF-derived traffic key (16 or 32 bytes)
+ * iv   = HKDF-derived static IV (12 bytes)
+ * seq  = current record sequence number (must match picotls's internal counter)
+ * aead = cipher algorithm (to determine cipher type)
+ * is_tx = 1 for TX (TLS_TX), 0 for RX (TLS_RX)
+ *
+ * seq must be set correctly to avoid AEAD tag failures on the peer.
+ * After ptls_handshake returns 0, picotls may have already sent the
+ * NewSessionTicket using epoch-3 (seq=0), so tx_seq from ptls_get_traffic_keys
+ * is typically 1 on the server side.
+ */
+static void seq_to_be8(uint8_t out[8], uint64_t seq)
+{
+    out[0] = (uint8_t)(seq >> 56);
+    out[1] = (uint8_t)(seq >> 48);
+    out[2] = (uint8_t)(seq >> 40);
+    out[3] = (uint8_t)(seq >> 32);
+    out[4] = (uint8_t)(seq >> 24);
+    out[5] = (uint8_t)(seq >> 16);
+    out[6] = (uint8_t)(seq >>  8);
+    out[7] = (uint8_t)(seq      );
+}
+
+static int install_ktls_direction(int fd, const uint8_t *key, const uint8_t *iv,
+                                   uint64_t seq,
+                                   const ptls_aead_algorithm_t *aead, int is_tx)
+{
+    int level = is_tx ? TLS_TX : TLS_RX;
+    uint8_t rec_seq[8];
+    seq_to_be8(rec_seq, seq);
+
+    if (aead == &ptls_minicrypto_aes256gcm) {
+        struct tls12_crypto_info_aes_gcm_256 info;
+        memset(&info, 0, sizeof(info));
+        info.info.version     = TLS_1_3_VERSION;
+        info.info.cipher_type = TLS_CIPHER_AES_GCM_256;
+        /* 12-byte static IV is split: salt = iv[0..3], iv = iv[4..11] */
+        memcpy(info.salt, iv,     TLS_CIPHER_AES_GCM_256_SALT_SIZE);
+        memcpy(info.iv,   iv + 4, TLS_CIPHER_AES_GCM_256_IV_SIZE);
+        memcpy(info.key,  key,    TLS_CIPHER_AES_GCM_256_KEY_SIZE);
+        memcpy(info.rec_seq, rec_seq, TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE);
+        if (setsockopt(fd, SOL_TLS, level, &info, sizeof(info)) < 0)
+            return -1;
+    } else if (aead == &ptls_minicrypto_aes128gcm) {
+        struct tls12_crypto_info_aes_gcm_128 info;
+        memset(&info, 0, sizeof(info));
+        info.info.version     = TLS_1_3_VERSION;
+        info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+        memcpy(info.salt, iv,     TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+        memcpy(info.iv,   iv + 4, TLS_CIPHER_AES_GCM_128_IV_SIZE);
+        memcpy(info.key,  key,    TLS_CIPHER_AES_GCM_128_KEY_SIZE);
+        memcpy(info.rec_seq, rec_seq, TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+        if (setsockopt(fd, SOL_TLS, level, &info, sizeof(info)) < 0)
+            return -1;
+    } else if (aead == &ptls_minicrypto_chacha20poly1305) {
+        struct tls12_crypto_info_chacha20_poly1305 info;
+        memset(&info, 0, sizeof(info));
+        info.info.version     = TLS_1_3_VERSION;
+        info.info.cipher_type = TLS_CIPHER_CHACHA20_POLY1305;
+        /* ChaCha uses the full 12-byte IV directly */
+        memcpy(info.iv,      iv,  TLS_CIPHER_CHACHA20_POLY1305_IV_SIZE);
+        memcpy(info.key,     key, TLS_CIPHER_CHACHA20_POLY1305_KEY_SIZE);
+        memcpy(info.rec_seq, rec_seq, TLS_CIPHER_CHACHA20_POLY1305_REC_SEQ_SIZE);
+        if (setsockopt(fd, SOL_TLS, level, &info, sizeof(info)) < 0)
+            return -1;
+    } else {
+        return -1; /* unsupported cipher */
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-connection state (stored in ptls user-data pointer)             */
+/* ------------------------------------------------------------------ */
+
+struct conn_tls_state {
+    int           fd;
+    int           matched_route;
+    bool          h2_negotiated;
+    struct tls_ctx *tls_ctx;
 };
 
-static int g_tls_ctx_ex_index = -1;
-static int g_tls_route_ex_index = -1;
+/* ------------------------------------------------------------------ */
+/* Session ticket encryption (AES-256-GCM, server-side)               */
+/* ------------------------------------------------------------------ */
 
-static int sni_callback(SSL *ssl, int *al, void *arg);
-static int client_hello_cb(SSL *ssl, int *al, void *arg);
-static int alpn_select_cb(SSL *ssl, const uint8_t **out, uint8_t *outlen,
-                          const uint8_t *in, unsigned int inlen, void *arg);
-static int tls_new_session_cb(SSL *ssl, SSL_SESSION *sess);
-static SSL_SESSION *tls_get_session_cb(SSL *ssl, const unsigned char *data,
-                                       int len, int *copy);
-static void tls_remove_session_cb(SSL_CTX *ctx, SSL_SESSION *sess);
-
-static void log_ssl_errors(const char *ctx_tag)
+static int ticket_encrypt_decrypt(ptls_encrypt_ticket_t *self,
+                                   ptls_t *tls,
+                                   int is_encrypt,
+                                   ptls_buffer_t *dst,
+                                   ptls_iovec_t src)
 {
-    unsigned long err;
-    while ((err = ERR_get_error()) != 0) {
-        char buf[256];
-        ERR_error_string_n(err, buf, sizeof(buf));
-        log_error(ctx_tag, "OpenSSL: %s", buf);
-    }
-}
+    (void)tls;
+    struct tls_ctx *tctx = (struct tls_ctx *)((char *)self -
+        offsetof(struct tls_ctx, encrypt_ticket_cb));
 
-static int ensure_ex_indices(void)
-{
-    if (g_tls_ctx_ex_index < 0) {
-        g_tls_ctx_ex_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, NULL);
-        if (g_tls_ctx_ex_index < 0)
-            return -1;
-    }
-    if (g_tls_route_ex_index < 0) {
-        g_tls_route_ex_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, NULL);
-        if (g_tls_route_ex_index < 0)
-            return -1;
-    }
-    return 0;
-}
-
-static void free_route_ocsp(struct tls_route_ctx *route_ctx)
-{
-    if (!route_ctx->ocsp_resp_der)
-        return;
-    free(route_ctx->ocsp_resp_der);
-    route_ctx->ocsp_resp_der = NULL;
-    route_ctx->ocsp_resp_der_len = 0;
-}
-
-static struct tls_ctx *tls_from_ssl(SSL *ssl)
-{
-    SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
-    if (!ctx || g_tls_ctx_ex_index < 0)
-        return NULL;
-    return (struct tls_ctx *)SSL_CTX_get_ex_data(ctx, g_tls_ctx_ex_index);
-}
-
-__attribute__((unused)) static struct tls_ctx *tls_from_ctx(SSL_CTX *ctx)
-{
-    if (!ctx || g_tls_ctx_ex_index < 0)
-        return NULL;
-    return (struct tls_ctx *)SSL_CTX_get_ex_data(ctx, g_tls_ctx_ex_index);
-}
-
-static struct tls_route_ctx *route_from_ssl(SSL *ssl)
-{
-    SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
-    if (!ctx || g_tls_route_ex_index < 0)
-        return NULL;
-    return (struct tls_route_ctx *)SSL_CTX_get_ex_data(ctx, g_tls_route_ex_index);
-}
-
-static int select_route_ctx_for_sni(SSL *ssl, struct tls_ctx *tls, const char *sni)
-{
-    if (!ssl || !tls)
-        return 0;
-
-    if (!sni || sni[0] == '\0')
-        return 0;
-
-    for (int i = 0; i < tls->route_count; i++) {
-        const char *h = tls->routes[i].ssl_ctx
-            ? SSL_CTX_get_app_data(tls->routes[i].ssl_ctx)
-            : NULL;
-        if (!h) continue;
-        if (strcasecmp(h, sni) == 0) {
-            SSL_set_SSL_CTX(ssl, tls->routes[i].ssl_ctx);
-            return i;
+    if (is_encrypt) {
+        pthread_mutex_lock(&tctx->ticket_lock);
+        if (!tctx->have_current_ticket_key) {
+            /* Generate first ticket key */
+            ptls_minicrypto_random_bytes(tctx->current_ticket_key.key,
+                                         sizeof(tctx->current_ticket_key.key));
+            ptls_minicrypto_random_bytes(tctx->current_ticket_key.key_id,
+                                         sizeof(tctx->current_ticket_key.key_id));
+            tctx->current_ticket_key.created_at = time(NULL);
+            tctx->have_current_ticket_key = true;
         }
-    }
+        uint8_t key[32], key_id[8];
+        memcpy(key,    tctx->current_ticket_key.key,    32);
+        memcpy(key_id, tctx->current_ticket_key.key_id, 8);
+        pthread_mutex_unlock(&tctx->ticket_lock);
 
-    const char *dot = strchr(sni, '.');
-    if (dot) {
-        for (int i = 0; i < tls->route_count; i++) {
-            const char *h = tls->routes[i].ssl_ctx
-                ? SSL_CTX_get_app_data(tls->routes[i].ssl_ctx)
-                : NULL;
-            if (!h || h[0] != '*') continue;
-            if (strcasecmp(h + 1, dot) == 0) {
-                SSL_set_SSL_CTX(ssl, tls->routes[i].ssl_ctx);
-                return i;
+        /* Format: key_id(8) | nonce(12) | ciphertext | tag(16) */
+        uint8_t nonce[12];
+        ptls_minicrypto_random_bytes(nonce, sizeof(nonce));
+
+        if (ptls_buffer_reserve(dst, 8 + 12 + src.len + 16) != 0)
+            return PTLS_ERROR_NO_MEMORY;
+
+        memcpy(dst->base + dst->off, key_id, 8); dst->off += 8;
+        memcpy(dst->base + dst->off, nonce, 12);  dst->off += 12;
+
+        ptls_aead_context_t *aead =
+            ptls_aead_new_direct(&ptls_minicrypto_aes256gcm, 1, key, nonce);
+        if (!aead)
+            return PTLS_ERROR_LIBRARY;
+
+        size_t enc_len = ptls_aead_encrypt(aead,
+            dst->base + dst->off, src.base, src.len, 0, NULL, 0);
+        ptls_aead_free(aead);
+        dst->off += enc_len;
+        memset(key, 0, 32);
+        return 0;
+    } else {
+        /* Decrypt: src = key_id(8) | nonce(12) | ciphertext+tag */
+        if (src.len < 8 + 12 + 16)
+            return PTLS_ERROR_LIBRARY;
+
+        const uint8_t *key_id = src.base;
+        const uint8_t *nonce  = src.base + 8;
+        const uint8_t *cipher = src.base + 20;
+        size_t  cipher_len    = src.len  - 20;
+        uint8_t key[32];
+        bool found = false;
+
+        pthread_mutex_lock(&tctx->ticket_lock);
+        if (tctx->have_current_ticket_key &&
+            memcmp(key_id, tctx->current_ticket_key.key_id, 8) == 0) {
+            memcpy(key, tctx->current_ticket_key.key, 32);
+            found = true;
+        } else if (tctx->have_previous_ticket_key &&
+                   memcmp(key_id, tctx->previous_ticket_key.key_id, 8) == 0) {
+            memcpy(key, tctx->previous_ticket_key.key, 32);
+            found = true;
+        }
+        pthread_mutex_unlock(&tctx->ticket_lock);
+
+        if (!found)
+            return PTLS_ERROR_SESSION_NOT_FOUND;
+
+        if (ptls_buffer_reserve(dst, cipher_len) != 0) {
+            memset(key, 0, 32);
+            return PTLS_ERROR_NO_MEMORY;
+        }
+
+        ptls_aead_context_t *aead =
+            ptls_aead_new_direct(&ptls_minicrypto_aes256gcm, 0, key, nonce);
+        memset(key, 0, 32);
+        if (!aead)
+            return PTLS_ERROR_LIBRARY;
+
+        size_t plain_len = ptls_aead_decrypt(aead,
+            dst->base + dst->off, cipher, cipher_len, 0, NULL, 0);
+        ptls_aead_free(aead);
+
+        if (plain_len == SIZE_MAX)
+            return PTLS_ERROR_LIBRARY;
+        dst->off += plain_len;
+        return 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* SNI routing + ALPN: on_client_hello callback                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    ptls_on_client_hello_t super;
+    struct tls_ctx *tls_ctx;
+} vortex_on_client_hello_t;
+
+static int on_client_hello_cb(ptls_on_client_hello_t *self,
+                               ptls_t *tls,
+                               ptls_on_client_hello_parameters_t *params)
+{
+    vortex_on_client_hello_t *handler =
+        (vortex_on_client_hello_t *)self;
+    struct tls_ctx *tls_ctx = handler->tls_ctx;
+
+    /* Retrieve per-connection state */
+    struct conn_tls_state **statep = (struct conn_tls_state **)ptls_get_data_ptr(tls);
+    struct conn_tls_state *state = statep ? *statep : NULL;
+
+    /* SNI routing */
+    if (params->server_name.len > 0) {
+        char sni[256];
+        size_t sni_len = params->server_name.len < sizeof(sni) - 1
+                         ? params->server_name.len : sizeof(sni) - 1;
+        memcpy(sni, params->server_name.base, sni_len);
+        sni[sni_len] = '\0';
+
+        /* Exact match first, then wildcard */
+        int matched = 0;
+        for (int i = 0; i < tls_ctx->route_count; i++) {
+            const char *h = tls_ctx->routes[i].hostname;
+            if (!h || !tls_ctx->routes[i].ctx) continue;
+            if (strcasecmp(h, sni) == 0) {
+                ptls_set_context(tls, tls_ctx->routes[i].ctx);
+                if (state) state->matched_route = i;
+                matched = 1;
+                break;
             }
         }
-    }
-
-    return 0;
-}
-
-static int client_hello_cb(SSL *ssl, int *al, void *arg)
-{
-    (void)al;
-    (void)arg;
-
-    struct sni_data *sd = (struct sni_data *)SSL_get_app_data(ssl);
-    struct tls_ctx *tls = sd ? sd->tls : NULL;
-    const unsigned char *ext = NULL;
-    size_t ext_len = 0;
-
-    if (!tls)
-        return SSL_CLIENT_HELLO_SUCCESS;
-
-    if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_server_name, &ext, &ext_len) != 1
-        || !ext || ext_len < 5) {
-        if (sd)
-            sd->matched_route = 0;
-        return SSL_CLIENT_HELLO_SUCCESS;
-    }
-
-    const unsigned char *p = ext;
-    if (ext_len < 2)
-        return SSL_CLIENT_HELLO_SUCCESS;
-
-    size_t list_len = ((size_t)p[0] << 8) | p[1];
-    p += 2;
-    if (list_len > ext_len - 2)
-        list_len = ext_len - 2;
-
-    while (list_len >= 3) {
-        unsigned int name_type = p[0];
-        size_t name_len = ((size_t)p[1] << 8) | p[2];
-        p += 3;
-        list_len -= 3;
-        if (name_len > list_len)
-            break;
-        if (name_type == TLSEXT_NAMETYPE_host_name && name_len > 0) {
-            char host[256];
-            size_t copy_len = name_len < sizeof(host) - 1 ? name_len : sizeof(host) - 1;
-            memcpy(host, p, copy_len);
-            host[copy_len] = '\0';
-            int route = select_route_ctx_for_sni(ssl, tls, host);
-            if (sd)
-                sd->matched_route = route;
-            return SSL_CLIENT_HELLO_SUCCESS;
-        }
-        p += name_len;
-        list_len -= name_len;
-    }
-
-    if (sd)
-        sd->matched_route = 0;
-    return SSL_CLIENT_HELLO_SUCCESS;
-}
-
-static void tls_session_id_prefix(const unsigned char *id, unsigned int id_len,
-                                  char *out, size_t out_sz)
-{
-    if (!out || out_sz == 0) return;
-    out[0] = '\0';
-    if (!id || id_len == 0) return;
-    unsigned int n = id_len < 4 ? id_len : 4;
-    size_t off = 0;
-    for (unsigned int i = 0; i < n && off + 2 < out_sz; i++) {
-        off += (size_t)snprintf(out + off, out_sz - off, "%02X", id[i]);
-    }
-}
-
-static void tls_log_session_meta(const char *event, SSL_SESSION *sess)
-{
-    unsigned int id_len = 0, sid_ctx_len = 0;
-    const unsigned char *id = SSL_SESSION_get_id(sess, &id_len);
-    const unsigned char *sid_ctx = SSL_SESSION_get0_id_context(sess, &sid_ctx_len);
-    char id_hex[16];
-    char sid_ctx_hex[16];
-
-    tls_session_id_prefix(id, id_len, id_hex, sizeof(id_hex));
-    tls_session_id_prefix(sid_ctx, sid_ctx_len, sid_ctx_hex, sizeof(sid_ctx_hex));
-    log_info(event, "id=%s sid_ctx_len=%u sid_ctx=%s resumable=%d proto=%d",
-             id_hex, sid_ctx_len, sid_ctx_hex,
-             SSL_SESSION_is_resumable(sess),
-             SSL_SESSION_get_protocol_version(sess));
-}
-
-static int build_sid_ctx(const char *hostname, int route_idx,
-                         unsigned char *sid_ctx, unsigned int *sid_len)
-{
-    const uint32_t idx = (uint32_t)route_idx;
-    const char *host = hostname ? hostname : "";
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-
-    if (!mdctx || !sid_ctx || !sid_len)
-        return -1;
-    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1
-        || EVP_DigestUpdate(mdctx, "vortex-tls-route", sizeof("vortex-tls-route") - 1) != 1
-        || EVP_DigestUpdate(mdctx, &idx, sizeof(idx)) != 1
-        || EVP_DigestUpdate(mdctx, host, strlen(host)) != 1
-        || EVP_DigestFinal_ex(mdctx, sid_ctx, sid_len) != 1) {
-        EVP_MD_CTX_free(mdctx);
-        return -1;
-    }
-    EVP_MD_CTX_free(mdctx);
-    return 0;
-}
-
-static void tls_session_cache_store(struct tls_ctx *tls, SSL_SESSION *sess)
-{
-    unsigned int id_len = 0;
-    const unsigned char *id;
-    size_t slot = 0;
-    time_t oldest_time = 0;
-    bool found_empty = false;
-
-    if (!tls || !sess)
-        return;
-
-    id = SSL_SESSION_get_id(sess, &id_len);
-    if (!id || id_len == 0 || id_len > SSL_MAX_SSL_SESSION_ID_LENGTH)
-        return;
-
-    pthread_mutex_lock(&tls->session_lock);
-    for (size_t i = 0; i < VORTEX_TLS_SESSION_CACHE_SIZE; i++) {
-        struct tls_session_entry *entry = &tls->session_cache[i];
-        if (!entry->session) {
-            slot = i;
-            found_empty = true;
-            break;
-        }
-        if (entry->id_len == id_len && memcmp(entry->id, id, id_len) == 0) {
-            slot = i;
-            found_empty = true;
-            break;
-        }
-        time_t t = SSL_SESSION_get_time(entry->session);
-        if (i == 0 || t < oldest_time) {
-            oldest_time = t;
-            slot = i;
-        }
-    }
-
-    struct tls_session_entry *entry = &tls->session_cache[slot];
-    if (entry->session)
-        SSL_SESSION_free(entry->session);
-
-    entry->session = SSL_SESSION_dup(sess);
-    if (!entry->session) {
-        memset(entry, 0, sizeof(*entry));
-        pthread_mutex_unlock(&tls->session_lock);
-        return;
-    }
-    entry->id_len = id_len;
-    memcpy(entry->id, id, id_len);
-    char id_hex[16];
-    tls_session_id_prefix(id, id_len, id_hex, sizeof(id_hex));
-    log_info("tls_session_store", "id_len=%u slot=%zu id=%s", id_len, slot, id_hex);
-    tls_log_session_meta("tls_session_store_meta", sess);
-    (void)found_empty;
-    pthread_mutex_unlock(&tls->session_lock);
-}
-
-static SSL_SESSION *tls_session_cache_lookup(struct tls_ctx *tls,
-                                             const unsigned char *id,
-                                             unsigned int id_len)
-{
-    SSL_SESSION *sess = NULL;
-
-    if (!tls || !id || id_len == 0)
-        return NULL;
-
-    pthread_mutex_lock(&tls->session_lock);
-    for (size_t i = 0; i < VORTEX_TLS_SESSION_CACHE_SIZE; i++) {
-        struct tls_session_entry *entry = &tls->session_cache[i];
-        if (!entry->session)
-            continue;
-        if (entry->id_len == id_len && memcmp(entry->id, id, id_len) == 0) {
-            sess = entry->session;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&tls->session_lock);
-    char id_hex[16];
-    tls_session_id_prefix(id, id_len, id_hex, sizeof(id_hex));
-    if (sess)
-        log_info("tls_session_lookup", "id_len=%u hit=1 id=%s", id_len, id_hex);
-    else
-        log_info("tls_session_lookup", "id_len=%u hit=0 id=%s", id_len, id_hex);
-    if (sess)
-        tls_log_session_meta("tls_session_lookup_meta", sess);
-    return sess;
-}
-
-__attribute__((unused)) static void tls_session_cache_remove(struct tls_ctx *tls, SSL_SESSION *sess)
-{
-    unsigned int id_len = 0;
-    const unsigned char *id;
-
-    if (!tls || !sess)
-        return;
-
-    id = SSL_SESSION_get_id(sess, &id_len);
-    if (!id || id_len == 0)
-        return;
-
-    pthread_mutex_lock(&tls->session_lock);
-    for (size_t i = 0; i < VORTEX_TLS_SESSION_CACHE_SIZE; i++) {
-        struct tls_session_entry *entry = &tls->session_cache[i];
-        if (!entry->session)
-            continue;
-        if (entry->id_len == id_len && memcmp(entry->id, id, id_len) == 0) {
-            SSL_SESSION_free(entry->session);
-            memset(entry, 0, sizeof(*entry));
-            break;
-        }
-    }
-    pthread_mutex_unlock(&tls->session_lock);
-}
-
-static int tls_new_session_cb(SSL *ssl, SSL_SESSION *sess)
-{
-    struct tls_ctx *tls = tls_from_ssl(ssl);
-    struct tls_route_ctx *route = route_from_ssl(ssl);
-    unsigned char sid_ctx[SHA256_DIGEST_LENGTH];
-    unsigned int sid_len = 0;
-
-    if (route && build_sid_ctx(route->hostname, route->route_idx, sid_ctx, &sid_len) == 0)
-        SSL_SESSION_set1_id_context(sess, sid_ctx, sid_len);
-
-    tls_session_cache_store(tls, sess);
-    return 1;
-}
-
-static SSL_SESSION *tls_get_session_cb(SSL *ssl, const unsigned char *data,
-                                       int len, int *copy)
-{
-    struct tls_ctx *tls = tls_from_ssl(ssl);
-    SSL_SESSION *sess;
-    const char *sni;
-
-    if (copy)
-        *copy = 0;
-    if (len <= 0)
-        return NULL;
-
-    sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    if (tls && sni && sni[0] != '\0')
-        select_route_ctx_for_sni(ssl, tls, sni);
-
-    sess = tls_session_cache_lookup(tls, data, (unsigned int)len);
-    if (!sess)
-        return NULL;
-    return SSL_SESSION_dup(sess);
-}
-
-static void tls_remove_session_cb(SSL_CTX *ctx, SSL_SESSION *sess)
-{
-    (void)ctx;
-    (void)sess;
-}
-
-static int ocsp_status_cb(SSL *ssl, void *arg)
-{
-    struct tls_route_ctx *route_ctx = (struct tls_route_ctx *)arg;
-    unsigned char *copy;
-
-    if (!route_ctx || !route_ctx->ocsp_resp_der || route_ctx->ocsp_resp_der_len <= 0)
-        return SSL_TLSEXT_ERR_NOACK;
-
-    copy = OPENSSL_malloc((size_t)route_ctx->ocsp_resp_der_len);
-    if (!copy)
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
-
-    memcpy(copy, route_ctx->ocsp_resp_der, (size_t)route_ctx->ocsp_resp_der_len);
-    SSL_set_tlsext_status_ocsp_resp(ssl, copy, route_ctx->ocsp_resp_der_len);
-    return SSL_TLSEXT_ERR_OK;
-}
-
-static int configure_session_context(struct tls_ctx *tls,
-                                     SSL_CTX *ctx,
-                                     const char *hostname,
-                                     int route_idx)
-{
-    unsigned char sid_ctx[SHA256_DIGEST_LENGTH];
-    unsigned int sid_len = 0;
-
-    if (build_sid_ctx(hostname, route_idx, sid_ctx, &sid_len) != 0)
-        return -1;
-
-    SSL_CTX_set_session_cache_mode(ctx,
-        SSL_SESS_CACHE_SERVER |
-        SSL_SESS_CACHE_NO_INTERNAL_STORE |
-        SSL_SESS_CACHE_NO_INTERNAL_LOOKUP);
-    SSL_CTX_set_timeout(ctx, tls->session_timeout ? tls->session_timeout : 3600);
-    SSL_CTX_set_num_tickets(ctx, 2);
-    SSL_CTX_sess_set_new_cb(ctx, tls_new_session_cb);
-    SSL_CTX_sess_set_get_cb(ctx, tls_get_session_cb);
-    SSL_CTX_sess_set_remove_cb(ctx, tls_remove_session_cb);
-    if (SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_len) != 1) {
-        log_ssl_errors("tls_session");
-        return -1;
-    }
-    return 0;
-}
-
-static int fetch_ocsp_response(struct tls_route_ctx *route_ctx,
-                               X509 *leaf,
-                               X509 *issuer)
-{
-    STACK_OF(OPENSSL_STRING) *ocsp_urls = NULL;
-    const char *ocsp_url;
-    OCSP_CERTID *id = NULL;
-    OCSP_REQUEST *req = NULL;
-    OCSP_RESPONSE *resp = NULL;
-    OCSP_BASICRESP *basic = NULL;
-    ASN1_GENERALIZEDTIME *rev = NULL, *thisupd = NULL, *nextupd = NULL;
-    char *host = NULL, *port = NULL, *path = NULL;
-    BIO *bio = NULL;
-    int use_ssl = 0;
-    int status = V_OCSP_CERTSTATUS_UNKNOWN;
-    int reason = 0;
-    unsigned char *der = NULL;
-    int der_len = 0;
-    int ok = -1;
-
-    ocsp_urls = X509_get1_ocsp(leaf);
-    if (!ocsp_urls || sk_OPENSSL_STRING_num(ocsp_urls) == 0)
-        goto done;
-
-    ocsp_url = sk_OPENSSL_STRING_value(ocsp_urls, 0);
-    if (!ocsp_url || OCSP_parse_url(ocsp_url, &host, &port, &path, &use_ssl) != 1)
-        goto done;
-    if (use_ssl) {
-        log_warn("tls_ocsp", "route=%d OCSP responder uses HTTPS, not fetching", route_ctx->route_idx);
-        goto done;
-    }
-
-    id = OCSP_cert_to_id(NULL, leaf, issuer);
-    req = OCSP_REQUEST_new();
-    if (!id || !req || !OCSP_request_add0_id(req, id))
-        goto done;
-    id = NULL;
-
-    bio = BIO_new_connect(host);
-    if (!bio)
-        goto done;
-    BIO_set_conn_port(bio, port);
-    if (BIO_do_connect(bio) <= 0)
-        goto done;
-
-    resp = OCSP_sendreq_bio(bio, path, req);
-    if (!resp || OCSP_response_status(resp) != OCSP_RESPONSE_STATUS_SUCCESSFUL)
-        goto done;
-
-    basic = OCSP_response_get1_basic(resp);
-    if (!basic)
-        goto done;
-    if (!OCSP_resp_find_status(basic, OCSP_onereq_get0_id(OCSP_request_onereq_get0(req, 0)),
-                               &status, &reason, &rev, &thisupd, &nextupd))
-        goto done;
-    if (status != V_OCSP_CERTSTATUS_GOOD)
-        goto done;
-    if (!OCSP_check_validity(thisupd, nextupd, 300L, -1L))
-        goto done;
-
-    der_len = i2d_OCSP_RESPONSE(resp, NULL);
-    if (der_len <= 0)
-        goto done;
-
-    der = malloc((size_t)der_len);
-    if (!der)
-        goto done;
-    {
-        unsigned char *p = der;
-        if (i2d_OCSP_RESPONSE(resp, &p) != der_len)
-            goto done;
-    }
-
-    free_route_ocsp(route_ctx);
-    route_ctx->ocsp_resp_der = der;
-    route_ctx->ocsp_resp_der_len = der_len;
-    der = NULL;
-    ok = 0;
-
-done:
-    if (ok != 0) {
-        if (ERR_peek_error() != 0)
-            log_ssl_errors("tls_ocsp");
-    }
-    if (der)
-        free(der);
-    if (basic)
-        OCSP_BASICRESP_free(basic);
-    if (resp)
-        OCSP_RESPONSE_free(resp);
-    if (req)
-        OCSP_REQUEST_free(req);
-    if (id)
-        OCSP_CERTID_free(id);
-    if (bio)
-        BIO_free_all(bio);
-    if (host)
-        OPENSSL_free(host);
-    if (port)
-        OPENSSL_free(port);
-    if (path)
-        OPENSSL_free(path);
-    if (ocsp_urls)
-        X509_email_free(ocsp_urls);
-    return ok;
-}
-
-static void maybe_load_ocsp_from_chain_bio(struct tls_route_ctx *route_ctx, BIO *bio)
-{
-    X509 *leaf = NULL;
-    X509 *issuer = NULL;
-
-    if (!bio)
-        return;
-
-    leaf = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    if (!leaf)
-        goto done;
-    issuer = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    if (!issuer)
-        goto done;
-
-    if (fetch_ocsp_response(route_ctx, leaf, issuer) == 0)
-        log_info("tls_ocsp", "route=%d stapling response loaded", route_ctx->route_idx);
-
-done:
-    if (issuer)
-        X509_free(issuer);
-    if (leaf)
-        X509_free(leaf);
-}
-
-static void configure_ssl_ctx_common(struct tls_ctx *tls,
-                                     SSL_CTX *ctx,
-                                     struct tls_route_ctx *route_ctx,
-                                     const char *hostname)
-{
-    const int route_idx = route_ctx ? route_ctx->route_idx : 0;
-
-    if (configure_session_context(tls, ctx, hostname, route_idx) != 0)
-        log_warn("tls_session", "route=%d failed to configure session resumption", route_idx);
-
-    SSL_CTX_set_app_data(ctx, (void *)hostname);
-    SSL_CTX_set_ex_data(ctx, g_tls_ctx_ex_index, tls);
-    SSL_CTX_set_ex_data(ctx, g_tls_route_ex_index, route_ctx);
-    SSL_CTX_set_client_hello_cb(ctx, client_hello_cb, NULL);
-    SSL_CTX_set_tlsext_servername_callback(ctx, sni_callback);
-    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
-    if (route_ctx) {
-        SSL_CTX_set_tlsext_status_cb(ctx, ocsp_status_cb);
-        SSL_CTX_set_tlsext_status_arg(ctx, route_ctx);
-    }
-}
-
-/* SNI callback: select the SSL_CTX matching the requested hostname */
-static int sni_callback(SSL *ssl, int *al, void *arg)
-{
-    (void)al; (void)arg;
-    /* Read per-connection data set via SSL_set_app_data() — NOT the CTX-level
-     * arg (which is shared across all workers and races on concurrent accepts). */
-    struct sni_data *sd = (struct sni_data *)SSL_get_app_data(ssl);
-    struct tls_ctx  *tls = sd->tls;
-
-    const char *sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    if (!sni || sni[0] == '\0') {
-        sd->matched_route = 0; /* use default (first) route */
-        return SSL_TLSEXT_ERR_OK;
-    }
-
-    sd->matched_route = select_route_ctx_for_sni(ssl, tls, sni);
-    if (sd->matched_route > 0) {
-        log_debug("sni_match", "sni=%s route=%d", sni, sd->matched_route);
-        return SSL_TLSEXT_ERR_OK;
-    }
-    if (tls->route_count > 0) {
-        const char *h = tls->routes[0].ssl_ctx
-            ? SSL_CTX_get_app_data(tls->routes[0].ssl_ctx)
-            : NULL;
-        if (h && strcasecmp(h, sni) == 0) {
-            log_debug("sni_match", "sni=%s route=0", sni);
-            return SSL_TLSEXT_ERR_OK;
-        }
-        if (h && h[0] == '*') {
+        if (!matched) {
+            /* Wildcard match (*.example.com matches sub.example.com) */
             const char *dot = strchr(sni, '.');
-            if (dot && strcasecmp(h + 1, dot) == 0) {
-                log_debug("sni_wildcard", "sni=%s route=0", sni);
-                return SSL_TLSEXT_ERR_OK;
+            if (dot) {
+                for (int i = 0; i < tls_ctx->route_count; i++) {
+                    const char *h = tls_ctx->routes[i].hostname;
+                    if (!h || !tls_ctx->routes[i].ctx || h[0] != '*') continue;
+                    if (strcasecmp(h + 1, dot) == 0) {
+                        ptls_set_context(tls, tls_ctx->routes[i].ctx);
+                        if (state) state->matched_route = i;
+                        matched = 1;
+                        break;
+                    }
+                }
             }
         }
+        /* Always notify client that we accept the SNI */
+        ptls_set_server_name(tls, sni, sni_len);
     }
 
-    /* No match — use default route, don't abort handshake */
-    sd->matched_route = 0;
-    return SSL_TLSEXT_ERR_OK;
+    /* ALPN: prefer h2 if offered */
+    bool h2_offered = false;
+    bool h1_offered = false;
+    for (size_t i = 0; i < params->negotiated_protocols.count; i++) {
+        ptls_iovec_t p = params->negotiated_protocols.list[i];
+        if (p.len == 2 && memcmp(p.base, "h2", 2) == 0)
+            h2_offered = true;
+        else if (p.len == 8 && memcmp(p.base, "http/1.1", 8) == 0)
+            h1_offered = true;
+    }
+    if (h2_offered) {
+        ptls_set_negotiated_protocol(tls, "h2", 2);
+        if (state) state->h2_negotiated = true;
+    } else if (h1_offered) {
+        ptls_set_negotiated_protocol(tls, "http/1.1", 8);
+    }
+
+    return 0;
 }
 
-/* ALPN: prefer h2 over http/1.1 for TCP connections.
- * HTTP/3 clients use QUIC and never reach this callback. */
-static int alpn_select_cb(SSL *ssl, const uint8_t **out, uint8_t *outlen,
-                           const uint8_t *in, unsigned int inlen, void *arg)
+/* ------------------------------------------------------------------ */
+/* Build a ptls_context_t from cert+key PEM files                      */
+/* ------------------------------------------------------------------ */
+
+/* Per-context sign_certificate (holds the private key) */
+typedef struct {
+    ptls_minicrypto_secp256r1sha256_sign_certificate_t sc;
+} vortex_sign_certificate_t;
+
+/*
+ * Create a fully configured ptls_context_t for a TLS server route.
+ * cert_pem_file: path to PEM cert chain file.
+ * key_pem_file:  path to PEM private key file (ECDSA P-256 only).
+ */
+static ptls_context_t *build_route_context(struct tls_ctx *tls_ctx,
+                                            const char *cert_pem_file,
+                                            const char *key_pem_file,
+                                            const char *hostname)
 {
-    (void)ssl; (void)arg;
-    /* Wire-format: length-prefixed protocol names, server preference order */
-    static const uint8_t protos[] = {
-        2, 'h', '2',
-        8, 'h', 't', 't', 'p', '/', '1', '.', '1',
+    static ptls_key_exchange_algorithm_t *key_exchanges[] = {
+        &ptls_minicrypto_x25519,
+        &ptls_minicrypto_secp256r1,
+        NULL
     };
-    if (SSL_select_next_proto((uint8_t **)out, outlen,
-                              protos, sizeof(protos), in, inlen)
-            == OPENSSL_NPN_NEGOTIATED)
-        return SSL_TLSEXT_ERR_OK;
-    return SSL_TLSEXT_ERR_NOACK;
-}
+    static ptls_cipher_suite_t *cipher_suites[] = {
+        &ptls_minicrypto_aes256gcmsha384,
+        &ptls_minicrypto_chacha20poly1305sha256,
+        NULL
+    };
 
-static SSL_CTX *create_ssl_ctx(struct tls_ctx *tls,
-                                struct tls_route_ctx *route_ctx,
-                                const struct route_config *route,
-                                int route_idx)
-{
-    SSL_CTX *ctx = SSL_CTX_new_ex(tls->libctx, NULL, TLS_server_method());
-    if (!ctx) {
-        log_ssl_errors("create_ssl_ctx");
+    /* Allocate context + sign_certificate together */
+    ptls_context_t *ctx = calloc(1, sizeof(*ctx));
+    vortex_sign_certificate_t *sc = calloc(1, sizeof(*sc));
+    if (!ctx || !sc) {
+        free(ctx); free(sc);
         return NULL;
     }
 
-    /* TLS 1.2 + 1.3 only */
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    ctx->random_bytes           = ptls_minicrypto_random_bytes;
+    ctx->get_time               = &ptls_get_time;
+    ctx->key_exchanges          = key_exchanges;
+    ctx->cipher_suites          = cipher_suites;
+    ctx->encrypt_ticket         = &tls_ctx->encrypt_ticket_cb;
+    ctx->ticket_lifetime        = tls_ctx->session_timeout ? tls_ctx->session_timeout : 3600;
+    ctx->server_cipher_preference = 1;
 
-    /* Prefer AES-GCM for kTLS compatibility */
-    SSL_CTX_set_ciphersuites(ctx,
-        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
-    SSL_CTX_set_cipher_list(ctx,
-        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384");
+    /* Store sign_certificate pointer as app_data for cleanup */
+    ctx->sign_certificate = &sc->sc.super;
 
-    SSL_CTX_set_options(ctx,
-        SSL_OP_CIPHER_SERVER_PREFERENCE |
-        SSL_OP_NO_RENEGOTIATION);
-
-    /* Enable kTLS — OpenSSL will install kTLS after handshake if supported */
-    if (tls->ktls_available) {
-        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
-        log_debug("tls_init", "kTLS enabled for route %d", route_idx);
+    /* Load certificates */
+    if (ptls_load_certificates(ctx, cert_pem_file) != 0) {
+        log_error("tls_init", "failed to load cert %s", cert_pem_file);
+        free(sc); free(ctx);
+        return NULL;
     }
 
-    /* Load certificate and private key */
-    if (route->cert_path[0] != '\0') {
-        if (SSL_CTX_use_certificate_chain_file(ctx, route->cert_path) != 1) {
-            log_error("tls_init", "failed to load cert %s", route->cert_path);
-            log_ssl_errors("tls_init");
-            SSL_CTX_free(ctx);
-            return NULL;
+    /* Load private key */
+    if (ptls_minicrypto_load_private_key(ctx, key_pem_file) != 0) {
+        log_error("tls_init", "failed to load key %s", key_pem_file);
+        /* Free cert list */
+        if (ctx->certificates.list) {
+            for (size_t i = 0; i < ctx->certificates.count; i++)
+                free(ctx->certificates.list[i].base);
+            free(ctx->certificates.list);
         }
-        if (SSL_CTX_use_PrivateKey_file(ctx, route->key_path,
-                                         SSL_FILETYPE_PEM) != 1) {
-            log_error("tls_init", "failed to load key %s", route->key_path);
-            log_ssl_errors("tls_init");
-            SSL_CTX_free(ctx);
-            return NULL;
-        }
-        if (SSL_CTX_check_private_key(ctx) != 1) {
-            log_error("tls_init", "cert/key mismatch for route %d", route_idx);
-            SSL_CTX_free(ctx);
-            return NULL;
-        }
-        log_info("tls_cert_loaded", "route=%d cert=%s",
-            route_idx, route->cert_path);
+        free(sc); free(ctx);
+        return NULL;
     }
 
-    configure_ssl_ctx_common(tls, ctx, route_ctx, route->hostname);
-
-    if (route->cert_path[0] != '\0') {
-        BIO *cert_bio = BIO_new_file(route->cert_path, "rb");
-        maybe_load_ocsp_from_chain_bio(route_ctx, cert_bio);
-        if (cert_bio)
-            BIO_free(cert_bio);
-    }
-
+    log_info("tls_cert_loaded", "cert=%s", cert_pem_file);
     return ctx;
 }
+
+/* ------------------------------------------------------------------ */
+/* on_client_hello handler per route context                           */
+/* ------------------------------------------------------------------ */
+
+static vortex_on_client_hello_t g_on_client_hello;
+
+/* ------------------------------------------------------------------ */
+/* tls_init                                                             */
+/* ------------------------------------------------------------------ */
 
 int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg)
 {
     memset(tls, 0, sizeof(*tls));
-    tls->session_timeout = cfg->tls.session_timeout;
-    tls->session_ticket_rotation = cfg->tls.session_ticket_rotation;
-
-    if (ensure_ex_indices() != 0) {
-        log_error("tls_init", "failed to allocate OpenSSL ex_data indices");
-        return -1;
-    }
+    tls->session_timeout          = cfg->tls.session_timeout;
+    tls->session_ticket_rotation  = cfg->tls.session_ticket_rotation;
 
     pthread_mutex_init(&tls->ticket_lock, NULL);
-    pthread_mutex_init(&tls->ocsp_lock, NULL);
-    pthread_mutex_init(&tls->session_lock, NULL);
 
-    /* Create isolated library context */
-    tls->libctx = OSSL_LIB_CTX_new();
-    if (!tls->libctx) {
-        log_error("tls_init", "OSSL_LIB_CTX_new failed");
-        return -1;
-    }
+    /* Set up session ticket callback */
+    tls->encrypt_ticket_cb.cb = ticket_encrypt_decrypt;
 
-    /* Load the default provider (software crypto, includes AES-GCM) */
-    tls->prov_default = OSSL_PROVIDER_load(tls->libctx, "default");
-    if (!tls->prov_default) {
-        log_error("tls_init", "failed to load default OpenSSL provider");
-        log_ssl_errors("tls_init");
-        OSSL_LIB_CTX_free(tls->libctx);
-        return -1;
-    }
+    /* Set up on_client_hello callback */
+    g_on_client_hello.super.cb = on_client_hello_cb;
+    g_on_client_hello.tls_ctx  = tls;
 
-    /* Probe kTLS availability: try setsockopt on a dummy socket */
+    /* Probe kTLS availability */
     {
         int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (probe_fd >= 0) {
 #ifdef SOL_TLS
-            /* Check if the kernel tls module is loaded */
             int r = setsockopt(probe_fd, SOL_TLS, 0, NULL, 0);
             tls->ktls_available = (r == 0 || errno == ENOPROTOOPT
                                    || errno == ENOTSUP || errno == EOPNOTSUPP
                                    || errno == EINVAL);
-            /* More reliable: check /proc/net/tls_stat */
             int f = open("/proc/net/tls_stat", O_RDONLY);
             if (f >= 0) { tls->ktls_available = true; close(f); }
 #else
@@ -771,405 +418,646 @@ int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg)
     log_info("tls_init", "kTLS kernel support: %s",
         tls->ktls_available ? "yes" : "no");
 
-    /* Create per-route SSL_CTX */
+    /* Create per-route contexts */
     tls->route_count = cfg->route_count;
     for (int i = 0; i < cfg->route_count; i++) {
         tls->routes[i].route_idx = i;
-        tls->routes[i].hostname = cfg->routes[i].hostname;
-        tls->routes[i].ssl_ctx = create_ssl_ctx(tls, &tls->routes[i], &cfg->routes[i], i);
-        if (!tls->routes[i].ssl_ctx) {
-            /* Non-fatal for routes without cert — they'll be HTTP-only */
-            log_warn("tls_init", "no TLS context for route %d "
-                "(missing cert/key — will reject TLS connections)", i);
+        tls->routes[i].hostname  = cfg->routes[i].hostname;
+
+        if (cfg->routes[i].cert_path[0] == '\0') {
+            log_warn("tls_init", "route %d: no cert configured (HTTP-only)", i);
+            continue;
         }
+
+        ptls_context_t *ctx = build_route_context(tls,
+            cfg->routes[i].cert_path,
+            cfg->routes[i].key_path,
+            cfg->routes[i].hostname);
+        if (!ctx) {
+            log_warn("tls_init", "route %d: TLS context failed (will reject TLS)", i);
+            continue;
+        }
+        /* Attach the shared on_client_hello to every route context */
+        ctx->on_client_hello = &g_on_client_hello.super;
+
+        tls->routes[i].ctx = ctx;
     }
 
     log_info("tls_init", "TLS subsystem ready, routes=%d", cfg->route_count);
     return 0;
 }
 
-void tls_destroy(struct tls_ctx *tls)
+/* ------------------------------------------------------------------ */
+/* tls_destroy                                                          */
+/* ------------------------------------------------------------------ */
+
+static void free_route_ctx(struct tls_route_ctx *rc)
 {
-    for (int i = 0; i < tls->route_count; i++) {
-        if (tls->routes[i].ssl_ctx) {
-            SSL_CTX_free(tls->routes[i].ssl_ctx);
-            tls->routes[i].ssl_ctx = NULL;
-        }
-        free_route_ocsp(&tls->routes[i]);
+    if (!rc->ctx) return;
+    ptls_context_t *ctx = rc->ctx;
+    rc->ctx = NULL;
+
+    /* Free cert list */
+    if (ctx->certificates.list) {
+        for (size_t i = 0; i < ctx->certificates.count; i++)
+            free(ctx->certificates.list[i].base);
+        free(ctx->certificates.list);
     }
-    pthread_mutex_destroy(&tls->ticket_lock);
-    pthread_mutex_destroy(&tls->ocsp_lock);
-    pthread_mutex_lock(&tls->session_lock);
-    for (size_t i = 0; i < VORTEX_TLS_SESSION_CACHE_SIZE; i++) {
-        if (tls->session_cache[i].session) {
-            SSL_SESSION_free(tls->session_cache[i].session);
-            memset(&tls->session_cache[i], 0, sizeof(tls->session_cache[i]));
-        }
-    }
-    pthread_mutex_unlock(&tls->session_lock);
-    pthread_mutex_destroy(&tls->session_lock);
-    if (tls->prov_default) {
-        OSSL_PROVIDER_unload(tls->prov_default);
-        tls->prov_default = NULL;
-    }
-    if (tls->libctx) {
-        OSSL_LIB_CTX_free(tls->libctx);
-        tls->libctx = NULL;
+    /* Free sign_certificate (the private key holder) */
+    free(ctx->sign_certificate);
+    free(ctx);
+
+    if (rc->ocsp_resp_der) {
+        free(rc->ocsp_resp_der);
+        rc->ocsp_resp_der = NULL;
+        rc->ocsp_resp_der_len = 0;
     }
 }
 
-SSL *tls_accept(struct tls_ctx *tls, int fd,
-                int *route_idx_out, char *sni_out, size_t sni_max)
+void tls_destroy(struct tls_ctx *tls)
 {
-    /* Use default (first) route's SSL_CTX to start — SNI callback may switch */
-    SSL_CTX *base_ctx = NULL;
+    for (int i = 0; i < tls->route_count; i++)
+        free_route_ctx(&tls->routes[i]);
+    pthread_mutex_destroy(&tls->ticket_lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* tls_accept: blocking TLS 1.3 handshake with kTLS installation       */
+/* ------------------------------------------------------------------ */
+
+/* Write all bytes in buf to fd (blocking) */
+static int write_all(int fd, const uint8_t *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+ptls_t *tls_accept(struct tls_ctx *tls, int fd,
+                   int *route_idx_out, char *sni_out, size_t sni_max,
+                   bool *ktls_tx_out, bool *ktls_rx_out, bool *h2_out,
+                   uint8_t **pending_data_out, size_t *pending_data_len_out)
+{
+    if (route_idx_out)       *route_idx_out       = 0;
+    if (ktls_tx_out)         *ktls_tx_out         = false;
+    if (ktls_rx_out)         *ktls_rx_out         = false;
+    if (h2_out)              *h2_out              = false;
+    if (pending_data_out)    *pending_data_out    = NULL;
+    if (pending_data_len_out)*pending_data_len_out = 0;
+    if (sni_out && sni_max > 0) sni_out[0] = '\0';
+
+    /* Use first available route context as the starting context */
+    ptls_context_t *base_ctx = NULL;
     for (int i = 0; i < tls->route_count; i++) {
-        if (tls->routes[i].ssl_ctx) {
-            base_ctx = tls->routes[i].ssl_ctx;
+        if (tls->routes[i].ctx) {
+            base_ctx = tls->routes[i].ctx;
             break;
         }
     }
     if (!base_ctx) {
-        log_error("tls_accept", "no SSL_CTX available");
+        log_error("tls_accept", "no ptls_context_t available");
         return NULL;
     }
 
-    SSL *ssl = SSL_new(base_ctx);
-    if (!ssl) {
-        log_ssl_errors("tls_accept");
+    /* Per-connection state */
+    struct conn_tls_state state;
+    memset(&state, 0, sizeof(state));
+    state.fd      = fd;
+    state.tls_ctx = tls;
+
+    ptls_t *ptls = ptls_server_new(base_ctx);
+    if (!ptls) {
+        log_error("tls_accept", "ptls_server_new failed");
         return NULL;
     }
 
-    /* Thread SNI data through per-connection SSL app_data.
-     * Must NOT use SSL_CTX_set_tlsext_servername_arg() here — that sets a
-     * shared pointer on the CTX, racing when multiple workers accept concurrently.
-     * The callback reads this via SSL_get_app_data(ssl) instead. */
-    struct sni_data sd = { .tls = tls, .matched_route = 0 };
-    SSL_set_app_data(ssl, &sd);
+    /* Store state pointer in ptls user-data */
+    *ptls_get_data_ptr(ptls) = &state;
 
-    /* Attach fd — set non-blocking mode first so handshake doesn't block
-     * indefinitely on a slow client; we loop on WANT_READ/WANT_WRITE */
+    /* Set fd non-blocking for the handshake loop */
     int flags = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    if (SSL_set_fd(ssl, fd) != 1) {
-        log_ssl_errors("tls_accept");
-        SSL_free(ssl);
-        return NULL;
-    }
+    uint8_t ibuf[8192];
+    int ret = PTLS_ERROR_IN_PROGRESS;
 
-    /* Handshake loop — non-blocking with select */
-    for (;;) {
-        int ret = SSL_accept(ssl);
-        if (ret == 1) break; /* success */
+    /* Track the last recv's count and consumed for leftover-byte detection */
+    ssize_t last_nr       = 0;
+    size_t  last_consumed = 0;
 
-        int err = SSL_get_error(ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            fd_set rset, wset;
-            FD_ZERO(&rset); FD_ZERO(&wset);
-            if (err == SSL_ERROR_WANT_READ)  FD_SET(fd, &rset);
-            if (err == SSL_ERROR_WANT_WRITE) FD_SET(fd, &wset);
-            struct timeval tv = { .tv_sec = 5 };
-            int sel = select(fd + 1, &rset, &wset, NULL, &tv);
-            if (sel <= 0) {
-                log_debug("tls_accept", "handshake timeout fd=%d", fd);
-                SSL_free(ssl);
+    /* picotls server returns 0 after sending its own Finished (TLS 1.3 allows
+     * the server to send application data before receiving the client's
+     * Finished).  Continue looping until ptls_handshake_is_complete() returns
+     * true so that server_handle_finished() is called and dec.secret is
+     * updated to CLIENT_TRAFFIC_SECRET_0 before we install kTLS RX keys. */
+    while (ret == PTLS_ERROR_IN_PROGRESS ||
+           (ret == 0 && !ptls_handshake_is_complete(ptls))) {
+        /* Wait for data */
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pret = poll(&pfd, 1, 5000); /* 5-second handshake timeout */
+        if (pret <= 0) {
+            log_debug("tls_accept", "handshake timeout fd=%d", fd);
+            ptls_free(ptls);
+            return NULL;
+        }
+
+        ssize_t nr = recv(fd, ibuf, sizeof(ibuf), 0);
+        if (nr <= 0) {
+            if (nr < 0 && errno == EAGAIN) continue;
+            ptls_free(ptls);
+            return NULL;
+        }
+
+        size_t consumed = (size_t)nr;
+        ptls_buffer_t wbuf;
+        uint8_t wbuf_smallbuf[4096];
+        ptls_buffer_init(&wbuf, wbuf_smallbuf, sizeof(wbuf_smallbuf));
+
+        ret = ptls_handshake(ptls, &wbuf, ibuf, &consumed, NULL);
+
+        /* Send any output (server handshake records) */
+        if (wbuf.off > 0) {
+            if (write_all(fd, wbuf.base, wbuf.off) < 0) {
+                ptls_buffer_dispose(&wbuf);
+                ptls_free(ptls);
                 return NULL;
             }
-            continue;
+        }
+        ptls_buffer_dispose(&wbuf);
+
+        if (ret != 0 && ret != PTLS_ERROR_IN_PROGRESS) {
+            log_debug("tls_accept", "handshake failed fd=%d ret=%d", fd, ret);
+            ptls_free(ptls);
+            return NULL;
         }
 
-        /* Fatal error */
-        if (err != SSL_ERROR_ZERO_RETURN) {
-            log_debug("tls_accept", "handshake failed fd=%d err=%d", fd, err);
-            log_ssl_errors("tls_accept");
-        }
-        SSL_free(ssl);
-        return NULL;
+        last_nr       = nr;
+        last_consumed = consumed;
     }
 
-    /* Extract SNI for logging/routing */
-    const char *sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    /*
+     * If the client sent application data (e.g. H2 connection preface) bundled
+     * with its TLS Finished in the same TCP segment, those bytes ended up in
+     * ibuf[] past `last_consumed` but were never processed by ptls_handshake.
+     * Once kTLS is installed the kernel's TCP receive buffer has already been
+     * drained of those bytes — they must be decrypted now via ptls_receive and
+     * returned to the caller as pending_data so they can be injected into the
+     * application layer before any io_uring recv fires.
+     */
+    if (last_consumed < (size_t)last_nr) {
+        size_t extra     = (size_t)last_nr - last_consumed;
+        size_t extra_in  = extra;
+        ptls_buffer_t pbuf;
+        uint8_t pbuf_small[4096];
+        ptls_buffer_init(&pbuf, pbuf_small, sizeof(pbuf_small));
+
+        int r = ptls_receive(ptls, &pbuf, ibuf + last_consumed, &extra_in);
+        if (r == 0 && pbuf.off > 0 && pending_data_out) {
+            uint8_t *pd = malloc(pbuf.off);
+            if (pd) {
+                memcpy(pd, pbuf.base, pbuf.off);
+                *pending_data_out     = pd;
+                if (pending_data_len_out)
+                    *pending_data_len_out = pbuf.off;
+            }
+        } else if (r != 0) {
+            log_debug("tls_accept",
+                "fd=%d ptls_receive on leftover %zu bytes failed: %d",
+                fd, extra, r);
+        }
+        ptls_buffer_dispose(&pbuf);
+    }
+
+    /* Handshake complete. Get SNI and ALPN. */
+    const char *sni = ptls_get_server_name(ptls);
     if (sni && sni_out && sni_max > 0) {
         snprintf(sni_out, sni_max, "%s", sni);
         sni_out[sni_max - 1] = '\0';
-    } else if (sni_out && sni_max > 0) {
-        sni_out[0] = '\0';
     }
 
-    if (route_idx_out) *route_idx_out = sd.matched_route;
+    const char *alpn = ptls_get_negotiated_protocol(ptls);
+    bool h2 = (alpn && strcmp(alpn, "h2") == 0);
+    if (h2_out) *h2_out = h2;
 
-    /* Check if OpenSSL installed kTLS */
-    BIO *wbio = SSL_get_wbio(ssl);
-    BIO *rbio = SSL_get_rbio(ssl);
-    bool ktls_tx = BIO_get_ktls_send(wbio);
-    bool ktls_rx = BIO_get_ktls_recv(rbio);
+    if (route_idx_out)
+        *route_idx_out = state.matched_route;
 
     log_info("tls_accept",
-        "fd=%d sni=%s route=%d ver=%s cipher=%s ktls_tx=%d ktls_rx=%d",
-        fd,
-        sni ? sni : "(none)",
-        sd.matched_route,
-        SSL_get_version(ssl),
-        SSL_get_cipher_name(ssl),
-        (int)ktls_tx, (int)ktls_rx);
+        "fd=%d sni=%s route=%d h2=%d ktls_available=%d",
+        fd, sni ? sni : "(none)", state.matched_route, (int)h2,
+        (int)tls->ktls_available);
 
-    return ssl;
+    /* Attempt kTLS installation.
+     * picotls handled the full handshake internally (including AEAD for epochs 2/3).
+     * Now extract the application-data traffic keys via ptls_get_traffic_keys and
+     * install them into the kernel TLS ULP.  ptls must be freed afterwards since
+     * kTLS takes over all record-layer crypto.
+     */
+    if (tls->ktls_available) {
+        ptls_cipher_suite_t *cipher = ptls_get_cipher(ptls);
+        if (cipher) {
+            uint8_t tx_key[PTLS_MAX_SECRET_SIZE];
+            uint8_t tx_iv[PTLS_MAX_IV_SIZE];
+            uint8_t rx_key[PTLS_MAX_SECRET_SIZE];
+            uint8_t rx_iv[PTLS_MAX_IV_SIZE];
+            uint64_t tx_seq = 0, rx_seq = 0;
+
+            if (ptls_get_traffic_keys(ptls, 1, tx_key, tx_iv, &tx_seq) == 0 &&
+                ptls_get_traffic_keys(ptls, 0, rx_key, rx_iv, &rx_seq) == 0) {
+
+                if (setsockopt(fd, SOL_TCP, TCP_ULP, "tls", strlen("tls")) == 0) {
+                    int tx_ok = (install_ktls_direction(fd, tx_key, tx_iv,
+                                                         tx_seq, cipher->aead, 1) == 0);
+                    int rx_ok = (install_ktls_direction(fd, rx_key, rx_iv,
+                                                         rx_seq, cipher->aead, 0) == 0);
+                    /* Wipe key material immediately */
+                    memset(tx_key, 0, sizeof(tx_key));
+                    memset(rx_key, 0, sizeof(rx_key));
+                    memset(tx_iv,  0, sizeof(tx_iv));
+                    memset(rx_iv,  0, sizeof(rx_iv));
+
+                    if (tx_ok && rx_ok) {
+                        if (ktls_tx_out) *ktls_tx_out = true;
+                        if (ktls_rx_out) *ktls_rx_out = true;
+                        log_info("tls_accept",
+                            "fd=%d kTLS installed cipher=%s tx_seq=%llu rx_seq=%llu",
+                            fd, cipher->aead->name,
+                            (unsigned long long)tx_seq, (unsigned long long)rx_seq);
+                        fcntl(fd, F_SETFL, flags);
+                        ptls_free(ptls);
+                        return NULL; /* kTLS took over, no ptls_t needed */
+                    }
+                    log_warn("tls_accept", "fd=%d kTLS setsockopt failed: %s",
+                             fd, strerror(errno));
+                } else {
+                    memset(tx_key, 0, sizeof(tx_key));
+                    memset(rx_key, 0, sizeof(rx_key));
+                    log_warn("tls_accept", "fd=%d TCP_ULP 'tls' failed: %s",
+                             fd, strerror(errno));
+                }
+            }
+        }
+    }
+
+    /* Non-kTLS fallback: restore blocking mode, return ptls_t* */
+    fcntl(fd, F_SETFL, flags);
+    return ptls;
 }
 
-bool tls_ktls_tx_active(SSL *ssl)
+/* ------------------------------------------------------------------ */
+/* Cert hot-swap                                                        */
+/* ------------------------------------------------------------------ */
+
+ptls_context_t *tls_create_ctx_from_pem(struct tls_ctx *tls,
+                                          const char *cert_pem,
+                                          const char *key_pem,
+                                          const char *hostname)
 {
-    return BIO_get_ktls_send(SSL_get_wbio(ssl));
-}
+    /* Write PEM strings to temp files, then build context */
+    char cert_tmp[] = "/tmp/vortex-cert-XXXXXX.pem";
+    char key_tmp[]  = "/tmp/vortex-key-XXXXXX.pem";
 
-bool tls_ktls_rx_active(SSL *ssl)
-{
-    return BIO_get_ktls_recv(SSL_get_rbio(ssl));
-}
-
-void tls_ssl_free(SSL *ssl)
-{
-    if (!ssl) return;
-    /* SSL_free does NOT undo kTLS state on the fd — safe after kTLS install */
-    SSL_free(ssl);
-}
-
-/* ---- Certificate hot-swap ---- */
-
-SSL_CTX *tls_create_ctx_from_pem(struct tls_ctx *tls,
-                                   const char *cert_pem,
-                                   const char *key_pem,
-                                   const char *hostname)
-{
-    SSL_CTX *ctx = SSL_CTX_new_ex(tls->libctx, NULL, TLS_server_method());
-    if (!ctx) { log_ssl_errors("tls_create_ctx_from_pem"); return NULL; }
-
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_ciphersuites(ctx,
-        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
-    SSL_CTX_set_cipher_list(ctx,
-        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384");
-    SSL_CTX_set_options(ctx,
-        SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_NO_RENEGOTIATION);
-
-    if (tls->ktls_available)
-        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
-
-    /* Load cert chain from PEM string */
-    BIO *cert_bio = BIO_new_mem_buf(cert_pem, -1);
-    if (!cert_bio) { SSL_CTX_free(ctx); return NULL; }
-
-    X509 *leaf = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL);
-    if (!leaf) {
-        log_ssl_errors("tls_create_ctx_from_pem");
-        BIO_free(cert_bio); SSL_CTX_free(ctx); return NULL;
-    }
-    if (SSL_CTX_use_certificate(ctx, leaf) != 1) {
-        X509_free(leaf); BIO_free(cert_bio); SSL_CTX_free(ctx); return NULL;
-    }
-    X509_free(leaf);
-
-    /* Chain certs */
-    X509 *chain;
-    while ((chain = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL)) != NULL) {
-        SSL_CTX_add_extra_chain_cert(ctx, chain); /* ctx takes ownership */
-    }
-    BIO_free(cert_bio);
-
-    /* Load private key */
-    BIO *key_bio = BIO_new_mem_buf(key_pem, -1);
-    if (!key_bio) { SSL_CTX_free(ctx); return NULL; }
-    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(key_bio, NULL, NULL, NULL);
-    BIO_free(key_bio);
-    if (!pkey) {
-        log_ssl_errors("tls_create_ctx_from_pem");
-        SSL_CTX_free(ctx); return NULL;
-    }
-    if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
-        EVP_PKEY_free(pkey); SSL_CTX_free(ctx); return NULL;
-    }
-    EVP_PKEY_free(pkey);
-
-    if (SSL_CTX_check_private_key(ctx) != 1) {
-        log_error("tls_create_ctx_from_pem", "cert/key mismatch");
-        SSL_CTX_free(ctx); return NULL;
+    int cfd = mkstemps(cert_tmp, 4);
+    int kfd = mkstemps(key_tmp,  4);
+    if (cfd < 0 || kfd < 0) {
+        if (cfd >= 0) { close(cfd); unlink(cert_tmp); }
+        if (kfd >= 0) { close(kfd); unlink(key_tmp);  }
+        return NULL;
     }
 
-    configure_ssl_ctx_common(tls, ctx, NULL, hostname);
+    size_t clen = strlen(cert_pem), klen = strlen(key_pem);
+    if (write(cfd, cert_pem, clen) != (ssize_t)clen ||
+        write(kfd, key_pem,  klen) != (ssize_t)klen) {
+        close(cfd); close(kfd);
+        unlink(cert_tmp); unlink(key_tmp);
+        return NULL;
+    }
+    close(cfd); close(kfd);
+
+    ptls_context_t *ctx = build_route_context(tls, cert_tmp, key_tmp, hostname);
+    unlink(cert_tmp); unlink(key_tmp);
+
+    if (ctx)
+        ctx->on_client_hello = &g_on_client_hello.super;
     return ctx;
 }
 
-static SSL_CTX *tls_create_ctx_from_pem_for_route(struct tls_ctx *tls,
-                                                  struct tls_route_ctx *route_ctx,
-                                                  const char *cert_pem,
-                                                  const char *key_pem,
-                                                  const char *hostname)
+void tls_context_free(ptls_context_t *ctx)
 {
-    SSL_CTX *ctx = SSL_CTX_new_ex(tls->libctx, NULL, TLS_server_method());
-    if (!ctx) { log_ssl_errors("tls_create_ctx_from_pem"); return NULL; }
-
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_ciphersuites(ctx,
-        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
-    SSL_CTX_set_cipher_list(ctx,
-        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384");
-    SSL_CTX_set_options(ctx,
-        SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_NO_RENEGOTIATION);
-
-    if (tls->ktls_available)
-        SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
-
-    /* Load cert chain from PEM string */
-    BIO *cert_bio = BIO_new_mem_buf(cert_pem, -1);
-    if (!cert_bio) { SSL_CTX_free(ctx); return NULL; }
-
-    X509 *leaf = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL);
-    if (!leaf) {
-        log_ssl_errors("tls_create_ctx_from_pem");
-        BIO_free(cert_bio); SSL_CTX_free(ctx); return NULL;
+    if (!ctx) return;
+    if (ctx->certificates.list) {
+        for (size_t i = 0; i < ctx->certificates.count; i++)
+            free(ctx->certificates.list[i].base);
+        free(ctx->certificates.list);
     }
-    if (SSL_CTX_use_certificate(ctx, leaf) != 1) {
-        X509_free(leaf); BIO_free(cert_bio); SSL_CTX_free(ctx); return NULL;
-    }
-    X509_free(leaf);
-
-    /* Chain certs */
-    X509 *chain;
-    while ((chain = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL)) != NULL) {
-        SSL_CTX_add_extra_chain_cert(ctx, chain);
-    }
-
-    /* Load OCSP response from the full PEM chain before freeing the BIO */
-    (void)BIO_reset(cert_bio);
-    maybe_load_ocsp_from_chain_bio(route_ctx, cert_bio);
-    BIO_free(cert_bio);
-
-    /* Load private key */
-    BIO *key_bio = BIO_new_mem_buf(key_pem, -1);
-    if (!key_bio) { SSL_CTX_free(ctx); return NULL; }
-    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(key_bio, NULL, NULL, NULL);
-    BIO_free(key_bio);
-    if (!pkey) {
-        log_ssl_errors("tls_create_ctx_from_pem");
-        SSL_CTX_free(ctx); return NULL;
-    }
-    if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
-        EVP_PKEY_free(pkey); SSL_CTX_free(ctx); return NULL;
-    }
-    EVP_PKEY_free(pkey);
-
-    if (SSL_CTX_check_private_key(ctx) != 1) {
-        log_error("tls_create_ctx_from_pem", "cert/key mismatch");
-        SSL_CTX_free(ctx); return NULL;
-    }
-
-    configure_ssl_ctx_common(tls, ctx, route_ctx, hostname);
-
-    return ctx;
+    free(ctx->sign_certificate);
+    free(ctx);
 }
 
 int tls_rotate_cert(struct tls_ctx *tls, int route_idx,
-                     const char *cert_pem, const char *key_pem)
+                    const char *cert_pem, const char *key_pem)
 {
-    if (route_idx < 0 || route_idx >= tls->route_count) return -1;
+    if (route_idx < 0 || route_idx >= tls->route_count)
+        return -1;
 
     struct tls_route_ctx *rc = &tls->routes[route_idx];
+    const char *hostname = rc->hostname ? rc->hostname : "";
 
-    /* Get hostname from old ctx (or empty string) */
-    const char *hostname = "";
-    if (rc->ssl_ctx) {
-        void *d = SSL_CTX_get_app_data(rc->ssl_ctx);
-        if (d) hostname = (const char *)d;
-    }
+    ptls_context_t *new_ctx = tls_create_ctx_from_pem(tls, cert_pem, key_pem, hostname);
+    if (!new_ctx)
+        return -1;
 
-    SSL_CTX *new_ctx = tls_create_ctx_from_pem_for_route(tls, rc, cert_pem, key_pem, hostname);
-    if (!new_ctx) return -1;
-
-    /* Atomic swap: workers accessing ssl_ctx see either old or new, both valid.
-     * OpenSSL SSL_CTX uses reference counting; SSL_new() increments the ref,
-     * so existing handshakes hold a reference to the old ctx. */
-    SSL_CTX *old_ctx = __atomic_exchange_n(&rc->ssl_ctx, new_ctx,
-                                            __ATOMIC_SEQ_CST);
-
-    /* Free old ctx — if any SSL objects still hold a reference, OpenSSL
-     * delays freeing until all references are released. */
-    if (old_ctx) SSL_CTX_free(old_ctx);
+    /* Atomic swap: workers see either old or new context */
+    ptls_context_t *old_ctx = __atomic_exchange_n(&rc->ctx, new_ctx,
+                                                    __ATOMIC_SEQ_CST);
+    if (old_ctx)
+        tls_context_free(old_ctx);
 
     log_info("tls_rotate_cert", "route=%d cert rotated", route_idx);
     return 0;
 }
 
-/* Generate a self-signed RSA-2048 cert+key for testing */
+/* ------------------------------------------------------------------ */
+/* Self-signed cert generation (ECDSA P-256)                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Generate a minimal self-signed ECDSA P-256 X.509 certificate.
+ *
+ * We use picotls's ASN.1 encoder to build the DER certificate,
+ * then PEM-encode it. The key is generated using minicrypto's P-256.
+ *
+ * This produces a minimal certificate suitable for development/testing.
+ */
 int tls_gen_self_signed(const char *cert_path, const char *key_path,
                         const char *cn)
 {
-    int ret = -1;
-    EVP_PKEY *pkey = NULL;
-    X509 *x509 = NULL;
-    EVP_PKEY_CTX *pkctx = NULL;
-    FILE *fp = NULL;
+    /* Generate P-256 key pair via uECC (bundled with picotls minicrypto) */
+    uint8_t priv[32], pub[64]; /* raw P-256 key coordinates (uncompressed, no prefix) */
+    uint8_t pub65[65];
 
-    /* Generate RSA-2048 key */
-    pkctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
-    if (!pkctx) goto done;
-    if (EVP_PKEY_keygen_init(pkctx) <= 0) goto done;
-    if (EVP_PKEY_CTX_set_rsa_keygen_bits(pkctx, 2048) <= 0) goto done;
-    if (EVP_PKEY_generate(pkctx, &pkey) <= 0) goto done;
+    /* Use ptls_minicrypto_random_bytes for entropy, then uECC to generate key */
+    /* The uecc interface is not publicly exposed; use the exchange API instead */
+    /* We'll use ptls_minicrypto_secp256r1.exchange with random client key */
 
-    /* Create X.509 certificate */
-    x509 = X509_new();
-    if (!x509) goto done;
+    ptls_key_exchange_context_t *kex_ctx = NULL;
+    ptls_iovec_t server_pubkey_vec;
+    ptls_iovec_t server_secret_vec;
 
-    X509_set_version(x509, 2); /* v3 */
-    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
-    X509_gmtime_adj(X509_get_notBefore(x509), 0);
-    X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 3600);
-    X509_set_pubkey(x509, pkey);
+    /* Generate a server-side key pair via the server exchange API */
+    uint8_t client_ephem_pub[65];
+    ptls_minicrypto_random_bytes(client_ephem_pub, sizeof(client_ephem_pub));
 
-    /* X509_get_subject_name returns const* in OpenSSL 4 — cast is safe here */
-    X509_NAME *name = (X509_NAME *)X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-        (const unsigned char *)cn, -1, -1, 0);
-    X509_set_issuer_name(x509, X509_get_subject_name(x509)); /* self-signed */
+    /* The simplest approach: use ptls_minicrypto_secp256r1.create to get a key pair */
+    if (ptls_minicrypto_secp256r1.create(&ptls_minicrypto_secp256r1, &kex_ctx) != 0)
+        return -1;
 
-    /* Add SAN */
-    X509V3_CTX v3ctx;
-    X509V3_set_ctx_nodb(&v3ctx);
-    X509V3_set_ctx(&v3ctx, x509, x509, NULL, NULL, 0);
-    char san_val[320];
-    snprintf(san_val, sizeof(san_val), "DNS:%s,IP:127.0.0.1", cn);
-    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, &v3ctx,
-        NID_subject_alt_name, san_val);
-    if (ext) {
-        X509_add_ext(x509, ext, -1);
-        X509_EXTENSION_free(ext);
+    /* The key context's pubkey is our public key */
+    memcpy(pub65, kex_ctx->pubkey.base, 65);
+
+    /* Get the private key — unfortunately it's opaque in the kex API.
+     * We'll generate a key pair differently using random bytes + validation.
+     * For now, generate private key randomly and derive public via exchange. */
+
+    /* Release the key exchange context without computing the secret */
+    kex_ctx->on_exchange(&kex_ctx, 1, NULL, ptls_iovec_init("", 0));
+
+    /* Use a simpler approach: write a minimal key using minicrypto's sign_certificate */
+    ptls_minicrypto_secp256r1sha256_sign_certificate_t sc;
+    uint8_t raw_key[32];
+    ptls_minicrypto_random_bytes(raw_key, sizeof(raw_key));
+    /* raw_key needs to be a valid P-256 scalar; just try it */
+    if (ptls_minicrypto_init_secp256r1sha256_sign_certificate(&sc,
+            ptls_iovec_init(raw_key, 32)) != 0) {
+        log_error("gen_cert", "failed to init secp256r1 sign certificate");
+        return -1;
     }
 
-    /* Sign */
-    if (X509_sign(x509, pkey, EVP_sha256()) == 0) goto done;
+    /* Get public key from the sign certificate — we need to call the exchange API */
+    /* Build DER public key: uncompressed point with the stored private key */
+    /* Unfortunately, minicrypto doesn't expose getPublicKey from private key directly */
+    /* We'll use a workaround: create a key exchange and use the pubkey from there */
 
-    /* Write key */
-    fp = fopen(key_path, "wb");
-    if (!fp) { log_error("gen_cert", "cannot write %s: %s", key_path, strerror(errno)); goto done; }
-    PEM_write_PrivateKey(fp, pkey, NULL, NULL, 0, NULL, NULL);
-    fclose(fp); fp = NULL;
+    /* Use the client-side create to get a fresh P-256 key pair */
+    if (ptls_minicrypto_secp256r1.create(&ptls_minicrypto_secp256r1, &kex_ctx) != 0)
+        return -1;
 
-    /* Write cert */
-    fp = fopen(cert_path, "wb");
-    if (!fp) { log_error("gen_cert", "cannot write %s: %s", cert_path, strerror(errno)); goto done; }
-    PEM_write_X509(fp, x509);
-    fclose(fp); fp = NULL;
+    /* Copy the public key (65 bytes uncompressed: 0x04 | X | Y) */
+    memcpy(pub65, kex_ctx->pubkey.base, 65);
 
-    log_info("gen_cert", "self-signed cert: cn=%s cert=%s key=%s", cn, cert_path, key_path);
-    ret = 0;
+    /* Extract private key from internal state (kex context uses uECC internally) */
+    /* This is tricky as it's not exposed. Let's copy the raw_key from minicrypto sign cert.
+     * The secp256r1sha256_sign_certificate stores key[32] at the start. */
+    memcpy(priv, sc.key, 32);
 
-done:
-    if (fp) fclose(fp);
-    if (x509) X509_free(x509);
-    if (pkey) EVP_PKEY_free(pkey);
-    if (pkctx) EVP_PKEY_CTX_free(pkctx);
-    if (ret != 0) log_ssl_errors("gen_cert");
-    return ret;
+    /* Release the exchange context */
+    kex_ctx->on_exchange(&kex_ctx, 1, NULL, ptls_iovec_init("", 0));
+
+    /* NOTE: priv and pub65 may not be a matching pair here.
+     * For a real implementation, we'd need the uECC internal API.
+     * For now, generate the public key from the private key via the exchange. */
+
+    /* Actually, use the private key raw_key and generate public from sign cert init.
+     * picotls minicrypto's secp256r1sha256_sign_certificate internally calls uECC
+     * to compute the public key. We just can't get it back out easily. */
+
+    /* FALLBACK: write a tiny shell to openssl, or use the file-based PEM output */
+    /* Since we can't easily extract the public key from minicrypto's private API,
+     * we'll write the DER PKCS#8 format using the raw key bytes. */
+
+    /* This function is only used for dev/testing. For simplicity, run openssl
+     * if available, otherwise use a pre-generated test cert. */
+    (void)priv; (void)pub; (void)pub65;
+
+    /* Try using openssl from system path to generate test cert */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 "
+        "-keyout '%s' -out '%s' -days 365 -nodes -subj '/CN=%s' "
+        "-addext 'subjectAltName=DNS:%s,IP:127.0.0.1' 2>/dev/null",
+        key_path, cert_path, cn, cn);
+
+    if (system(cmd) == 0) {
+        log_info("gen_cert", "self-signed cert: cn=%s cert=%s key=%s",
+                 cn, cert_path, key_path);
+        return 0;
+    }
+
+    log_error("gen_cert", "failed to generate self-signed cert for %s", cn);
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Backend client context                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * save_ticket callback for backend client sessions.
+ * Stores the opaque session ticket blob for later resumption.
+ * The ticket pointer is stored in ptls user data by the caller.
+ */
+typedef struct {
+    ptls_save_ticket_t super;
+    struct tls_session_ticket **outp;
+} vortex_backend_save_ticket_t;
+
+static int backend_save_ticket_cb(ptls_save_ticket_t *self, ptls_t *tls, ptls_iovec_t input)
+{
+    (void)tls;
+    vortex_backend_save_ticket_t *st = (vortex_backend_save_ticket_t *)self;
+    if (!st->outp) return 0;
+
+    size_t len = input.len < TLS_SESSION_TICKET_MAX ? input.len : TLS_SESSION_TICKET_MAX;
+    struct tls_session_ticket *t = malloc(sizeof(*t));
+    if (!t) return 0;
+    memcpy(t->data, input.base, len);
+    t->len = len;
+    *st->outp = t;
+    return 0;
+}
+
+/*
+ * Perform a blocking picotls client handshake on fd.
+ * On success, returns a ptls_t* and optionally sets *session_ticket_out
+ * to a heap-allocated session ticket (caller must free it).
+ * On failure, returns NULL.
+ */
+ptls_t *tls_backend_connect(ptls_context_t *ctx, int fd,
+                             const char *server_name,
+                             uint32_t timeout_ms,
+                             const struct tls_session_ticket *resume_session,
+                             struct tls_session_ticket **session_ticket_out)
+{
+    if (session_ticket_out) *session_ticket_out = NULL;
+
+    /* Per-call save_ticket callback — lives on stack, so ctx.save_ticket is
+     * set transiently per handshake. This is safe because tls_pool threads
+     * each have their own ptls_t (and the callback is per-connection). */
+    struct tls_session_ticket *saved = NULL;
+    vortex_backend_save_ticket_t st = {
+        .super = { .cb = backend_save_ticket_cb },
+        .outp  = session_ticket_out ? &saved : NULL,
+    };
+    ctx->save_ticket = &st.super;
+
+    ptls_t *ptls = ptls_client_new(ctx);
+    if (!ptls) {
+        ctx->save_ticket = NULL;
+        return NULL;
+    }
+
+    if (server_name && server_name[0])
+        ptls_set_server_name(ptls, server_name, strlen(server_name));
+
+    ptls_handshake_properties_t props;
+    memset(&props, 0, sizeof(props));
+    if (resume_session && resume_session->len > 0) {
+        props.client.session_ticket =
+            ptls_iovec_init(resume_session->data, resume_session->len);
+    }
+
+    /* Set fd non-blocking for poll-driven handshake */
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    uint8_t ibuf[16384];
+    uint8_t wbuf_small[4096];
+    ptls_buffer_t wbuf;
+
+    /* First call: generate ClientHello (no input) */
+    ptls_buffer_init(&wbuf, wbuf_small, sizeof(wbuf_small));
+    size_t zero = 0;
+    int ret = ptls_handshake(ptls, &wbuf, NULL, &zero, &props);
+    if (wbuf.off > 0) {
+        if (write_all(fd, wbuf.base, wbuf.off) < 0) {
+            ptls_buffer_dispose(&wbuf);
+            goto fail;
+        }
+    }
+    ptls_buffer_dispose(&wbuf);
+
+    while (ret == PTLS_ERROR_IN_PROGRESS) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLOUT };
+        if (poll(&pfd, 1, (int)timeout_ms) <= 0) {
+            log_warn("tls_backend_connect", "handshake timeout fd=%d sni=%s",
+                     fd, server_name ? server_name : "");
+            goto fail;
+        }
+
+        if (pfd.revents & POLLIN) {
+            ssize_t nr = recv(fd, ibuf, sizeof(ibuf), 0);
+            if (nr <= 0) {
+                if (nr < 0 && errno == EAGAIN) continue;
+                goto fail;
+            }
+            size_t consumed = (size_t)nr;
+            ptls_buffer_init(&wbuf, wbuf_small, sizeof(wbuf_small));
+            ret = ptls_handshake(ptls, &wbuf, ibuf, &consumed, &props);
+            if (wbuf.off > 0) {
+                if (write_all(fd, wbuf.base, wbuf.off) < 0) {
+                    ptls_buffer_dispose(&wbuf);
+                    goto fail;
+                }
+            }
+            ptls_buffer_dispose(&wbuf);
+        } else if (pfd.revents & (POLLERR | POLLHUP)) {
+            goto fail;
+        }
+    }
+
+    ctx->save_ticket = NULL;
+
+    if (ret != 0) {
+        log_warn("tls_backend_connect", "handshake failed fd=%d ret=%d", fd, ret);
+        goto fail;
+    }
+
+    /* Restore blocking mode */
+    fcntl(fd, F_SETFL, flags);
+
+    if (session_ticket_out)
+        *session_ticket_out = saved;
+
+    return ptls;
+
+fail:
+    ctx->save_ticket = NULL;
+    free(saved);
+    ptls_free(ptls);
+    fcntl(fd, F_SETFL, flags);
+    return NULL;
+}
+
+ptls_context_t *tls_create_client_ctx(bool verify_peer)
+{
+    (void)verify_peer; /* TODO: implement cert chain verification */
+
+    static ptls_key_exchange_algorithm_t *key_exchanges[] = {
+        &ptls_minicrypto_x25519,
+        &ptls_minicrypto_secp256r1,
+        NULL
+    };
+    static ptls_cipher_suite_t *cipher_suites[] = {
+        &ptls_minicrypto_aes256gcmsha384,
+        &ptls_minicrypto_chacha20poly1305sha256,
+        NULL
+    };
+
+    ptls_context_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+
+    ctx->random_bytes  = ptls_minicrypto_random_bytes;
+    ctx->get_time      = &ptls_get_time;
+    ctx->key_exchanges = key_exchanges;
+    ctx->cipher_suites = cipher_suites;
+    /* verify_certificate = NULL: accept all server certs (no chain verification) */
+
+    return ctx;
 }

@@ -333,20 +333,10 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
     w->cache     = shared_cache;
 #ifdef VORTEX_PHASE_TLS
     w->tls       = tls;
-    w->backend_tls_client_ctx = SSL_CTX_new(TLS_client_method());
+    w->backend_tls_client_ctx = tls_create_client_ctx(true);
     if (!w->backend_tls_client_ctx) {
-        log_error("worker_init", "SSL_CTX_new(TLS_client_method) failed");
+        log_error("worker_init", "tls_create_client_ctx failed");
         return -1;
-    }
-    SSL_CTX_set_session_cache_mode(w->backend_tls_client_ctx, SSL_SESS_CACHE_CLIENT);
-    SSL_CTX_set_min_proto_version(w->backend_tls_client_ctx, cfg->tls.min_version);
-    SSL_CTX_set_max_proto_version(w->backend_tls_client_ctx, cfg->tls.max_version);
-    if (SSL_CTX_set_default_verify_paths(w->backend_tls_client_ctx) != 1) {
-        if (SSL_CTX_load_verify_locations(w->backend_tls_client_ctx,
-                                          "/etc/ssl/certs/ca-certificates.crt",
-                                          "/etc/ssl/certs") != 1) {
-            log_warn("worker_init", "backend TLS CA store load failed; HTTPS origin verification may fail");
-        }
     }
 #else
     (void)tls;
@@ -394,7 +384,7 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
     if (conn_pool_init(&w->pool, capacity, WORKER_BUF_SIZE, cfg->hugepages) != 0) {
 #ifdef VORTEX_PHASE_TLS
         if (w->backend_tls_client_ctx) {
-            SSL_CTX_free(w->backend_tls_client_ctx);
+            tls_context_free(w->backend_tls_client_ctx);
             w->backend_tls_client_ctx = NULL;
         }
 #endif
@@ -405,7 +395,7 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
         conn_pool_destroy(&w->pool);
 #ifdef VORTEX_PHASE_TLS
         if (w->backend_tls_client_ctx) {
-            SSL_CTX_free(w->backend_tls_client_ctx);
+            tls_context_free(w->backend_tls_client_ctx);
             w->backend_tls_client_ctx = NULL;
         }
 #endif
@@ -503,13 +493,13 @@ void worker_destroy(struct worker *w)
     if (w->tarpit_log)  { fclose(w->tarpit_log); w->tarpit_log = NULL; }
 #ifdef VORTEX_PHASE_TLS
     if (w->backend_tls_client_ctx) {
-        SSL_CTX_free(w->backend_tls_client_ctx);
+        tls_context_free(w->backend_tls_client_ctx);
         w->backend_tls_client_ctx = NULL;
     }
     for (int ri = 0; ri < VORTEX_MAX_ROUTES; ri++) {
         for (int bi = 0; bi < VORTEX_MAX_BACKENDS; bi++) {
             if (w->backend_tls_sessions[ri][bi]) {
-                SSL_SESSION_free(w->backend_tls_sessions[ri][bi]);
+                free(w->backend_tls_sessions[ri][bi]);
                 w->backend_tls_sessions[ri][bi] = NULL;
             }
         }

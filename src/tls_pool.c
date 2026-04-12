@@ -1,54 +1,19 @@
 #include "tls_pool.h"
+#include "tls.h"
 #include "log.h"
 
+#include <picotls.h>
+
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509v3.h>
 
 struct tls_pool g_tls_pool;
 
 _Static_assert(sizeof(struct tls_handshake_result) <= 4096,
     "tls_handshake_result must fit in PIPE_BUF");
-
-static void log_pool_ssl_errors(const char *tag)
-{
-    unsigned long err;
-    while ((err = ERR_get_error()) != 0) {
-        char buf[256];
-        ERR_error_string_n(err, buf, sizeof(buf));
-        log_error(tag, "OpenSSL: %s", buf);
-    }
-}
-
-static int tls_pool_wait_io(int fd, bool want_read, uint32_t timeout_ms)
-{
-    struct pollfd pfd = {
-        .fd = fd,
-        .events = want_read ? POLLIN : POLLOUT,
-    };
-    return poll(&pfd, 1, (int)timeout_ms);
-}
-
-static const char *backend_job_server_name(const struct tls_handshake_job *job,
-                                           char *fallback, size_t fallback_sz)
-{
-    if (job->backend_sni[0])
-        return job->backend_sni;
-
-    const char *addr = job->backend_addr;
-    const char *colon = strrchr(addr, ':');
-    size_t host_len = colon ? (size_t)(colon - addr) : strlen(addr);
-    if (host_len >= fallback_sz)
-        host_len = fallback_sz - 1;
-    memcpy(fallback, addr, host_len);
-    fallback[host_len] = '\0';
-    return fallback;
-}
 
 static void *tls_pool_worker_thread(void *arg)
 {
@@ -80,115 +45,82 @@ static void *tls_pool_worker_thread(void *arg)
         if (job.kind == TLS_HANDSHAKE_FRONTEND) {
             char sni[256] = {0};
             int route_idx = 0;
-            SSL *ssl = tls_accept(job.tls, job.client_fd, &route_idx, sni, sizeof(sni));
+            bool ktls_tx = false, ktls_rx = false, h2 = false;
+            uint8_t *pending_data = NULL;
+            size_t   pending_data_len = 0;
 
-            if (!ssl) {
+            ptls_t *ptls = tls_accept(job.tls, job.client_fd,
+                                       &route_idx, sni, sizeof(sni),
+                                       &ktls_tx, &ktls_rx, &h2,
+                                       &pending_data, &pending_data_len);
+
+            if (!ptls && !ktls_tx) {
                 log_debug("tls_pool", "frontend handshake failed cid=%u fd=%d",
                           job.cid, job.client_fd);
+                free(pending_data);
             } else {
-                res.ok            = true;
-                res.tls_route_idx = route_idx;
-                res.tls_version   = SSL_version(ssl);
+                res.ok               = true;
+                res.tls_route_idx    = route_idx;
+                res.tls_version      = PTLS_PROTOCOL_VERSION_TLS13;
+                res.h2_negotiated    = h2;
+                res.ktls_tx          = ktls_tx;
+                res.ktls_rx          = ktls_rx;
+                res.ssl              = ptls; /* NULL if kTLS took over */
+                res.pending_data     = pending_data;
+                res.pending_data_len = (uint32_t)pending_data_len;
 
-                const uint8_t *alpn_proto;
-                unsigned int   alpn_len;
-                SSL_get0_alpn_selected(ssl, &alpn_proto, &alpn_len);
-                res.h2_negotiated = (alpn_len == 2 && memcmp(alpn_proto, "h2", 2) == 0);
-                if (res.h2_negotiated)
-                    log_debug("tls_pool", "ALPN=h2 cid=%u", job.cid);
-
-                if (tls_ktls_tx_active(ssl) && tls_ktls_rx_active(ssl)) {
-                    res.ktls_tx = true;
-                    res.ktls_rx = true;
-                    res.ssl     = NULL;
-                    tls_ssl_free(ssl);
-                } else {
-                    res.ssl = ssl;
+                if (!ktls_tx) {
+                    /* Restore blocking mode for non-kTLS path */
+                    int flags = fcntl(job.client_fd, F_GETFL);
+                    fcntl(job.client_fd, F_SETFL, flags & ~O_NONBLOCK);
                 }
-
-                int flags = fcntl(job.client_fd, F_GETFL);
-                fcntl(job.client_fd, F_SETFL, flags & ~O_NONBLOCK);
             }
         } else {
-            SSL *ssl;
+            /* TLS_HANDSHAKE_BACKEND */
             char sni_buf[256];
             const char *server_name;
 
-            ssl = SSL_new(job.backend_tls_client_ctx);
-            if (!ssl) {
-                log_pool_ssl_errors("backend_tls_new");
-            } else if (SSL_set_fd(ssl, job.client_fd) != 1) {
-                log_pool_ssl_errors("backend_tls_set_fd");
-                SSL_free(ssl);
+            if (job.backend_sni[0]) {
+                server_name = job.backend_sni;
             } else {
-                server_name = backend_job_server_name(&job, sni_buf, sizeof(sni_buf));
-                if (job.resume_session) {
-                    if (SSL_set_session(ssl, job.resume_session) != 1)
-                        log_pool_ssl_errors("backend_tls_set_session");
-                    SSL_SESSION_free(job.resume_session);
-                    job.resume_session = NULL;
-                }
+                const char *addr = job.backend_addr;
+                const char *colon = strrchr(addr, ':');
+                size_t host_len = colon ? (size_t)(colon - addr) : strlen(addr);
+                if (host_len >= sizeof(sni_buf))
+                    host_len = sizeof(sni_buf) - 1;
+                memcpy(sni_buf, addr, host_len);
+                sni_buf[host_len] = '\0';
+                server_name = sni_buf;
+            }
 
-                if (server_name[0]) {
-                    SSL_set_tlsext_host_name(ssl, server_name);
-                    if (job.verify_peer || !job.verify_peer_set) {
-                        if (SSL_set1_host(ssl, server_name) != 1) {
-                            log_pool_ssl_errors("backend_tls_set_host");
-                            SSL_free(ssl);
-                            ssl = NULL;
-                        }
-                    }
-                }
+            struct tls_session_ticket *new_ticket = NULL;
+            ptls_t *ptls = tls_backend_connect(
+                job.backend_tls_client_ctx,
+                job.client_fd,
+                server_name,
+                job.timeout_ms ? job.timeout_ms : 30000,
+                job.resume_session,
+                &new_ticket);
 
-                if (ssl) {
-                    SSL_set_verify(ssl,
-                        (job.verify_peer || !job.verify_peer_set) ? SSL_VERIFY_PEER : SSL_VERIFY_NONE,
-                        NULL);
+            if (job.resume_session) {
+                free(job.resume_session);
+                job.resume_session = NULL;
+            }
 
-                    ERR_clear_error();
-                    for (;;) {
-                        int ret = SSL_connect(ssl);
-                        if (ret == 1)
-                            break;
-                        {
-                            int err = SSL_get_error(ssl, ret);
-                            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                                int sel = tls_pool_wait_io(job.client_fd, err == SSL_ERROR_WANT_READ,
-                                                           job.timeout_ms);
-                                if (sel > 0)
-                                    continue;
-                                log_warn("backend_tls_handshake",
-                                         "conn=%u fd=%d wait timeout/error during SSL_connect",
-                                         job.cid, job.client_fd);
-                            } else {
-                                log_pool_ssl_errors("backend_tls_handshake");
-                            }
-                        }
-                        SSL_free(ssl);
-                        ssl = NULL;
-                        break;
-                    }
-                }
-
-                if (ssl && (job.verify_peer || !job.verify_peer_set) &&
-                    SSL_get_verify_result(ssl) != X509_V_OK) {
-                    log_warn("backend_tls_handshake", "conn=%u certificate verification failed",
-                             job.cid);
-                    SSL_free(ssl);
-                    ssl = NULL;
-                }
-
-                if (ssl) {
-                    res.ok = true;
-                    res.ssl = ssl;
-                    res.backend_session = SSL_get1_session(ssl);
-                }
+            if (ptls) {
+                res.ok             = true;
+                res.ssl            = ptls;
+                res.backend_session = new_ticket;
+            } else {
+                free(new_ticket);
+                log_warn("tls_pool", "backend handshake failed cid=%u fd=%d sni=%s",
+                         job.cid, job.client_fd, server_name);
             }
         }
 
+        /* Free any unconsumed resume_session (error paths) */
         if (job.resume_session) {
-            SSL_SESSION_free(job.resume_session);
-            job.resume_session = NULL;
+            free(job.resume_session);
         }
 
         /* Push result to the per-worker MPSC ring, then send a 1-byte wakeup.
@@ -208,14 +140,13 @@ static void *tls_pool_worker_thread(void *arg)
             if (wr != 1)
                 log_error("tls_pool", "wakeup pipe write failed cid=%u", job.cid);
         } else {
-            /* Fallback: write full struct to pipe (old path, should not occur) */
+            /* Fallback: write full struct to pipe (should not occur) */
             ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
             if (wr != (ssize_t)sizeof(res)) {
                 log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
                 if (res.ssl && !res.ktls_tx)
-                    SSL_free(res.ssl);
-                if (res.backend_session)
-                    SSL_SESSION_free(res.backend_session);
+                    ptls_free(res.ssl);
+                free(res.backend_session);
             }
         }
 
@@ -257,6 +188,7 @@ void tls_pool_destroy(void)
         g_tls_pool.head = (g_tls_pool.head + 1) % TLS_POOL_QUEUE;
         g_tls_pool.count--;
         close(job.client_fd);
+        free(job.resume_session);
     }
     pthread_cond_broadcast(&g_tls_pool.cv);
     pthread_mutex_unlock(&g_tls_pool.mu);

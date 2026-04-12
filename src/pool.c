@@ -26,7 +26,7 @@ void global_pool_destroy(void)
                     close(p->conns[i].fd);
 #ifdef VORTEX_PHASE_TLS
                     if (p->conns[i].ssl)
-                        SSL_free((SSL *)p->conns[i].ssl);
+                        ptls_free((ptls_t *)p->conns[i].ssl);
 #endif
                     p->conns[i].fd = -1;
                     p->conns[i].ssl = NULL;

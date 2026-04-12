@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #ifdef VORTEX_PHASE_TLS
-#include <openssl/ssl.h>
+#include <picotls.h>
 #endif
 #include "config.h"
 
@@ -74,7 +74,7 @@ static inline void global_pool_put(int ri, int bi, struct global_backend_conn co
         close(conn.fd);
 #ifdef VORTEX_PHASE_TLS
         if (conn.ssl)
-            SSL_free((SSL *)conn.ssl);
+            ptls_free((ptls_t *)conn.ssl);
 #endif
     }
 }

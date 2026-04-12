@@ -9,34 +9,14 @@
 #include "worker_internal.h"
 
 #ifdef VORTEX_PHASE_TLS
-#include <poll.h>
-#include <openssl/err.h>
-#include <openssl/x509v3.h>
-
-static void log_backend_ssl_errors(const char *tag)
-{
-    unsigned long err;
-    while ((err = ERR_get_error()) != 0) {
-        char buf[256];
-        ERR_error_string_n(err, buf, sizeof(buf));
-        log_error(tag, "OpenSSL: %s", buf);
-    }
-}
+#include <picotls.h>
+#include <stdlib.h>
 
 static uint32_t backend_timeout_ms_for(struct worker *w, uint32_t cid)
 {
     struct conn_hot *h = conn_hot(&w->pool, cid);
     uint32_t tmo_ms = w->cfg->routes[h->route_idx].backend_timeout_ms;
     return tmo_ms ? tmo_ms : 30000;
-}
-
-static int backend_ssl_wait(int fd, bool want_read, uint32_t timeout_ms)
-{
-    struct pollfd pfd = {
-        .fd = fd,
-        .events = want_read ? POLLIN : POLLOUT,
-    };
-    return poll(&pfd, 1, (int)timeout_ms);
 }
 
 static const char *backend_server_name(const struct backend_config *bcfg,
@@ -68,8 +48,6 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
 #ifdef VORTEX_PHASE_TLS
     struct conn_hot *h = conn_hot(&w->pool, cid);
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-    SSL_SESSION *cached_session = NULL;
-    SSL *ssl;
     char sni_buf[256];
     const char *server_name;
     uint32_t timeout_ms;
@@ -79,80 +57,32 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
     if (!w->backend_tls_client_ctx || h->backend_fd < 0)
         return -1;
 
-    ssl = SSL_new(w->backend_tls_client_ctx);
-    if (!ssl) {
-        log_backend_ssl_errors("backend_tls_new");
-        return -1;
-    }
-    if (SSL_set_fd(ssl, h->backend_fd) != 1) {
-        log_backend_ssl_errors("backend_tls_set_fd");
-        SSL_free(ssl);
-        return -1;
-    }
-
-    if (h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS)
-        cached_session = w->backend_tls_sessions[h->route_idx][h->backend_idx];
-    if (cached_session) {
-        if (SSL_set_session(ssl, cached_session) != 1)
-            log_backend_ssl_errors("backend_tls_set_session");
-    }
-
     server_name = backend_server_name(bcfg, sni_buf, sizeof(sni_buf));
-    if (server_name[0]) {
-        SSL_set_tlsext_host_name(ssl, server_name);
-        if (bcfg->verify_peer || !bcfg->verify_peer_set) {
-            if (SSL_set1_host(ssl, server_name) != 1) {
-                log_backend_ssl_errors("backend_tls_set_host");
-                SSL_free(ssl);
-                return -1;
-            }
-        }
-    }
+    timeout_ms  = backend_timeout_ms_for(w, cid);
 
-    SSL_set_verify(ssl,
-        (bcfg->verify_peer || !bcfg->verify_peer_set) ? SSL_VERIFY_PEER : SSL_VERIFY_NONE,
-        NULL);
+    struct tls_session_ticket *resume = NULL;
+    if (h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS)
+        resume = w->backend_tls_sessions[h->route_idx][h->backend_idx];
 
-    timeout_ms = backend_timeout_ms_for(w, cid);
-    ERR_clear_error();
-    for (;;) {
-        int ret = SSL_connect(ssl);
-        if (ret == 1)
-            break;
-        {
-            int err = SSL_get_error(ssl, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
-                if (sel > 0)
-                    continue;
-                log_warn("backend_tls_handshake",
-                         "conn=%u fd=%d wait timeout/error during SSL_connect", cid, h->backend_fd);
-            } else {
-                log_backend_ssl_errors("backend_tls_handshake");
-            }
-        }
-        SSL_free(ssl);
+    struct tls_session_ticket *new_ticket = NULL;
+    ptls_t *ptls = tls_backend_connect(w->backend_tls_client_ctx,
+                                        h->backend_fd,
+                                        server_name,
+                                        timeout_ms,
+                                        resume,
+                                        &new_ticket);
+    if (!ptls)
         return -1;
+
+    if (new_ticket && h->route_idx < VORTEX_MAX_ROUTES &&
+        h->backend_idx < VORTEX_MAX_BACKENDS) {
+        free(w->backend_tls_sessions[h->route_idx][h->backend_idx]);
+        w->backend_tls_sessions[h->route_idx][h->backend_idx] = new_ticket;
+    } else {
+        free(new_ticket);
     }
 
-    if ((bcfg->verify_peer || !bcfg->verify_peer_set) &&
-        SSL_get_verify_result(ssl) != X509_V_OK) {
-        log_warn("backend_tls_handshake", "conn=%u certificate verification failed", cid);
-        SSL_free(ssl);
-        return -1;
-    }
-
-    if (h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS) {
-        SSL_SESSION *new_session = SSL_get1_session(ssl);
-        if (new_session) {
-            SSL_SESSION *old_session = w->backend_tls_sessions[h->route_idx][h->backend_idx];
-            w->backend_tls_sessions[h->route_idx][h->backend_idx] = new_session;
-            if (old_session)
-                SSL_SESSION_free(old_session);
-        }
-    }
-
-    cold->backend_ssl = ssl;
+    cold->backend_ssl = ptls;
     h->flags |= CONN_FLAG_BACKEND_TLS;
     h->flags &= ~CONN_FLAG_BACKEND_POOLED;
     return 0;
@@ -167,35 +97,37 @@ int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, siz
 #ifdef VORTEX_PHASE_TLS
     struct conn_hot *h = conn_hot(&w->pool, cid);
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-    SSL *ssl = (SSL *)cold->backend_ssl;
-    uint32_t timeout_ms = backend_timeout_ms_for(w, cid);
-    size_t off = 0;
+    ptls_t *ptls = (ptls_t *)cold->backend_ssl;
 
-    if (!ssl)
+    if (!ptls)
         return -1;
 
-    while (off < len) {
-        int ret;
-        ERR_clear_error();
-        ret = SSL_write(ssl, buf + off, (int)(len - off));
-        if (ret > 0) {
-            off += (size_t)ret;
-            continue;
-        }
-        {
-            int err = SSL_get_error(ssl, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
-                if (sel > 0)
-                    continue;
-                log_warn("backend_tls_send", "conn=%u fd=%d wait timeout/error", cid, h->backend_fd);
-            } else {
-                log_backend_ssl_errors("backend_tls_send");
-            }
-        }
+    /* ptls_send encrypts and writes to a buffer; we then write to socket */
+    uint8_t wbuf_small[16384];
+    ptls_buffer_t wbuf;
+    ptls_buffer_init(&wbuf, wbuf_small, sizeof(wbuf_small));
+
+    int ret = ptls_send(ptls, &wbuf, buf, len);
+    if (ret != 0) {
+        ptls_buffer_dispose(&wbuf);
+        log_warn("backend_tls_send", "conn=%u ptls_send failed ret=%d", cid, ret);
         return -1;
     }
-    return (int)off;
+
+    /* Blocking write — backend socket is in blocking mode */
+    size_t off = 0;
+    while (off < wbuf.off) {
+        ssize_t n = write(h->backend_fd, wbuf.base + off, wbuf.off - off);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            ptls_buffer_dispose(&wbuf);
+            log_warn("backend_tls_send", "conn=%u write failed: %s", cid, strerror(errno));
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    ptls_buffer_dispose(&wbuf);
+    return (int)len;
 #else
     (void)w; (void)cid; (void)buf; (void)len;
     return -1;
@@ -207,45 +139,39 @@ int backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t l
 #ifdef VORTEX_PHASE_TLS
     struct conn_hot *h = conn_hot(&w->pool, cid);
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-    SSL *ssl = (SSL *)cold->backend_ssl;
-    uint32_t timeout_ms = backend_timeout_ms_for(w, cid);
+    ptls_t *ptls = (ptls_t *)cold->backend_ssl;
 
-    if (!ssl)
+    if (!ptls)
         return -1;
 
-    for (;;) {
-        int ret;
-        ERR_clear_error();
-        ret = SSL_read(ssl, buf, (int)len);
-        if (ret > 0)
-            return ret;
-        if (ret == 0) {
-            int err = SSL_get_error(ssl, ret);
-            if (err == SSL_ERROR_ZERO_RETURN)
-                return 0;
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
-                if (sel > 0)
-                    continue;
-                log_warn("backend_tls_recv", "conn=%u fd=%d wait timeout/error", cid, h->backend_fd);
-            } else {
-                log_backend_ssl_errors("backend_tls_recv");
-            }
-            return -1;
-        }
-        {
-            int err = SSL_get_error(ssl, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                int sel = backend_ssl_wait(h->backend_fd, err == SSL_ERROR_WANT_READ, timeout_ms);
-                if (sel > 0)
-                    continue;
-                log_warn("backend_tls_recv", "conn=%u fd=%d wait timeout/error", cid, h->backend_fd);
-            } else {
-                log_backend_ssl_errors("backend_tls_recv");
-            }
-        }
+    /* Read encrypted data from the backend socket */
+    uint8_t ibuf[16384];
+    ssize_t nr = recv(h->backend_fd, ibuf, sizeof(ibuf), 0);
+    if (nr < 0) {
+        if (errno == EINTR || errno == EAGAIN) return 0;
         return -1;
     }
+    if (nr == 0)
+        return 0; /* EOF */
+
+    /* Decrypt via picotls */
+    ptls_buffer_t plainbuf;
+    uint8_t plainbuf_small[16384];
+    ptls_buffer_init(&plainbuf, plainbuf_small, sizeof(plainbuf_small));
+
+    size_t consumed = (size_t)nr;
+    int ret = ptls_receive(ptls, &plainbuf, ibuf, &consumed);
+    if (ret != 0 && ret != PTLS_ERROR_IN_PROGRESS) {
+        ptls_buffer_dispose(&plainbuf);
+        log_warn("backend_tls_recv", "conn=%u ptls_receive failed ret=%d", cid, ret);
+        return -1;
+    }
+
+    size_t out_len = plainbuf.off < len ? plainbuf.off : len;
+    if (out_len > 0)
+        memcpy(buf, plainbuf.base, out_len);
+    ptls_buffer_dispose(&plainbuf);
+    return (int)out_len;
 #else
     (void)w; (void)cid; (void)buf; (void)len;
     return -1;

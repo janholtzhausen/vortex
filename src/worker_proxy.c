@@ -384,7 +384,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
         /* Backend closed the connection — never return to pool */
         if (cold_main->backend_ssl) {
 #ifdef VORTEX_PHASE_TLS
-            SSL_free((SSL *)cold_main->backend_ssl);
+            ptls_free((ptls_t *)cold_main->backend_ssl);
 #endif
             cold_main->backend_ssl = NULL;
         }
@@ -912,9 +912,8 @@ static void process_tls_result(struct worker *w,
     if (th->state == CONN_STATE_FREE) {
         if (res->kind == TLS_HANDSHAKE_BACKEND) {
             if (res->ssl)
-                SSL_free(res->ssl);
-            if (res->backend_session)
-                SSL_SESSION_free(res->backend_session);
+                ptls_free(res->ssl);
+            free(res->backend_session);
         }
         return;
     }
@@ -926,12 +925,12 @@ static void process_tls_result(struct worker *w,
         }
         if (res->backend_session &&
             th->route_idx < VORTEX_MAX_ROUTES && th->backend_idx < VORTEX_MAX_BACKENDS) {
-            SSL_SESSION *old = w->backend_tls_sessions[th->route_idx][th->backend_idx];
+            struct tls_session_ticket *old =
+                w->backend_tls_sessions[th->route_idx][th->backend_idx];
             w->backend_tls_sessions[th->route_idx][th->backend_idx] = res->backend_session;
-            if (old)
-                SSL_SESSION_free(old);
+            free(old);
         } else if (res->backend_session) {
-            SSL_SESSION_free(res->backend_session);
+            free(res->backend_session);
         }
         conn_cold_ptr(&w->pool, hcid)->backend_ssl = res->ssl;
         th->flags |= CONN_FLAG_BACKEND_TLS;
@@ -940,11 +939,12 @@ static void process_tls_result(struct worker *w,
         return;
     }
     if (!res->ok) {
+        free(res->pending_data);
         close(res->client_fd);
         conn_free(&w->pool, hcid);
         return;
     }
-    if (res->tls_version == TLS1_3_VERSION) w->tls13_count++;
+    if (res->tls_version == PTLS_PROTOCOL_VERSION_TLS13) w->tls13_count++;
     else w->tls12_count++;
     if (res->ktls_tx && res->ktls_rx) {
         th->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
@@ -961,9 +961,21 @@ static void process_tls_result(struct worker *w,
         th->last_active_tsc = rdtsc();
         w->accepted++;
         if (h2_session_init(w, hcid) != 0) {
+            free(res->pending_data);
             close(res->client_fd);
             conn_free(&w->pool, hcid);
             return;
+        }
+        /* Inject pre-decrypted data that arrived bundled with the TLS Finished.
+         * H2 clients (Chromium, curl) send the connection preface immediately
+         * after the handshake — it often lands in the same recv() as the TLS
+         * Finished and would be lost once kTLS takes over the socket. */
+        if (res->pending_data && res->pending_data_len > 0) {
+            bool ok = h2_inject_predata(w, hcid,
+                                        res->pending_data, res->pending_data_len);
+            free(res->pending_data);
+            if (!ok)
+                return;
         }
         struct io_uring_sqe *h2sq = io_uring_get_sqe(&w->uring.ring);
         if (!h2sq) { conn_close(w, hcid, true); return; }
@@ -982,6 +994,7 @@ static void process_tls_result(struct worker *w,
         return;
     }
 #endif
+    free(res->pending_data); /* non-H2: free any pending data (shouldn't occur) */
     {
         int route_idx = res->tls_route_idx;
         if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
@@ -1111,10 +1124,12 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
         }
         /* Fallback (no pipe): blocking path — should not normally happen */
         char sni_fb[256] = {0};
-        SSL *ssl_fb = tls_accept(w->tls, client_fd, &tls_route_idx, sni_fb, sizeof(sni_fb));
-        if (!ssl_fb) { close(client_fd); conn_free(&w->pool, new_cid); return; }
-        if (SSL_version(ssl_fb) == TLS1_3_VERSION) w->tls13_count++; else w->tls12_count++;
-        if (tls_ktls_tx_active(ssl_fb) && tls_ktls_rx_active(ssl_fb)) {
+        bool ktls_tx_fb = false, ktls_rx_fb = false, h2_fb = false;
+        ptls_t *ssl_fb = tls_accept(w->tls, client_fd, &tls_route_idx, sni_fb, sizeof(sni_fb),
+                                     &ktls_tx_fb, &ktls_rx_fb, &h2_fb, NULL, NULL);
+        if (!ssl_fb && !ktls_tx_fb) { close(client_fd); conn_free(&w->pool, new_cid); return; }
+        w->tls13_count++;
+        if (ktls_tx_fb && ktls_rx_fb) {
             nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
             tls_ssl_free(ssl_fb); nh->ssl = NULL; w->ktls_count++;
         } else { nh->ssl = ssl_fb; }
@@ -1255,11 +1270,15 @@ static void handle_error(struct worker *w, struct io_uring_cqe *cqe, uint32_t ci
     bool is_error = true;
     if (cqe->res == -ECONNRESET || cqe->res == -EPIPE ||
         cqe->res == -EBADF     || cqe->res == -ECANCELED ||
-        cqe->res == -EIO       || cqe->res == -ENOBUFS) {
+        cqe->res == -EIO       || cqe->res == -ENOBUFS ||
+        cqe->res == -EBADMSG) {
         if (cqe->res == -ENOBUFS)
             log_warn("recv_ring",
                 "conn=%u op=%u recv buf ring exhausted — closing connection",
                 cid, op);
+        else
+            log_debug("proxy_err", "conn=%u op=%u err=%s",
+                      cid, op, strerror(-cqe->res));
         is_error = false; /* expected close conditions */
     } else {
         log_debug("proxy_err", "conn=%u op=%u err=%s", cid, op, strerror(-cqe->res));
@@ -2013,6 +2032,7 @@ static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t 
         return;
     }
     log_debug("connect_cqe", "conn=%u backend_fd=%d connected", cid, h->backend_fd);
+#ifdef VORTEX_PHASE_TLS
     if (bcfg->tls) {
         if (w->tls_done_pipe_wr >= 0) {
             struct tls_handshake_job job = {
@@ -2030,12 +2050,17 @@ static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t 
             snprintf(job.backend_addr, sizeof(job.backend_addr), "%s", bcfg->address);
             snprintf(job.backend_sni, sizeof(job.backend_sni), "%s", bcfg->sni);
             if (w->backend_tls_sessions[h->route_idx][h->backend_idx]) {
-                job.resume_session = w->backend_tls_sessions[h->route_idx][h->backend_idx];
-                SSL_SESSION_up_ref(job.resume_session);
+                /* Duplicate the session ticket for the pool thread to consume */
+                struct tls_session_ticket *src =
+                    w->backend_tls_sessions[h->route_idx][h->backend_idx];
+                struct tls_session_ticket *dup = malloc(sizeof(*dup));
+                if (dup) {
+                    memcpy(dup, src, sizeof(*dup));
+                    job.resume_session = dup;
+                }
             }
             if (!tls_pool_submit(job)) {
-                if (job.resume_session)
-                    SSL_SESSION_free(job.resume_session);
+                free(job.resume_session);
                 log_warn("connect_cqe", "conn=%u backend TLS handshake submit failed", cid);
                 send_bad_gateway_and_close(w, cid);
                 return;
@@ -2049,6 +2074,7 @@ static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t 
             return;
         }
     }
+#endif
 
     resume_connected_backend(w, cid, h);
 }

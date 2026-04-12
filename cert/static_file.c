@@ -8,12 +8,6 @@
 #include <errno.h>
 #include <time.h>
 
-#ifdef VORTEX_PHASE_TLS
-#include <openssl/bio.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <openssl/err.h>
-#endif
 
 /* Per-route paths stashed in provider_ctx */
 struct static_ctx {
@@ -52,24 +46,11 @@ static char *read_file(const char *path)
 
 static time_t pem_not_after(const char *cert_pem)
 {
-#ifdef VORTEX_PHASE_TLS
-    BIO *bio = BIO_new_mem_buf(cert_pem, -1);
-    if (!bio) return 0;
-    X509 *x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    if (!x509) return 0;
-
-    const ASN1_TIME *na = X509_get0_notAfter(x509);
-    struct tm tm_val;
-    memset(&tm_val, 0, sizeof(tm_val));
-    ASN1_TIME_to_tm(na, &tm_val);
-    time_t t = timegm(&tm_val);
-    X509_free(x509);
-    return t;
-#else
+    /* Certificate expiry parsing requires an X.509 library.
+     * Until picotls-based cert parsing is implemented, return 0
+     * (renewal will fall back to time-based rotation). */
     (void)cert_pem;
     return 0;
-#endif
 }
 
 /* ---- provider interface ---- */
