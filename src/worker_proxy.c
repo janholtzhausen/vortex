@@ -994,12 +994,44 @@ static void process_tls_result(struct worker *w,
         return;
     }
 #endif
-    free(res->pending_data); /* non-H2: free any pending data (shouldn't occur) */
     {
         int route_idx = res->tls_route_idx;
         if (w->cfg->route_count > 0 && route_idx < w->cfg->route_count) {
             if (w->cfg->routes[route_idx].route_type == ROUTE_TYPE_TCP_TUNNEL)
                 th->flags |= CONN_FLAG_TCP_TUNNEL;
+        }
+        /* HTTP/1.1 + kTLS: client may have sent its first request bundled with
+         * the TLS Finished in the same TCP segment.  picotls drained it from the
+         * socket and decrypted it into pending_data (kTLS rx_seq already
+         * advanced past that record).  We copy it into recv_buf and use the
+         * has_pending_data=true path so route_and_connect skips arming a recv
+         * SQE — the data is already here, not in the kernel receive buffer. */
+        bool has_pre = !(th->flags & CONN_FLAG_TCP_TUNNEL) &&
+                       res->pending_data && res->pending_data_len > 0;
+        if (has_pre) {
+            uint8_t *rbuf = conn_recv_buf(&w->pool, hcid);
+            size_t copy_len = res->pending_data_len;
+            if (copy_len > w->pool.buf_size)
+                copy_len = w->pool.buf_size;
+            memcpy(rbuf, res->pending_data, copy_len);
+            th->send_buf_len = (uint32_t)copy_len;
+            free(res->pending_data);
+            w->accepted++;
+            th->last_active_tsc = rdtsc();
+            if (route_idx >= 0 && route_idx < w->cfg->route_count) {
+                if (route_and_connect(w, hcid, route_idx, true) < 0)
+                    return;
+                if (th->flags & CONN_FLAG_BACKEND_CONNECTING)
+                    return;
+                if (th->backend_fd >= 0)
+                    resume_connected_backend(w, hcid, th);
+                else
+                    send_bad_gateway_and_close(w, hcid);
+            }
+            return;
+        }
+        free(res->pending_data);
+        if (route_idx >= 0 && route_idx < w->cfg->route_count) {
             if (route_and_connect(w, hcid, route_idx, false) < 0)
                 return;
             if (th->flags & CONN_FLAG_BACKEND_CONNECTING)
@@ -1935,30 +1967,123 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
     h->state = CONN_STATE_PROXYING;
 
     if (h->send_buf_len > 0) {
-        /* Reconnect case: request already buffered in recv_buf.
-         * Strip the Authorization header (security) then forward. */
+        /* TLS early-data / reconnect: request already buffered in recv_buf.
+         * Apply full header rewrite pipeline (matches handle_recv_client). */
         uint32_t saved_n = h->send_buf_len;
         h->send_buf_len = 0;
         uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
         int fwd_n = (int)saved_n;
 
+        /* Proxy auth check — must run before Authorization is stripped */
+        {
+            const struct route_config *rc = &w->cfg->routes[h->route_idx];
+            if (!auth_check_request(&rc->auth, rbuf, fwd_n)) {
+                static const char r401[] =
+                    "HTTP/1.1 401 Unauthorized\r\n"
+                    "WWW-Authenticate: Basic realm=\"vortex\"\r\n"
+                    "Content-Length: 0\r\n"
+                    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+                    "Connection: keep-alive\r\n\r\n";
+                struct io_uring_sqe *sqe401  = io_uring_get_sqe(&w->uring.ring);
+                struct io_uring_sqe *sqe401r = io_uring_get_sqe(&w->uring.ring);
+                if (!sqe401 || !sqe401r) { conn_close(w, cid, false); return; }
+                uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+                size_t r401_len = sizeof(r401) - 1;
+                memcpy(sbuf, r401, r401_len);
+                h->send_buf_off = 0;
+                h->send_buf_len = (uint32_t)r401_len;
+                h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+                PREP_SEND(w, sqe401, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    sbuf, r401_len, MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+                sqe401->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+                sqe401->flags |= IOSQE_IO_LINK;
+                PREP_RECV(w, sqe401r, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                    conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+                sqe401r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+                uring_submit(&w->uring);
+                return;
+            }
+        }
+
+        /* Rewrite Accept-Encoding → identity */
+        bool ae_present = false;
+        {
+            uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
+            if (!ae)
+                ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
+            if (ae) {
+                ae_present = true;
+                uint8_t *vs = ae + 18;
+                while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t')) vs++;
+                uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
+                if (ve && ve > vs) {
+                    const char *id = "identity";
+                    size_t id_len  = 8;
+                    int delta = (int)id_len - (int)(ve - vs);
+                    if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
+                        memmove(vs + id_len, ve, (size_t)(rbuf + fwd_n - ve));
+                        memcpy(vs, id, id_len);
+                        fwd_n += delta;
+                    }
+                }
+            }
+        }
+
         /* Strip Authorization so proxy credentials don't reach backend */
-        uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
-        if (!ah)
-            ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
-        if (ah) {
-            uint8_t *le = (uint8_t *)FIND_CRLF(ah + 2,
-                (size_t)(rbuf + fwd_n - ah - 2));
-            if (le) {
-                le += 2;
-                size_t rm = (size_t)(le - ah - 2);
-                memmove(ah + 2, ah + 2 + rm,
-                    (size_t)(rbuf + fwd_n - (ah + 2 + rm)));
-                fwd_n -= (int)rm;
+        {
+            uint8_t *ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAuthorization:", 16);
+            if (!ah)
+                ah = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nauthorization:", 16);
+            if (ah) {
+                uint8_t *le = (uint8_t *)FIND_CRLF(ah + 2,
+                    (size_t)(rbuf + fwd_n - ah - 2));
+                if (le) {
+                    le += 2;
+                    size_t rm = (size_t)(le - ah - 2);
+                    memmove(ah + 2, ah + 2 + rm,
+                        (size_t)(rbuf + fwd_n - (ah + 2 + rm)));
+                    fwd_n -= (int)rm;
+                }
             }
         }
 
         fwd_n = rewrite_backend_connection_header(w, cid, h, rbuf, fwd_n, false);
+
+        /* Inject Accept-Encoding (if absent), X-Api-Key, and backend credentials
+         * after the request line.  X-Real-IP/X-Forwarded-For are intentionally
+         * omitted here — they are injected by handle_recv_client on every
+         * subsequent request.  Injecting them on the early-data first request
+         * can change backend behaviour (e.g. Jackett IP-trust checks) compared
+         * to the no-proxy case, causing equivalence regressions. */
+        {
+            const struct route_config *rc_fwd = &w->cfg->routes[h->route_idx];
+            const char *eol = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
+            if (eol) {
+                size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
+                char inj[HEADER_INJ_BUF_SIZE];
+                int inj_len = 0;
+                if (!ae_present)
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "Accept-Encoding: identity\r\n");
+                if (rc_fwd->x_api_key[0])
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
+                if (rc_fwd->backend_credentials[0]) {
+                    char b64[512];
+                    b64_encode(rc_fwd->backend_credentials,
+                               strlen(rc_fwd->backend_credentials), b64, sizeof(b64));
+                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
+                        "Authorization: Basic %s\r\n", b64);
+                }
+                if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
+                    memmove(rbuf + line_end + inj_len,
+                            rbuf + line_end, (size_t)fwd_n - line_end);
+                    memcpy(rbuf + line_end, inj, (size_t)inj_len);
+                    fwd_n += inj_len;
+                }
+            }
+        }
+
         if (backend_uses_tls(w, cid)) {
             if (backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n) < 0) {
                 send_bad_gateway_and_close(w, cid);
