@@ -23,7 +23,7 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **TCP tunnel mode** — TLS-terminated raw TCP passthrough; after SNI routing, bytes are forwarded verbatim to the backend with no HTTP parsing. Used for SSH-over-TLS (`protocol: tcp` in route config)
 - **HTTP/2 and HTTP/3** — HTTP/3 via ngtcp2 + nghttp3 (conditional compile); `Alt-Svc: h3=":443"` injected into HTTP/1.x responses to advertise QUIC
 
-### TLS (OpenSSL 4.0)
+### TLS (picotls + minicrypto)
 - TLS 1.2 and 1.3, configurable minimum/maximum versions and cipher suites
 - **kTLS offload** — after handshake, kernel handles symmetric crypto; io_uring operates on plaintext via the socket directly
 - **SNI-multiplexed certificates** — one listener, unlimited virtual hosts
@@ -81,7 +81,8 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - **Inbound (client → backend)**:
   - `X-Real-IP` and `X-Forwarded-For` injected from actual client socket address
   - `X-Api-Key` injected per route (if configured)
-  - `Authorization` header stripped (proxy consumed it; never forwarded to backend)
+  - `Authorization` header handling controlled per-route by `backend_auth` (default: strip before forwarding; see Configuration Reference)
+  - Custom per-header rules (strip or inject) for any backend-bound header via `backend_headers`
   - `Connection` rewritten to `close` for HTTP, passed through for WebSocket upgrades
 - **Outbound (backend → client)**:
   - `Server` header replaced with `CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)` — obscures backend stack identity
@@ -237,7 +238,8 @@ ACCEPT ──► [TLS handshake] ──► RECV_CLIENT
 | liburing | `liburing-dev` | io_uring |
 | libyaml | `libyaml-dev` | config parsing |
 | bpftool | `linux-tools-common` | vmlinux.h generation |
-| OpenSSL 4.0 | build from source | TLS (optional but recommended) |
+| picotls | build from source | TLS termination (optional but recommended) |
+| micro-ecc | bundled in picotls | ECDH/ECDSA primitives |
 | ngtcp2 1.16 | build from source | HTTP/3 (optional) |
 | nghttp3 1.8 | build from source | HTTP/3 (optional) |
 
@@ -245,8 +247,9 @@ Pass paths via CMake variables; none are assumed to be at a fixed system locatio
 
 ```sh
 cmake -B build \
-  -DOPENSSL_ROOT_DIR=/path/to/openssl-4.0 \
-  -DNGTCP2_BUILD_DIR=/path/to/ngtcp2/build \
+  -DPICOTLS_SRC_DIR=/path/to/picotls \
+  -DPICOTLS_BUILD_DIR=/path/to/picotls/build \
+  -DNGTCP2_BUILD_DIR=/path/to/ngtcp2-picotls-build \
   -DNGHTTP3_BUILD_DIR=/path/to/nghttp3/build \
   -DNGTCP2_SRC_DIR=/path/to/ngtcp2-1.16.0 \
   -DNGHTTP3_SRC_DIR=/path/to/nghttp3-1.8.0
@@ -301,14 +304,14 @@ Covers the HTTP/1.1 request-line parser under libFuzzer with ASan and UBSan enab
 
 ### Building a .deb package
 
-`tools/build_deb.sh` produces a self-contained Debian package that bundles the
-OpenSSL 4.0 shared libraries so the target machine does not need them pre-installed.
+`tools/build_deb.sh` produces a self-contained Debian package. picotls is statically
+linked into the binary — no TLS shared libraries are bundled or required on the target.
 If no version is passed, the script picks the next patch version after the
 highest version it can find from `VERSION`, git tags, and local `.deb`
 artifacts, and refuses version regressions.
 
 ```sh
-OPENSSL_ROOT_DIR=/path/to/openssl-4.0 bash tools/build_deb.sh 1.0.0
+bash tools/build_deb.sh 1.0.0
 # produces vortex_1.0.0_amd64.deb
 ```
 
@@ -449,6 +452,18 @@ routes:
     key_path:  "/etc/ssl/api.key"
     x_api_key: ""                  # Injected as X-Api-Key to backend if set
     backend_timeout_ms: 30000      # Max ms to wait for first byte from backend
+    backend_auth: "block"          # block (default) | passthrough | rewrite
+                                   # block: strip Authorization before forwarding
+                                   # passthrough: forward Authorization unchanged
+                                   # rewrite: replace with backend_credentials
+    backend_credentials: ""        # "user:pass" injected as Authorization: Basic <b64>
+                                   # (implies backend_auth: rewrite when set)
+    backend_headers:               # Per-header rules for backend-bound requests
+      - name: "X-Internal-Token"   # BLOCK: strip this header before forwarding
+        action: "block"
+      - name: "X-Api-Version"      # SET: inject/replace header with fixed value
+        action: "set"
+        value: "v2"
     backends:
       - address: "10.0.0.1:8080"
         weight: 3
@@ -560,7 +575,7 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 - **Request header limit** — HTTP/1.1 requests rejected before routing if the header block reaches `max_request_header_bytes` (default 32 KB) without `\r\n\r\n`
 - **URI length enforcement** — request lines with a URI exceeding the parser's output buffer are rejected with 400 (not silently truncated)
 - **Ambiguous framing rejection** — requests with both `Transfer-Encoding` and `Content-Length` are rejected (HTTP request smuggling defence)
-- **Authorization header stripping** — proxy credentials are never forwarded to backends
+- **Authorization header control** — per-route `backend_auth` (block/passthrough/rewrite) controls whether the incoming Authorization header is stripped, forwarded unchanged, or replaced with backend-specific credentials; default is strip
 - **Server header masquerade** — backend identity hidden behind `CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)` to mislead automated vulnerability scanners
 - **HTTP Basic Auth** — per-route credential enforcement at the proxy level
 - **SNI pre-check** — TLS ClientHello is peeked before the full handshake; unrecognised SNI → tarpit without handshake cost
@@ -603,15 +618,15 @@ All maps pinned under `/sys/fs/bpf/vortex/`:
 
 ### kTLS fast path
 
-When OpenSSL negotiates kTLS (`SSL_CTX_set_options` with `SSL_OP_ENABLE_KTLS`):
-1. After the handshake, symmetric keys are installed into the kernel via `setsockopt(SOL_TLS)`
-2. `SSL_sendfile` / normal `send` on the socket triggers kernel-side AES-GCM
-3. The `SSL*` object is freed; io_uring operates directly on the fd
+When picotls completes the handshake and negotiates a kTLS-compatible cipher (AES-128-GCM or AES-256-GCM):
+1. Symmetric session keys are extracted from the picotls context and installed into the kernel via `setsockopt(SOL_TLS, TLS_TX/RX)`
+2. The `ptls_t *` context is freed; io_uring operates directly on the fd
+3. Normal `send`/`recv` on the socket trigger kernel-side AES-GCM — no userspace crypto on the data path
 4. `CONN_FLAG_KTLS_TX` and `CONN_FLAG_KTLS_RX` flags track which directions are offloaded
 5. `EIO` on a kTLS recv is treated as `close_notify` / TLS alert (normal close path)
 6. `begin_splice` and `send_zc` are gated on `!CONN_FLAG_KTLS_TX` — splice and zero-copy send are incompatible with kTLS TX on kernel 6.8
 
-When kTLS is not available (negotiated cipher not supported, older kernel), the SSL* object is kept and `SSL_read`/`SSL_write` are used via the standard OpenSSL data path.
+When kTLS is not available (negotiated cipher not supported, older kernel), the `ptls_t *` context is kept and `ptls_send`/`ptls_receive` handle TLS record encryption in userspace.
 
 ### Cache URL patterns
 
@@ -652,7 +667,7 @@ src/        Core proxy engine
   worker_proxy.c    HTTP/1.x proxy state machine, header rewrites, TCP tunnel relay
   conn.c            Connection pool (hot/cold split, cache-line aligned)
   router.c          SNI route lookup, backend selection (LB algorithms)
-  tls.c             OpenSSL 4.0 TLS context, accept, kTLS install, cert rotation
+  tls.c             picotls TLS context, accept, kTLS install, cert rotation
   tls_pool.c        Shared TLS handshake offload pool
   compress_pool.c   Shared compression offload pool
   pool.c            Shared backend keep-alive pool
@@ -728,7 +743,8 @@ Vortex is original software but is built on the shoulders of several excellent o
 | **[libbpf](https://github.com/libbpf/libbpf)** | system | LGPL-2.1 / BSD-2-Clause | Loads and manages the XDP/eBPF kernel programs; provides BPF map accessors and the skeleton API |
 | **[liburing](https://github.com/axboe/liburing)** | system | LGPL-2.1 | All async I/O: multishot accept, send/recv, async backend connect, timeouts |
 | **[libyaml](https://github.com/yaml/libyaml)** | system | MIT | Parses `vortex.yaml` configuration files |
-| **[OpenSSL 4.0](https://github.com/openssl/openssl)** | 4.0 | Apache 2.0 | TLS 1.2/1.3 handshake, kTLS kernel offload, ACME HTTPS requests, ECDSA key generation |
+| **[picotls](https://github.com/h2o/picotls)** | HEAD | MIT | TLS 1.2/1.3 handshake, kTLS kernel-offload key installation |
+| **[micro-ecc](https://github.com/kmackay/micro-ecc)** | bundled | BSD-2-Clause | ECDH/ECDSA primitives (P-256, P-384) used by picotls minicrypto |
 | **[ngtcp2](https://github.com/ngtcp2/ngtcp2)** | 1.16.0 | MIT | QUIC transport protocol (HTTP/3) |
 | **[nghttp3](https://github.com/ngtcp2/nghttp3)** | 1.8.0 | MIT | HTTP/3 application layer over QUIC |
 
@@ -738,7 +754,7 @@ Vortex itself is released under the **GNU General Public License v3.0 (GPLv3)**.
 
 - MIT, BSD-2-Clause — permissive, compatible with GPLv3.
 - LGPL-2.1 — compatible with GPLv3 when linked dynamically (libbpf, liburing, libyaml are system shared libraries).
-- Apache 2.0 (OpenSSL 4.0) — compatible with GPLv3 per the FSF's clarification.
+- MIT (picotls, micro-ecc) — permissive, compatible with GPLv3.
 - GPL-2.0 (kernel BPF program, vmlinux.h) — the XDP program is a separate kernel-space component; it is explicitly GPL-2.0 as required by the kernel's module ABI.
 
 Commercial entities wishing to use Vortex without complying with the GPLv3 (for example, in a proprietary product) must obtain a separate commercial licence from the author.

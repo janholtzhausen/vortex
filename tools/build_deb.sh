@@ -71,8 +71,9 @@ fi
 
 PKG="vortex_${VERSION}_amd64"
 STAGING="/tmp/${PKG}"
-OPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR:-/opt/openssl-4.0}"
 NGTCP2_BUILD_DIR="${NGTCP2_BUILD_DIR:-/tmp/ngtcp2-picotls-build}"
+PICOTLS_SRC_DIR="${PICOTLS_SRC_DIR:-/tmp/picotls}"
+PICOTLS_BUILD_DIR="${PICOTLS_BUILD_DIR:-/tmp/picotls/build}"
 NGHTTP3_BUILD_DIR="${NGHTTP3_BUILD_DIR:-/tmp/nghttp3-build}"
 NGTCP2_SRC_DIR="${NGTCP2_SRC_DIR:-/tmp/ngtcp2-1.16.0}"
 NGHTTP3_SRC_DIR="${NGHTTP3_SRC_DIR:-/tmp/nghttp3-1.8.0}"
@@ -85,8 +86,8 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DVORTEX_VERSION_OVERRIDE="$VERSION" \
     -DVORTEX_MARCH="$VORTEX_DEB_MARCH" \
-    -DFORCE_OPENSSL_BUNDLED=ON \
-    -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+    -DPICOTLS_SRC_DIR="$PICOTLS_SRC_DIR" \
+    -DPICOTLS_BUILD_DIR="$PICOTLS_BUILD_DIR" \
     -DNGTCP2_BUILD_DIR="$NGTCP2_BUILD_DIR" \
     -DNGHTTP3_BUILD_DIR="$NGHTTP3_BUILD_DIR" \
     -DNGTCP2_SRC_DIR="$NGTCP2_SRC_DIR" \
@@ -99,10 +100,8 @@ rm -rf "$STAGING"
 install -d "$STAGING/DEBIAN"
 install -d "$STAGING/usr/bin"
 install -d "$STAGING/usr/share/vortex"
-install -d "$STAGING/usr/lib/vortex"
 install -d "$STAGING/etc/vortex"
 install -d "$STAGING/lib/systemd/system"
-install -d "$STAGING/etc/ld.so.conf.d"
 
 # Binary — strip debug info and set rpath to the .deb install location
 install -m 755 "$BUILD_DIR/vortex" "$STAGING/usr/bin/vortex"
@@ -113,16 +112,7 @@ patchelf --set-rpath /usr/lib/vortex "$STAGING/usr/bin/vortex" 2>/dev/null || \
 # BPF object
 install -m 644 "$BUILD_DIR/vortex_xdp.bpf.o" "$STAGING/usr/share/vortex/vortex_xdp.bpf.o"
 
-# Bundled OpenSSL 4.0 libs
-OPENSSL_DIR="${OPENSSL_ROOT_DIR}/lib64"
-for lib in libcrypto.so.4 libssl.so.4; do
-    if [ -f "$OPENSSL_DIR/$lib" ]; then
-        install -m 755 "$OPENSSL_DIR/$lib" "$STAGING/usr/lib/vortex/$lib"
-    fi
-done
-
-# ld.so config so the runtime linker finds the bundled libs
-echo "/usr/lib/vortex" > "$STAGING/etc/ld.so.conf.d/vortex.conf"
+# picotls is statically linked — no runtime TLS libraries to bundle
 
 # Systemd unit
 install -m 644 "$REPO_ROOT/contrib/vortex.service" "$STAGING/lib/systemd/system/vortex.service"
