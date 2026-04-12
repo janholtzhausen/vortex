@@ -162,6 +162,8 @@ typedef enum {
     P_ROUTE_HEALTH,
     P_ROUTE_BACKEND_HEADERS,
     P_ROUTE_BACKEND_HEADER,
+    P_ROUTE_RESPONSE_HEADERS,
+    P_ROUTE_RESPONSE_HEADER,
 } parse_state_t;
 
 typedef struct {
@@ -171,6 +173,7 @@ typedef struct {
     int                  route_idx;
     int                  backend_idx;
     int                  backend_header_idx;
+    int                  response_header_idx;
     int                  depth;          /* mapping depth */
     int                  seq_depth;      /* sequence depth */
     int                  error;
@@ -412,6 +415,22 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         break;
     }
 
+    case P_ROUTE_RESPONSE_HEADER: {
+        struct route_config *r = &c->routes[ctx->route_idx];
+        if (ctx->response_header_idx < 0 ||
+            ctx->response_header_idx >= VORTEX_MAX_RESPONSE_HEADER_RULES) break;
+        struct backend_header_rule *hr = &r->response_headers[ctx->response_header_idx];
+        if (!strcmp(k, "name")) {
+            snprintf(hr->name, sizeof(hr->name), "%s", val);
+        } else if (!strcmp(k, "action")) {
+            if      (!strcmp(val, "set"))   hr->action = HEADER_ACTION_SET;
+            else                            hr->action = HEADER_ACTION_BLOCK;
+        } else if (!strcmp(k, "value")) {
+            snprintf(hr->value, sizeof(hr->value), "%s", val);
+        }
+        break;
+    }
+
     default: break;
     }
 }
@@ -439,6 +458,7 @@ int config_load(const char *path, struct vortex_config *cfg)
         .route_idx = -1,
         .backend_idx = -1,
         .backend_header_idx = -1,
+        .response_header_idx = -1,
     };
 
     bool got_key    = false;
@@ -483,6 +503,11 @@ int config_load(const char *path, struct vortex_config *cfg)
                 if (ctx.backend_header_idx < VORTEX_MAX_BACKEND_HEADER_RULES)
                     cfg->routes[ctx.route_idx].backend_header_count = ctx.backend_header_idx + 1;
                 ctx.state = P_ROUTE_BACKEND_HEADER;
+            } else if (ctx.state == P_ROUTE_RESPONSE_HEADERS) {
+                ctx.response_header_idx++;
+                if (ctx.response_header_idx < VORTEX_MAX_RESPONSE_HEADER_RULES)
+                    cfg->routes[ctx.route_idx].response_header_count = ctx.response_header_idx + 1;
+                ctx.state = P_ROUTE_RESPONSE_HEADER;
             }
             break;
 
@@ -495,7 +520,8 @@ int config_load(const char *path, struct vortex_config *cfg)
             else if (ctx.state == P_ROUTE_AUTH)            { ctx.state = P_ROUTE; }
             else if (ctx.state == P_ROUTE_RATELIMIT)       { ctx.state = P_ROUTE; }
             else if (ctx.state == P_ROUTE_HEALTH)          { ctx.state = P_ROUTE; }
-            else if (ctx.state == P_ROUTE_BACKEND_HEADER)  { ctx.state = P_ROUTE_BACKEND_HEADERS; }
+            else if (ctx.state == P_ROUTE_BACKEND_HEADER)   { ctx.state = P_ROUTE_BACKEND_HEADERS; }
+            else if (ctx.state == P_ROUTE_RESPONSE_HEADER)  { ctx.state = P_ROUTE_RESPONSE_HEADERS; }
             else if (ctx.state == P_ROUTE)                 { ctx.state = P_ROUTES; }
             else if (ctx.state == P_ACME_DNS_CFG)     { ctx.state = P_ACME; }
             else if (ctx.state == P_XDP_RATELIMIT)    { ctx.state = P_XDP; }
@@ -521,6 +547,9 @@ int config_load(const char *path, struct vortex_config *cfg)
             } else if (ctx.state == P_ROUTE && !strcmp(ctx.key, "backend_headers")) {
                 ctx.state = P_ROUTE_BACKEND_HEADERS;
                 ctx.backend_header_idx = -1;
+            } else if (ctx.state == P_ROUTE && !strcmp(ctx.key, "response_headers")) {
+                ctx.state = P_ROUTE_RESPONSE_HEADERS;
+                ctx.response_header_idx = -1;
             }
             break;
 
@@ -533,6 +562,8 @@ int config_load(const char *path, struct vortex_config *cfg)
             } else if (ctx.state == P_ROUTE_AUTH_USERS) {
                 ctx.state = P_ROUTE_AUTH;
             } else if (ctx.state == P_ROUTE_BACKEND_HEADERS) {
+                ctx.state = P_ROUTE;
+            } else if (ctx.state == P_ROUTE_RESPONSE_HEADERS) {
                 ctx.state = P_ROUTE;
             }
             break;

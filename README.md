@@ -85,9 +85,11 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
   - Custom per-header rules (strip or inject) for any backend-bound header via `backend_headers`
   - `Connection` rewritten to `close` for HTTP, passed through for WebSocket upgrades
 - **Outbound (backend → client)**:
-  - `Server` header replaced with `CSWS/2.4.62 OpenVMS/V9.2-2 (Alpha)` — obscures backend stack identity
+  - `Server` header replaced globally (configurable; per-route `server_header` overrides global; `"none"` = pass through)
+  - `Strict-Transport-Security` injected if absent (`max-age=31536000; includeSubDomains`)
   - `Connection` rewritten to `keep-alive`
   - `Alt-Svc: h3=":443"; ma=86400` injected when HTTP/3 is compiled in
+  - Custom per-header rules (strip or inject/replace any response header) via `response_headers`
 
 ### HTTP Basic Auth
 - Per-route hashed verifier list, either inline under `users:` or loaded from `auth.file`
@@ -464,6 +466,22 @@ routes:
       - name: "X-Api-Version"      # SET: inject/replace header with fixed value
         action: "set"
         value: "v2"
+    server_header: ""              # Per-route Server header sent to clients.
+                                   # Empty = use global server_header.
+                                   # "none" = pass backend's Server header through.
+    response_headers:              # Per-header rules for responses sent to clients.
+                                   # Applied after all built-in rewrites.
+      - name: "X-Powered-By"       # BLOCK: strip this header from every response
+        action: "block"
+      - name: "X-Frame-Options"    # SET: inject/replace with fixed value
+        action: "set"
+        value: "DENY"
+    congestion_control: ""         # TCP congestion control for backend connections.
+                                   # Empty = kernel default (cubic). Overrides global.
+                                   # e.g. "bbr" (check /proc/sys/net/ipv4/tcp_allowed_congestion_control)
+    health:
+      fail_threshold: 3            # Consecutive connect failures to open circuit breaker (0 = default 3)
+      open_ms: 10000               # ms to keep circuit open before retry probe (0 = default 10000)
     backends:
       - address: "10.0.0.1:8080"
         weight: 3

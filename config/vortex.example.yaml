@@ -103,15 +103,60 @@ routes:
         weight: 3
       - address: "10.0.0.2:8080"
         weight: 1
-    load_balancing: "weighted_round_robin"
-    cert_provider: "static_file"
+    load_balancing: "weighted_round_robin"  # round_robin | weighted_round_robin | least_conn | ip_hash
+    cert_provider: "static_file"            # static_file | acme_http01 | acme_dns01
     cert_path: "/etc/vortex/certs/api.example.com/fullchain.pem"
-    key_path: "/etc/vortex/certs/api.example.com/privkey.pem"
+    key_path:  "/etc/vortex/certs/api.example.com/privkey.pem"
+
+    # Backend connection settings
+    backend_timeout_ms: 30000    # Max ms to wait for first byte from backend (0 = default 30000)
+    # congestion_control: "bbr"  # TCP CC algorithm for backend sockets (empty = kernel default, e.g. cubic)
+                                  # Check /proc/sys/net/ipv4/tcp_allowed_congestion_control
+
+    # Circuit breaker
+    # health:
+    #   fail_threshold: 3        # Consecutive failures to open circuit (0 = default 3)
+    #   open_ms: 10000           # ms to keep circuit open before retry probe (0 = default 10000)
+
+    # Rate limiting (per source IP, applied before routing)
+    # rate_limit:
+    #   enabled: true
+    #   rps: 100                 # Sustained requests per second
+    #   burst: 200               # Initial burst allowance
+
+    # Proxy-level HTTP Basic Auth
     # auth:
     #   enabled: true
     #   file: "/etc/vortex/auth/api-users.auth"
     #   users:
     #     - "admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc="
+    #     # Generate with: python3 tools/vortex-passwd.py <username>
+
+    # Backend request header manipulation
+    # x_api_key: ""              # Injected as X-Api-Key on backend requests
+    # backend_auth: "block"      # block (default) | passthrough | rewrite
+    #                            # block: strip Authorization before forwarding
+    #                            # passthrough: forward Authorization unchanged
+    #                            # rewrite: replace with backend_credentials
+    # backend_credentials: ""    # "user:pass" injected as Authorization: Basic <b64>
+    #                            # (implies backend_auth: rewrite when non-empty)
+    # backend_headers:
+    #   - name: "X-Internal-Token"
+    #     action: "block"        # strip before forwarding
+    #   - name: "X-Api-Version"
+    #     action: "set"          # inject/replace with fixed value
+    #     value: "v2"
+
+    # Response header manipulation (headers sent to clients)
+    # server_header: ""          # Override global Server header for this route.
+    #                            # Empty = use global. "none" = pass backend's through.
+    # response_headers:
+    #   - name: "X-Powered-By"
+    #     action: "block"        # strip from every response
+    #   - name: "X-Frame-Options"
+    #     action: "set"          # inject/replace with fixed value
+    #     value: "DENY"
+
     cache:
       enabled: true
       ttl: 60

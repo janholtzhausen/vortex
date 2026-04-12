@@ -679,6 +679,75 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
             (void)hdr_len;
         }
 
+        /* ---- Custom response header rules (block/set) ---- */
+        {
+            const struct route_config *rc_resp = &w->cfg->routes[h->route_idx];
+            for (int _ri = 0; _ri < rc_resp->response_header_count && hdr_end; _ri++) {
+                const struct backend_header_rule *hr = &rc_resp->response_headers[_ri];
+                size_t _nlen = strlen(hr->name);
+                char _needle[256];
+                snprintf(_needle, sizeof(_needle), "\r\n%s:", hr->name);
+                uint8_t *_ph = (uint8_t *)memmem(sbuf, hdr_len, _needle, _nlen + 3);
+                if (!_ph) {
+                    char _low[256];
+                    snprintf(_low, sizeof(_low), "\r\n");
+                    for (size_t _i = 0; _i < _nlen && _i + 2 < sizeof(_low) - 1; _i++)
+                        _low[_i + 2] = (char)tolower((unsigned char)hr->name[_i]);
+                    _low[_nlen + 2] = ':'; _low[_nlen + 3] = '\0';
+                    _ph = (uint8_t *)memmem(sbuf, hdr_len, _low, _nlen + 3);
+                }
+                if (hr->action == HEADER_ACTION_BLOCK) {
+                    if (_ph) {
+                        uint8_t *_pe = (uint8_t *)FIND_CRLF(_ph + 2,
+                            (size_t)(sbuf + n - _ph - 2));
+                        if (_pe) {
+                            _pe += 2;
+                            size_t _rm = (size_t)(_pe - (_ph + 2));
+                            memmove(_ph + 2, _ph + 2 + _rm,
+                                (size_t)(sbuf + n - (_ph + 2 + _rm)));
+                            n -= (int)_rm;
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                        }
+                    }
+                } else { /* HEADER_ACTION_SET */
+                    const char *_hval    = hr->value;
+                    size_t      _hval_len = strlen(_hval);
+                    if (_ph) {
+                        uint8_t *_vs = _ph + _nlen + 3;
+                        while (_vs < sbuf + hdr_len && (*_vs == ' ' || *_vs == '\t')) _vs++;
+                        uint8_t *_ve = (uint8_t *)FIND_CRLF(_vs,
+                            (size_t)(sbuf + hdr_len - _vs));
+                        if (_ve) {
+                            int _delta = (int)_hval_len - (int)(_ve - _vs);
+                            if (n + _delta <= (int)w->pool.buf_size && n + _delta > 0) {
+                                memmove(_vs + _hval_len, _ve, (size_t)(sbuf + n - _ve));
+                                memcpy(_vs, _hval, _hval_len);
+                                n += _delta;
+                                hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                                hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                            }
+                        }
+                    } else {
+                        char _inj[VORTEX_MAX_BACKEND_HEADER_NAME +
+                                  VORTEX_MAX_BACKEND_HEADER_VALUE + 8];
+                        int _inj_len = snprintf(_inj, sizeof(_inj), "\r\n%s: %s",
+                                                hr->name, _hval);
+                        if (_inj_len > 0 && n + _inj_len <= (int)w->pool.buf_size) {
+                            size_t _hle = (size_t)(hdr_end - sbuf);
+                            memmove(sbuf + _hle + _inj_len, sbuf + _hle,
+                                    (size_t)(n - (int)_hle));
+                            memcpy(sbuf + _hle, _inj, (size_t)_inj_len);
+                            n += _inj_len;
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
+                        }
+                    }
+                }
+            }
+            (void)hdr_len;
+        }
+
         if (w->cache && w->cache->index) {
             const uint8_t *resp2 = conn_send_buf(&w->pool, cid);
             int status2 = 0;

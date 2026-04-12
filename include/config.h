@@ -48,6 +48,7 @@ typedef enum {
 } header_action_t;
 
 #define VORTEX_MAX_BACKEND_HEADER_RULES  16
+#define VORTEX_MAX_RESPONSE_HEADER_RULES 16
 #define VORTEX_MAX_BACKEND_HEADER_NAME  128
 #define VORTEX_MAX_BACKEND_HEADER_VALUE 512
 
@@ -162,6 +163,12 @@ struct route_config {
      * fixed value.  Applied after the built-in Authorization/x_api_key logic. */
     struct backend_header_rule backend_headers[VORTEX_MAX_BACKEND_HEADER_RULES];
     uint8_t                    backend_header_count;
+
+    /* Per-route header rules applied to every response sent to the client.
+     * BLOCK rules strip a response header; SET rules replace/inject a header
+     * with a fixed value.  Applied after all built-in response rewrites. */
+    struct backend_header_rule response_headers[VORTEX_MAX_RESPONSE_HEADER_RULES];
+    uint8_t                    response_header_count;
 };
 
 struct xdp_config {
