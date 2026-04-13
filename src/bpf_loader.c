@@ -30,6 +30,7 @@ static int                 g_map_metrics_fd     = -1;
 static int                 g_map_rate_config_fd = -1;
 static int                 g_map_conntrack_fd   = -1;
 static int                 g_map_conntrack_v6_fd = -1;
+static int                 g_map_port_config_fd = -1;
 static int                 g_xdp_active         = 0;
 
 /* Suppress verbose libbpf logs unless VORTEX_DEBUG is set */
@@ -198,6 +199,17 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
         log_warn("bpf_loader", "conn_track_map_v6 not found in BPF object");
     }
 
+    map = bpf_object__find_map_by_name(g_obj, "port_config_map");
+    if (map) {
+        g_map_port_config_fd = bpf_map__fd(map);
+        char pin_path[256];
+        snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/port_config_map");
+        bpf_map__pin(map, pin_path);
+        log_info("bpf_loader", "port config map loaded");
+    } else {
+        log_warn("bpf_loader", "port_config_map not found in BPF object");
+    }
+
     g_xdp_active = 1;
     log_info("bpf_loader", "BPF loader initialised: obj=%s if=%s ifindex=%d",
         bpf_obj_path, ifname, g_ifindex);
@@ -226,6 +238,7 @@ void bpf_loader_detach(void)
     snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_config_map"); unlink(path);
     snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map");  unlink(path);
     snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map_v6"); unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/port_config_map"); unlink(path);
     rmdir(BPF_PIN_DIR);
 
     if (g_obj) {
@@ -360,6 +373,22 @@ int bpf_rate_config_set(uint32_t tokens_per_sec, uint32_t burst)
     return bpf_map_update_elem(g_map_rate_config_fd, &key, &cfg, BPF_ANY);
 }
 
+int bpf_port_config_set(const uint16_t *ports, uint8_t count)
+{
+    if (g_map_port_config_fd < 0) return -1;
+    
+    struct port_config cfg = {0};
+    if (count > 16) count = 16;  /* Safety limit */
+    
+    cfg.count = count;
+    for (int i = 0; i < count; i++) {
+        cfg.ports[i] = htons(ports[i]);
+    }
+    
+    uint32_t key = 0;
+    return bpf_map_update_elem(g_map_port_config_fd, &key, &cfg, BPF_ANY);
+}
+
 int bpf_blocklist_clear(void)
 {
     if (g_map_blocklist_fd >= 0) {
@@ -460,6 +489,16 @@ int bpf_loader_apply_config(const struct xdp_config *xdp)
     bpf_blocklist_clear();
     if (xdp->blocklist_file[0] != '\0') {
         bpf_blocklist_load_file(xdp->blocklist_file);
+    }
+
+    /* Configure protected ports */
+    if (g_map_port_config_fd >= 0) {
+        if (bpf_port_config_set(xdp->protected_ports, xdp->protected_ports_count) == 0) {
+            log_info("xdp_config", "protected ports: %d port(s)", xdp->protected_ports_count);
+            for (int i = 0; i < xdp->protected_ports_count; i++) {
+                log_info("xdp_config", "  - port %u", xdp->protected_ports[i]);
+            }
+        }
     }
 
     return 0;

@@ -124,7 +124,30 @@ add_custom_command(
     COMMENT "Compiling XDP BPF program"
     VERBATIM
 )
-add_custom_target(bpf_prog ALL DEPENDS "${CMAKE_BINARY_DIR}/vortex_xdp.bpf.o")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/vortex_tc_egress.bpf.o"
+    COMMAND ${CLANG_BPF}
+            -O2 -g
+            -target bpf
+            -D__BPF__
+            -D__TARGET_ARCH_x86
+            -I${CMAKE_SOURCE_DIR}/bpf
+            -I${LIBBPF_INCLUDE_DIRS}
+            -I${CLANG_INCLUDE_DIR}
+            -c ${CMAKE_SOURCE_DIR}/bpf/vortex_tc_egress.bpf.c
+            -o "${CMAKE_BINARY_DIR}/vortex_tc_egress.bpf.o"
+    DEPENDS
+            bpf/vortex_tc_egress.bpf.c
+            bpf/maps.h
+            bpf/vmlinux.h
+    COMMENT "Compiling TC egress BPF program"
+    VERBATIM
+)
+add_custom_target(bpf_prog ALL DEPENDS 
+    "${CMAKE_BINARY_DIR}/vortex_xdp.bpf.o"
+    "${CMAKE_BINARY_DIR}/vortex_tc_egress.bpf.o"
+)
 
 # ---- Sources ----
 set(VORTEX_SRCS

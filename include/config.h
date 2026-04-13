@@ -177,6 +177,8 @@ struct xdp_config {
     uint32_t   rate_limit_rps;
     uint32_t   rate_limit_burst;
     char       blocklist_file[PATH_MAX];
+    uint16_t   protected_ports[16];  /* Ports vortex protects with XDP */
+    uint8_t    protected_ports_count; /* Number of configured ports (0-16) */
 };
 
 struct tls_config {

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * vortex_xdp.bpf.c — XDP program for vortex reverse proxy
+ * Modified version with tarpitting instead of dropping for blocked IPs
  *
  * Compiled with: clang -O2 -g -target bpf -D__BPF__ -D__TARGET_ARCH_x86
  *
  * Processing pipeline (per ingress TCP packet):
  *   1. Parse Ethernet / IPv4 or IPv6 / TCP headers with bounds checks
- *   2. IP blocklist enforcement   — XDP_DROP if source IP is blocked
+ *   2. IP blocklist enforcement   — TCP window clamping if source IP is blocked
  *   3. Stateful L4 conntrack      — XDP_DROP if no matching TCP state
  *      • RST  : tear down CT entry, always pass
  *      • SYN  : rate-limit new connections, create CT_SYN_SENT entry
@@ -20,7 +21,6 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_core_read.h>
 #include "maps.h"
-#include "vortex_xdp.h"
 
 #define ETH_P_IP    0x0800
 #define ETH_P_IPV6  0x86DD
@@ -88,19 +88,55 @@ struct {
     __type(value, struct conn_state);
 } conn_track_map_v6 SEC(".maps");
 
+/* Port configuration map - which ports vortex protects */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,   __u32);
+    __type(value, struct port_config);
+} port_config_map SEC(".maps");
+
 static __always_inline struct vortex_metrics *get_metrics(void)
 {
     __u32 key = 0;
     return bpf_map_lookup_elem(&metrics_map, &key);
 }
 
-static __always_inline int apply_rate_limit_v4(struct vortex_metrics *m, __be32 src_ip,
-                                               __u64 now)
+/* Check if a port is in the protected ports list */
+static __always_inline int is_protected_port(__be16 port)
 {
+    __u32 key = 0;
+    struct port_config *config = bpf_map_lookup_elem(&port_config_map, &key);
+    
+    if (!config || config->count == 0) {
+        // Default to protecting ports 80 and 443 if no config
+        __u16 port_host = bpf_ntohs(port);
+        return (port_host == 80 || port_host == 443);
+    }
+    
+    // Check if port is in the configured list
+    __u16 port_host = bpf_ntohs(port);
+    for (int i = 0; i < config->count && i < MAX_PROTECTED_PORTS; i++) {
+        if (bpf_ntohs(config->ports[i]) == port_host) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+static __always_inline int apply_rate_limit_v4(struct vortex_metrics *m, __be32 src_ip,
+                                               __be16 dest_port, __u64 now)
+{
+    // Only rate limit protected ports
+    if (!is_protected_port(dest_port)) {
+        return XDP_PASS;
+    }
+    
     __u32 rckey = 0;
-    struct rate_config *rcfg = bpf_map_lookup_elem(&rate_config_map, &rckey);
-    __u64 tps = (rcfg && rcfg->tokens_per_sec) ? rcfg->tokens_per_sec : DEFAULT_TOKENS_PER_SEC;
-    __u64 burst = (rcfg && rcfg->burst) ? rcfg->burst : DEFAULT_BURST_TOKENS;
+    struct rate_config *rc = bpf_map_lookup_elem(&rate_config_map, &rckey);
+    __u64 tokens_per_sec = rc ? rc->tokens_per_sec : DEFAULT_TOKENS_PER_SEC;
+    __u64 burst = rc ? rc->burst : DEFAULT_BURST_TOKENS;
 
     struct rate_limit_entry *rle = bpf_map_lookup_elem(&rate_limit_map, &src_ip);
     if (!rle) {
@@ -108,17 +144,21 @@ static __always_inline int apply_rate_limit_v4(struct vortex_metrics *m, __be32 
             .tokens = burst * RATE_SCALE,
             .last_refill_ns = now,
         };
-        bpf_map_update_elem(&rate_limit_map, &src_ip, &new_rle, BPF_ANY);
-        return XDP_PASS;
+        if (bpf_map_update_elem(&rate_limit_map, &src_ip, &new_rle, BPF_NOEXIST) != 0)
+            return XDP_PASS;
+        rle = bpf_map_lookup_elem(&rate_limit_map, &src_ip);
+        if (!rle)
+            return XDP_PASS;
     }
 
-    __u64 elapsed = now - rle->last_refill_ns;
-    __u64 add = (elapsed * tps * RATE_SCALE) / 1000000000ULL;
-    __u64 max_tok = burst * RATE_SCALE;
-    rle->tokens += add;
-    if (rle->tokens > max_tok)
-        rle->tokens = max_tok;
-    rle->last_refill_ns = now;
+    __u64 elapsed_ns = now - rle->last_refill_ns;
+    __u64 refill = (elapsed_ns * tokens_per_sec * RATE_SCALE) / 1000000000ULL;
+    if (refill > 0) {
+        rle->tokens += refill;
+        if (rle->tokens > burst * RATE_SCALE)
+            rle->tokens = burst * RATE_SCALE;
+        rle->last_refill_ns = now;
+    }
 
     if (rle->tokens < RATE_SCALE) {
         if (m) m->dropped_ratelimit++;
@@ -130,12 +170,17 @@ static __always_inline int apply_rate_limit_v4(struct vortex_metrics *m, __be32 
 
 static __always_inline int apply_rate_limit_v6(struct vortex_metrics *m,
                                                const struct ip6_addr *src_ip,
-                                               __u64 now)
+                                               __be16 dest_port, __u64 now)
 {
+    // Only rate limit protected ports
+    if (!is_protected_port(dest_port)) {
+        return XDP_PASS;
+    }
+    
     __u32 rckey = 0;
-    struct rate_config *rcfg = bpf_map_lookup_elem(&rate_config_map, &rckey);
-    __u64 tps = (rcfg && rcfg->tokens_per_sec) ? rcfg->tokens_per_sec : DEFAULT_TOKENS_PER_SEC;
-    __u64 burst = (rcfg && rcfg->burst) ? rcfg->burst : DEFAULT_BURST_TOKENS;
+    struct rate_config *rc = bpf_map_lookup_elem(&rate_config_map, &rckey);
+    __u64 tokens_per_sec = rc ? rc->tokens_per_sec : DEFAULT_TOKENS_PER_SEC;
+    __u64 burst = rc ? rc->burst : DEFAULT_BURST_TOKENS;
 
     struct rate_limit_entry *rle = bpf_map_lookup_elem(&rate_limit_map_v6, src_ip);
     if (!rle) {
@@ -143,17 +188,21 @@ static __always_inline int apply_rate_limit_v6(struct vortex_metrics *m,
             .tokens = burst * RATE_SCALE,
             .last_refill_ns = now,
         };
-        bpf_map_update_elem(&rate_limit_map_v6, src_ip, &new_rle, BPF_ANY);
-        return XDP_PASS;
+        if (bpf_map_update_elem(&rate_limit_map_v6, src_ip, &new_rle, BPF_NOEXIST) != 0)
+            return XDP_PASS;
+        rle = bpf_map_lookup_elem(&rate_limit_map_v6, src_ip);
+        if (!rle)
+            return XDP_PASS;
     }
 
-    __u64 elapsed = now - rle->last_refill_ns;
-    __u64 add = (elapsed * tps * RATE_SCALE) / 1000000000ULL;
-    __u64 max_tok = burst * RATE_SCALE;
-    rle->tokens += add;
-    if (rle->tokens > max_tok)
-        rle->tokens = max_tok;
-    rle->last_refill_ns = now;
+    __u64 elapsed_ns = now - rle->last_refill_ns;
+    __u64 refill = (elapsed_ns * tokens_per_sec * RATE_SCALE) / 1000000000ULL;
+    if (refill > 0) {
+        rle->tokens += refill;
+        if (rle->tokens > burst * RATE_SCALE)
+            rle->tokens = burst * RATE_SCALE;
+        rle->last_refill_ns = now;
+    }
 
     if (rle->tokens < RATE_SCALE) {
         if (m) m->dropped_ratelimit++;
@@ -163,14 +212,26 @@ static __always_inline int apply_rate_limit_v6(struct vortex_metrics *m,
     return XDP_PASS;
 }
 
+// Helper to clamp TCP window to 1 byte
+static __always_inline void clamp_tcp_window(struct tcphdr *tcp)
+{
+    // Set window size to 1 byte (in network byte order)
+    tcp->window = bpf_htons(1);
+}
+
 static __always_inline int conntrack_tcp_v4(struct vortex_metrics *m,
                                             __be32 src_ip, __be32 dst_ip,
                                             struct tcphdr *tcp)
 {
     __u8 *blocked = bpf_map_lookup_elem(&blocklist_map, &src_ip);
     if (blocked && *blocked) {
-        if (m) m->dropped_blocklist++;
-        return XDP_DROP;
+        // Only tarpit protected ports
+        if (is_protected_port(tcp->dest)) {
+            // TARPIT: Instead of dropping, clamp TCP window to 1 byte
+            clamp_tcp_window(tcp);
+            if (m) m->dropped_blocklist++;  // Still count as "dropped" for metrics
+        }
+        return XDP_PASS;  // Pass the packet (tarpitted if protected port)
     }
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
@@ -193,23 +254,34 @@ static __always_inline int conntrack_tcp_v4(struct vortex_metrics *m,
     }
 
     if (f_syn) {
-        if (apply_rate_limit_v4(m, src_ip, now) == XDP_DROP)
-            return XDP_DROP;
+        // Only rate limit and track SYNs for protected ports
+        if (is_protected_port(tcp->dest)) {
+            if (apply_rate_limit_v4(m, src_ip, tcp->dest, now) == XDP_DROP)
+                return XDP_DROP;
 
-        struct conn_state new_state = {0};
-        new_state.tcp_state = CT_SYN_SENT;
-        new_state.last_seen_ns = now;
-        /* BPF_NOEXIST prevents a SYN flood from overwriting ESTABLISHED entries in the
-         * LRU map.  If the entry already exists, only refresh last_seen_ns when the
-         * existing state is itself CT_SYN_SENT (retransmitted SYN). */
-        if (bpf_map_update_elem(&conn_track_map, &key, &new_state, BPF_NOEXIST) != 0) {
-            struct conn_state *cs_exist = bpf_map_lookup_elem(&conn_track_map, &key);
-            if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT)
-                cs_exist->last_seen_ns = now;
+            struct conn_state new_state = {0};
+            new_state.tcp_state = CT_SYN_SENT;
+            new_state.last_seen_ns = now;
+            /* BPF_NOEXIST prevents a SYN flood from overwriting ESTABLISHED entries in the
+             * LRU map.  If the entry already exists, only refresh last_seen_ns when the
+             * existing state is itself CT_SYN_SENT (retransmitted SYN). */
+            if (bpf_map_update_elem(&conn_track_map, &key, &new_state, BPF_NOEXIST) != 0) {
+                struct conn_state *cs_exist = bpf_map_lookup_elem(&conn_track_map, &key);
+                if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT)
+                    cs_exist->last_seen_ns = now;
+            }
         }
+        // Pass SYN packets (tracked if port 80/443, untracked otherwise)
         return XDP_PASS;
     }
 
+    // Only enforce connection tracking for protected ports
+    if (!is_protected_port(tcp->dest)) {
+        // Pass all other traffic without stateful tracking
+        if (m) m->passed++;
+        return XDP_PASS;
+    }
+    
     struct conn_state *cs = bpf_map_lookup_elem(&conn_track_map, &key);
     if (!cs) {
         if (m) m->dropped_conntrack++;
@@ -238,8 +310,13 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m,
 {
     __u8 *blocked = bpf_map_lookup_elem(&blocklist_map_v6, src_ip);
     if (blocked && *blocked) {
-        if (m) m->dropped_blocklist++;
-        return XDP_DROP;
+        // Only tarpit protected ports
+        if (is_protected_port(tcp->dest)) {
+            // TARPIT: Instead of dropping, clamp TCP window to 1 byte
+            clamp_tcp_window(tcp);
+            if (m) m->dropped_blocklist++;  // Still count as "dropped" for metrics
+        }
+        return XDP_PASS;  // Pass the packet (tarpitted if protected port)
     }
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
@@ -262,20 +339,31 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m,
     }
 
     if (f_syn) {
-        if (apply_rate_limit_v6(m, src_ip, now) == XDP_DROP)
-            return XDP_DROP;
+        // Only rate limit and track SYNs for protected ports
+        if (is_protected_port(tcp->dest)) {
+            if (apply_rate_limit_v6(m, src_ip, tcp->dest, now) == XDP_DROP)
+                return XDP_DROP;
 
-        struct conn_state new_state = {0};
-        new_state.tcp_state = CT_SYN_SENT;
-        new_state.last_seen_ns = now;
-        if (bpf_map_update_elem(&conn_track_map_v6, &key, &new_state, BPF_NOEXIST) != 0) {
-            struct conn_state *cs_exist = bpf_map_lookup_elem(&conn_track_map_v6, &key);
-            if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT)
-                cs_exist->last_seen_ns = now;
+            struct conn_state new_state = {0};
+            new_state.tcp_state = CT_SYN_SENT;
+            new_state.last_seen_ns = now;
+            if (bpf_map_update_elem(&conn_track_map_v6, &key, &new_state, BPF_NOEXIST) != 0) {
+                struct conn_state *cs_exist = bpf_map_lookup_elem(&conn_track_map_v6, &key);
+                if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT)
+                    cs_exist->last_seen_ns = now;
+            }
         }
+        // Pass SYN packets (tracked if port 80/443, untracked otherwise)
         return XDP_PASS;
     }
 
+    // Only enforce connection tracking for protected ports
+    if (!is_protected_port(tcp->dest)) {
+        // Pass all other traffic without stateful tracking
+        if (m) m->passed++;
+        return XDP_PASS;
+    }
+    
     struct conn_state *cs = bpf_map_lookup_elem(&conn_track_map_v6, &key);
     if (!cs) {
         if (m) m->dropped_conntrack++;
@@ -300,56 +388,26 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m,
 SEC("xdp")
 int vortex_xdp_main(struct xdp_md *ctx)
 {
-    void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
     struct vortex_metrics *m = get_metrics();
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        goto pass_invalid;
+        goto drop_invalid;
 
     __u16 eth_proto = bpf_ntohs(eth->h_proto);
+
     if (eth_proto == ETH_P_IPV6) {
         struct ipv6hdr *ip6 = (void *)(eth + 1);
         if ((void *)(ip6 + 1) > data_end)
-            goto pass_invalid;
-
-        __u8 nexthdr = ip6->nexthdr;
-        __u32 off = sizeof(*ip6);
-
-#pragma unroll
-        for (int i = 0; i < 6; i++) {
-            if (nexthdr == IPPROTO_TCP)
-                break;
-            if (nexthdr == 0 || nexthdr == 43 || nexthdr == 60) {
-                struct ipv6_opt_hdr *opt = (void *)ip6 + off;
-                if ((void *)(opt + 1) > data_end)
-                    goto pass_invalid;
-                nexthdr = opt->nexthdr;
-                off += ((__u32)opt->hdrlen + 1) * 8;
-                if (off > 128)
-                    goto drop_invalid;
-                if ((void *)ip6 + off > data_end)
-                    goto pass_invalid;
-                continue;
-            }
-            if (nexthdr == 44) {
-                struct frag_hdr *frag = (void *)ip6 + off;
-                if ((void *)(frag + 1) > data_end)
-                    goto pass_invalid;
-                nexthdr = frag->nexthdr;
-                off += sizeof(*frag);
-                if ((bpf_ntohs(frag->frag_off) & 0xfff8) != 0)
-                    goto drop_invalid;
-                continue;
-            }
-            goto drop_invalid;
-        }
-
-        if (nexthdr != IPPROTO_TCP)
             goto drop_invalid;
 
-        struct tcphdr *tcp6 = (void *)ip6 + off;
+        if (ip6->nexthdr != IPPROTO_TCP)
+            goto pass;
+
+        struct tcphdr *tcp6 = (void *)ip6 + sizeof(*ip6);
         if ((void *)(tcp6 + 1) > data_end)
             goto pass_invalid;
         if (tcp6->doff < 5 || (void *)tcp6 + tcp6->doff * 4 > data_end)

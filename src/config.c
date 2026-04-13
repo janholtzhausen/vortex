@@ -91,6 +91,9 @@ void config_set_defaults(struct vortex_config *cfg)
     cfg->xdp.rate_limit_enabled = true;
     cfg->xdp.rate_limit_rps     = 1000;
     cfg->xdp.rate_limit_burst   = 2000;
+    cfg->xdp.protected_ports[0] = 80;
+    cfg->xdp.protected_ports[1] = 443;
+    cfg->xdp.protected_ports_count = 2;
 
     /* Cache defaults — slab sized to 30% of system RAM */
     cfg->cache.enabled       = true;
@@ -146,6 +149,7 @@ typedef enum {
     P_TLS,
     P_XDP,
     P_XDP_RATELIMIT,
+    P_XDP_PROTECTED_PORTS,
     P_CACHE,
     P_ACME,
     P_ACME_DNS_CFG,
@@ -247,6 +251,20 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
         if      (!strcmp(k, "enabled"))          c->xdp.rate_limit_enabled = !strcmp(val,"true");
         else if (!strcmp(k, "requests_per_second")) c->xdp.rate_limit_rps  = (uint32_t)atol(val);
         else if (!strcmp(k, "burst"))            c->xdp.rate_limit_burst   = (uint32_t)atol(val);
+        break;
+
+    case P_XDP_PROTECTED_PORTS:
+        /* Each scalar is a port number */
+        if (c->xdp.protected_ports_count < 16) {
+            uint16_t port = (uint16_t)atoi(val);
+            if (port > 0 && port <= 65535) {
+                c->xdp.protected_ports[c->xdp.protected_ports_count++] = port;
+            } else {
+                log_warn("config", "invalid port number in protected_ports: %s", val);
+            }
+        } else {
+            log_warn("config", "too many protected ports (max 16), ignoring: %s", val);
+        }
         break;
 
     case P_CACHE:
@@ -544,6 +562,9 @@ int config_load(const char *path, struct vortex_config *cfg)
                 ctx.backend_idx = -1;
             } else if (ctx.state == P_ROUTE_AUTH && !strcmp(ctx.key, "users")) {
                 ctx.state = P_ROUTE_AUTH_USERS;
+            } else if (ctx.state == P_XDP && !strcmp(ctx.key, "protected_ports")) {
+                ctx.state = P_XDP_PROTECTED_PORTS;
+                cfg->xdp.protected_ports_count = 0;
             } else if (ctx.state == P_ROUTE && !strcmp(ctx.key, "backend_headers")) {
                 ctx.state = P_ROUTE_BACKEND_HEADERS;
                 ctx.backend_header_idx = -1;
@@ -555,15 +576,17 @@ int config_load(const char *path, struct vortex_config *cfg)
 
         case YAML_SEQUENCE_END_EVENT:
             ctx.seq_depth--;
-            if (ctx.state == P_ROUTES) {
-                ctx.state = P_ROOT;
-            } else if (ctx.state == P_ROUTE_BACKENDS) {
-                ctx.state = P_ROUTE;
-            } else if (ctx.state == P_ROUTE_AUTH_USERS) {
+            if (ctx.state == P_ROUTE_AUTH_USERS) {
                 ctx.state = P_ROUTE_AUTH;
+            } else if (ctx.state == P_XDP_PROTECTED_PORTS) {
+                ctx.state = P_XDP;
             } else if (ctx.state == P_ROUTE_BACKEND_HEADERS) {
                 ctx.state = P_ROUTE;
             } else if (ctx.state == P_ROUTE_RESPONSE_HEADERS) {
+                ctx.state = P_ROUTE;
+            } else if (ctx.state == P_ROUTES) {
+                ctx.state = P_ROOT;
+            } else if (ctx.state == P_ROUTE_BACKENDS) {
                 ctx.state = P_ROUTE;
             }
             break;

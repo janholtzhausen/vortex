@@ -26,6 +26,9 @@ int  bpf_metrics_read(struct vortex_metrics *out);
 /* Global rate config */
 int  bpf_rate_config_set(uint32_t tokens_per_sec, uint32_t burst);
 
+/* Port configuration */
+int  bpf_port_config_set(const uint16_t *ports, uint8_t count);
+
 /* Blocklist file loading */
 int  bpf_blocklist_clear(void);
 int  bpf_blocklist_load_file(const char *path);
