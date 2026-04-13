@@ -28,7 +28,7 @@ latest_git_tag_version() {
 }
 
 latest_gh_release_version() {
-    gh -C "$REPO_ROOT" release list --limit 50 2>/dev/null \
+    ( cd "$REPO_ROOT" && gh release list --limit 50 2>/dev/null ) \
         | awk '{print $1}' \
         | sed 's/^v//' \
         | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
