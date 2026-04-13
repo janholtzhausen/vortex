@@ -27,11 +27,21 @@ latest_git_tag_version() {
         | sed 's/^v//'
 }
 
+latest_gh_release_version() {
+    gh -C "$REPO_ROOT" release list --limit 50 2>/dev/null \
+        | awk '{print $1}' \
+        | sed 's/^v//' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -V \
+        | tail -n 1
+}
+
 highest_known_version() {
     {
         version_file_version; printf '\n'
         latest_git_tag_version; printf '\n'
         latest_local_pkg_version; printf '\n'
+        latest_gh_release_version; printf '\n'
     } | sed '/^$/d' | sort -V | tail -n 1
 }
 
