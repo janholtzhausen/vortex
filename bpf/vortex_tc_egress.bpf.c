@@ -8,10 +8,10 @@
  */
 
 #define __BPF__
-#include "/home/janh/dev/vmlinux.h"
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "/home/janh/dev/maps.h"
+#include "maps.h"
 
 /* Maximum number of ports vortex can protect */
 #define MAX_PROTECTED_PORTS 16

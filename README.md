@@ -41,7 +41,8 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
 - XDP program attached in native mode (falls back to SKB/generic mode automatically)
 - **IP blocklist** — kernel-space drop before packet reaches userspace; loaded from file on startup and SIGHUP reload
 - **Per-IP token-bucket rate limiting** — applied to new connection SYNs; configurable RPS and burst; LRU map auto-evicts stale entries
-- **Stateful L4 TCP connection tracking** — fully stateful state machine in XDP:
+- **Port-scoped protection** — conntrack, rate limiting, and tarpit apply only to configured `protected_ports` (default: 80, 443). All other TCP traffic and all non-TCP traffic (SSH, ICMPv6, UDP, DNS, etc.) passes through XDP untouched, so server-initiated connections and management access are never affected.
+- **Stateful L4 TCP connection tracking** — fully stateful state machine in XDP (protected ports only):
   - SYN → creates `CT_SYN_SENT` entry via `BPF_NOEXIST` (SYN flood cannot overwrite ESTABLISHED entries)
   - ACK (client completing handshake) → advances to `CT_ESTABLISHED`
   - FIN → `CT_FIN_WAIT`, then `CT_CLOSING`
@@ -49,7 +50,6 @@ Vortex is built for extreme throughput on Linux using modern kernel interfaces: 
   - Non-SYN with no CT entry → **XDP_DROP** (drops ACK scans, spoofed packets, mid-stream injection attempts)
   - Idle timeouts: 30 s (SYN), 120 s (ESTABLISHED), 30 s (FIN)
   - Map capacity: 512 K connections (LRU_HASH, auto-evicts)
-  - IPv6 extension header walk capped at 128-byte offset to prevent oversized EH chains
   - TCP `doff` field validated before conntrack; invalid offsets passed to kernel without CT processing
 - BPF maps pinned under `/sys/fs/bpf/vortex` for external inspection
 - Per-CPU metrics: `rx_packets`, `rx_bytes`, `passed`, `dropped_ratelimit`, `dropped_blocklist`, `dropped_invalid`, `dropped_conntrack`
@@ -179,6 +179,8 @@ Separate threads:
 ```
 
 ### Connection State Machine (XDP)
+
+Applies to `protected_ports` only (default: 80, 443). All other ports pass through untracked.
 
 ```
                SYN (rate-limit OK, BPF_NOEXIST)
@@ -411,6 +413,10 @@ tls:
 xdp:
   mode: "auto"              # auto | native | skb
   blocklist_file: "/etc/vortex/blocklist.txt"  # One IPv4 or IPv6 literal per line
+  protected_ports:          # TCP ports XDP applies conntrack/rate-limit/tarpit to.
+    - 80                    # Default: 80 and 443. All other ports pass through
+    - 443                   # untracked — required so server-initiated connections
+                            # (SSH, apt, backend health checks) are not blocked.
   rate_limit:
     enabled: true
     requests_per_second: 1000   # New connections per second per source IP
@@ -584,7 +590,7 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 - **Stateful TCP conntrack** — non-SYN packets with no matching state are dropped; prevents ACK scans, spoofed mid-stream injection, and half-open attacks
 - **Conntrack timeouts** — stale entries expire (30 s SYN, 120 s idle, 30 s FIN)
 - **SYN flood protection** — `BPF_NOEXIST` on CT insert prevents a SYN flood from evicting ESTABLISHED entries from the LRU map
-- **IPv6 EH loop cap** — extension header walk stops at 128-byte offset; oversized EH chains are dropped
+- **Port-scoped enforcement** — conntrack, rate limiting, and tarpit apply only to `protected_ports` (default 80, 443); all other TCP and all non-TCP traffic passes through unmodified
 - **TCP doff validation** — packets with a data-offset that points outside the packet are passed to the kernel without CT tracking rather than processed
 
 ### Application Layer
@@ -658,7 +664,6 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 ## Known Limitations
 
-- **IPv6 extension headers** in the XDP program are allowlisted: plain TCP plus common hop-by-hop, routing, destination-options, and initial-fragment layouts are handled; unknown extension chains and non-initial fragments are dropped at XDP; EH chains extending beyond 128 bytes are also dropped
 - **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
 - **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (e.g. `5000`) for TLS backend routes to limit the blast radius.
 - **Backend TLS verification** is enabled by default. Per backend, set `verify_peer: false` or `insecure_skip_verify: true` to ignore certificate-chain and hostname validity checks for that origin.
