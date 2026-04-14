@@ -71,6 +71,10 @@ static void submit_client_response_send(struct worker *w, uint32_t cid,
     uring_submit(&w->uring);
 }
 
+/* Forward declaration — defined near strip_named_header below. */
+static uint8_t *find_header_ci(const uint8_t *buf, size_t n,
+                                const char *name, size_t nlen);
+
 static int inject_response_etag(struct worker *w, uint8_t *buf, int n)
 {
     if (n <= 0 || memcmp(buf, "HTTP/", 5) != 0)
@@ -500,8 +504,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
         if (_srv_hdr[0]) {
             const char *new_srv = _srv_hdr;
             size_t new_srv_len  = strlen(new_srv);
-            uint8_t *sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nServer:", 9);
-            if (!sh) sh = (uint8_t *)memmem(sbuf, hdr_len, "\r\nserver:", 9);
+            uint8_t *sh = find_header_ci(sbuf, hdr_len, "Server", 6);
             if (sh) {
                 uint8_t *vs = sh + 9;
                 while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
@@ -555,8 +558,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                 if (ttl >= 3600) snprintf(cc_val, sizeof(cc_val), "public, max-age=%u, immutable", ttl);
                 else             snprintf(cc_val, sizeof(cc_val), "public, max-age=%u", ttl);
 
-                uint8_t *cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nCache-Control:", 16);
-                if (!cch) cch = (uint8_t *)memmem(sbuf, hdr_len, "\r\ncache-control:", 16);
+                uint8_t *cch = find_header_ci(sbuf, hdr_len, "Cache-Control", 13);
 
                 if (cch && ttl >= 3600) {
                     uint8_t *vs = cch + 16;
@@ -590,9 +592,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
 
                 /* For static assets: also strip Pragma header (no-cache from Kestrel) */
                 if (ttl >= 3600 && hdr_end) {
-                    uint8_t *ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\nPragma:", 9);
-                    if (!ph)
-                        ph = (uint8_t *)memmem(sbuf, hdr_len, "\r\npragma:", 9);
+                    uint8_t *ph = find_header_ci(sbuf, hdr_len, "Pragma", 6);
                     if (ph) {
                         uint8_t *pe = (uint8_t *)FIND_CRLF(ph + 2,
                             (size_t)(sbuf + n - ph - 2));
@@ -612,9 +612,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
 
         /* ---- Inject HSTS on HTTPS responses when absent ---- */
         if (hdr_end) {
-            bool has_hsts =
-                memmem(sbuf, hdr_len, "\r\nStrict-Transport-Security:", 28) ||
-                memmem(sbuf, hdr_len, "\r\nstrict-transport-security:", 28);
+            bool has_hsts = find_header_ci(sbuf, hdr_len, "Strict-Transport-Security", 25) != NULL;
             if (!has_hsts) {
                 const char *hsts = "\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains";
                 int hsts_len = (int)strlen(hsts);
@@ -645,8 +643,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
 #endif
 
         {
-            uint8_t *ch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nConnection:", 13);
-            if (!ch) ch = (uint8_t *)memmem(sbuf, hdr_len, "\r\nconnection:", 13);
+            uint8_t *ch = find_header_ci(sbuf, hdr_len, "Connection", 10);
             if (ch) {
                 uint8_t *vs = ch + 13;
                 while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t')) vs++;
@@ -685,17 +682,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
             for (int _ri = 0; _ri < rc_resp->response_header_count && hdr_end; _ri++) {
                 const struct backend_header_rule *hr = &rc_resp->response_headers[_ri];
                 size_t _nlen = strlen(hr->name);
-                char _needle[256];
-                snprintf(_needle, sizeof(_needle), "\r\n%s:", hr->name);
-                uint8_t *_ph = (uint8_t *)memmem(sbuf, hdr_len, _needle, _nlen + 3);
-                if (!_ph) {
-                    char _low[256];
-                    snprintf(_low, sizeof(_low), "\r\n");
-                    for (size_t _i = 0; _i < _nlen && _i + 2 < sizeof(_low) - 1; _i++)
-                        _low[_i + 2] = (char)tolower((unsigned char)hr->name[_i]);
-                    _low[_nlen + 2] = ':'; _low[_nlen + 3] = '\0';
-                    _ph = (uint8_t *)memmem(sbuf, hdr_len, _low, _nlen + 3);
-                }
+                uint8_t *_ph = find_header_ci(sbuf, hdr_len, hr->name, _nlen);
                 if (hr->action == HEADER_ACTION_BLOCK) {
                     if (_ph) {
                         uint8_t *_pe = (uint8_t *)FIND_CRLF(_ph + 2,
@@ -1389,24 +1376,29 @@ static void handle_error(struct worker *w, struct io_uring_cqe *cqe, uint32_t ci
 
 /* Strip a named request header (case-insensitive: tries original name then
  * lowercase).  Modifies buf in-place; decrements *n by the removed bytes. */
+/* Single-pass case-insensitive scan for \r\n<name>: in a header block.
+ * Returns a pointer to the \r\n, or NULL if not found. */
+static uint8_t *find_header_ci(const uint8_t *buf, size_t n,
+                                const char *name, size_t nlen)
+{
+    if (n < nlen + 3) return NULL;
+    const uint8_t *end = buf + n - (nlen + 2);
+    for (const uint8_t *p = buf; p < end; p++) {
+        if (p[0] != '\r' || p[1] != '\n') continue;
+        size_t i = 0;
+        while (i < nlen &&
+               tolower((unsigned char)p[2 + i]) == tolower((unsigned char)name[i]))
+            i++;
+        if (i == nlen && p[2 + nlen] == ':')
+            return (uint8_t *)p;
+    }
+    return NULL;
+}
+
 static void strip_named_header(uint8_t *buf, int *n, const char *name)
 {
     size_t nlen = strlen(name);
-    char needle[256];
-    /* \r\n + name + : */
-    snprintf(needle, sizeof(needle), "\r\n%s:", name);
-    uint8_t *h = (uint8_t *)memmem(buf, (size_t)*n, needle, nlen + 3);
-    if (!h) {
-        /* Try lowercase */
-        needle[2] = '\0';  /* truncate to just "\r\n" */
-        char low[256];
-        snprintf(low, sizeof(low), "\r\n");
-        for (size_t i = 0; i < nlen && i + 2 < sizeof(low) - 1; i++)
-            low[i + 2] = (char)tolower((unsigned char)name[i]);
-        low[nlen + 2] = ':';
-        low[nlen + 3] = '\0';
-        h = (uint8_t *)memmem(buf, (size_t)*n, low, nlen + 3);
-    }
+    uint8_t *h = find_header_ci(buf, (size_t)*n, name, nlen);
     if (h) {
         uint8_t *le = (uint8_t *)FIND_CRLF(h + 2, (size_t)(buf + *n - h - 2));
         if (le) {

@@ -13,15 +13,7 @@
 #include <bpf/bpf_endian.h>
 #include "maps.h"
 
-/* Maximum number of ports vortex can protect */
-#define MAX_PROTECTED_PORTS 16
-
-/* Port configuration map - which ports vortex protects */
-struct port_config {
-    __be16 ports[MAX_PROTECTED_PORTS];  /* Ports in network byte order */
-    __u8   count;                       /* Number of active ports (0-16) */
-    __u8   _pad[7];                     /* Padding for alignment */
-};
+/* MAX_PROTECTED_PORTS, port_config and port_config_map are defined in maps.h */
 
 #define ETH_P_IP    0x0800
 #define ETH_P_IPV6  0x86DD

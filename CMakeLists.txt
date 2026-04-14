@@ -26,9 +26,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(VORTEX_MARCH "native" CACHE STRING "GCC/Clang -march value (native, x86-64-v3, znver3, etc.)")
-set(CMAKE_C_FLAGS_RELEASE        "-O3 -march=${VORTEX_MARCH} -mtune=${VORTEX_MARCH} -DNDEBUG -flto -D_FORTIFY_SOURCE=2 -fstack-protector-strong")
-set(CMAKE_C_FLAGS_DEBUG          "-O0 -g3 -fsanitize=address,undefined -DVORTEX_DEBUG")
-set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -D_FORTIFY_SOURCE=2 -fstack-protector-strong")
+set(CMAKE_C_FLAGS_RELEASE        "-O3 -march=${VORTEX_MARCH} -mtune=${VORTEX_MARCH} -DNDEBUG -flto -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE")
+set(CMAKE_C_FLAGS_DEBUG          "-O0 -g3 -fsanitize=address,undefined -DVORTEX_DEBUG -fPIE")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE")
 
 # Common warnings.
 # -Werror=format-security: format-string vulnerabilities are always hard errors.
@@ -36,6 +36,9 @@ add_compile_options(
     -Wall -Wextra -Wno-unused-parameter -Wno-stringop-truncation
     -Wformat -Wformat-security -Werror=format-security
 )
+
+# PIE + full RELRO: ASLR and read-only GOT at startup.
+add_link_options(-pie -Wl,-z,relro,-z,now)
 
 option(VORTEX_FUZZ "Build libFuzzer targets" OFF)
 

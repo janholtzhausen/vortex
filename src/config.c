@@ -729,6 +729,14 @@ int config_reload(const char *path, struct vortex_config *cfg)
     }
     /* Atomic copy — caller must handle live state */
     memcpy(cfg, &new_cfg, sizeof(*cfg));
+    /* Scrub credential fields from the stack-local copy so they don't linger
+     * in memory after this frame returns (core-dump hygiene). */
+    for (int _ri = 0; _ri < new_cfg.route_count; _ri++) {
+        explicit_bzero(new_cfg.routes[_ri].backend_credentials,
+                       sizeof(new_cfg.routes[_ri].backend_credentials));
+        explicit_bzero(new_cfg.routes[_ri].x_api_key,
+                       sizeof(new_cfg.routes[_ri].x_api_key));
+    }
     return 0;
 }
 

@@ -1,5 +1,5 @@
 /*
- * quic.c — HTTP/3 server via ngtcp2 + nghttp3 + OpenSSL 4.0
+ * quic.c — HTTP/3 server via ngtcp2 + nghttp3 + picotls
  *
  * Architecture:
  *   - One UDP socket per quic_server (SO_REUSEPORT — one instance total)
