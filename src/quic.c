@@ -45,8 +45,7 @@ static ngtcp2_tstamp now_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ngtcp2_tstamp)ts.tv_sec * NGTCP2_SECONDS +
-           (ngtcp2_tstamp)ts.tv_nsec;
+    return (ngtcp2_tstamp)ts.tv_sec * NGTCP2_SECONDS + (ngtcp2_tstamp)ts.tv_nsec;
 }
 
 /* ---- Per-stream state (needed by forward decls below) ---- */
@@ -54,27 +53,27 @@ struct quic_conn;
 struct quic_server;
 
 struct quic_stream {
-    int64_t  stream_id;
+    int64_t stream_id;
 
-    char     method[16];
-    char     url[512];
-    char     authority[256];
+    char method[16];
+    char url[512];
+    char authority[256];
 
     uint8_t *req_body;
-    size_t   req_body_len;
-    bool     req_too_large;
-    bool     headers_done;
-    bool     request_done;
+    size_t req_body_len;
+    bool req_too_large;
+    bool headers_done;
+    bool request_done;
 
     uint8_t *resp_buf;
-    size_t   resp_len;
-    size_t   resp_offset;
-    bool     resp_submitted;
+    size_t resp_len;
+    size_t resp_offset;
+    bool resp_submitted;
 
     struct quic_conn *conn;
 };
 
-static int  conn_send(struct quic_conn *c);
+static int conn_send(struct quic_conn *c);
 static void conn_free(struct quic_server *qs, struct quic_conn *c);
 static void submit_h3_response(struct quic_conn *c, struct quic_stream *s);
 
@@ -87,23 +86,23 @@ static uint8_t *dup_http_response(const char *resp, size_t *out_len)
 
 /* ---- Per-connection state ---- */
 struct quic_conn {
-    ngtcp2_conn              *conn;
+    ngtcp2_conn *conn;
     ngtcp2_crypto_picotls_ctx ptls_ctx;
-    ptls_t                   *ptls;
-    nghttp3_conn             *h3conn;
+    ptls_t *ptls;
+    nghttp3_conn *h3conn;
 
-    ngtcp2_crypto_conn_ref  conn_ref;
+    ngtcp2_crypto_conn_ref conn_ref;
 
     struct sockaddr_storage peer_addr;
-    socklen_t               peer_addrlen;
+    socklen_t peer_addrlen;
 
     struct quic_stream *streams[QUIC_MAX_STREAMS];
-    int                 stream_count;
+    int stream_count;
 
-    uint8_t  send_buf[65536];
+    uint8_t send_buf[65536];
     ngtcp2_tstamp last_active;
-    bool     handshake_done;
-    bool     closing;
+    bool handshake_done;
+    bool closing;
 
     struct quic_server *server;
 };
@@ -113,39 +112,39 @@ struct quic_conn {
 
 struct proxy_completion {
     struct sockaddr_storage peer_addr;
-    socklen_t               peer_addrlen;
-    int64_t                 stream_id;
-    uint8_t                *resp_buf;
-    size_t                  resp_len;
+    socklen_t peer_addrlen;
+    int64_t stream_id;
+    uint8_t *resp_buf;
+    size_t resp_len;
 };
 
 /* ---- Server state ---- */
 struct quic_server {
-    int    udp_fd;
-    int    epoll_fd;
+    int udp_fd;
+    int epoll_fd;
 
     ptls_context_t *ptls_ctx[VORTEX_MAX_ROUTES];
-    int             ptls_ctx_count;
+    int ptls_ctx_count;
 
     struct quic_conn *conns[QUIC_MAX_CONNS];
-    int               conn_count;
+    int conn_count;
 
     struct vortex_config *cfg;
-    struct cache         *cache;
-    struct router         router;
+    struct cache *cache;
+    struct router router;
 
     struct sockaddr_storage local_addr;
-    socklen_t               local_addrlen;
+    socklen_t local_addrlen;
 
-    pthread_t    thread;
+    pthread_t thread;
     volatile int stop;
 
     /* Completion ring for detached proxy threads */
-    int                    comp_efd;
-    pthread_mutex_t        comp_mu;
+    int comp_efd;
+    pthread_mutex_t comp_mu;
     struct proxy_completion comp_ring[QUIC_COMP_RING_SIZE];
-    int                    comp_head;
-    int                    comp_tail;
+    int comp_head;
+    int comp_tail;
 };
 
 /* ---- Stream helpers ---- */
@@ -153,8 +152,7 @@ struct quic_server {
 static struct quic_stream *stream_find(struct quic_conn *c, int64_t sid)
 {
     for (int i = 0; i < QUIC_MAX_STREAMS; i++)
-        if (c->streams[i] && c->streams[i]->stream_id == sid)
-            return c->streams[i];
+        if (c->streams[i] && c->streams[i]->stream_id == sid) return c->streams[i];
     return NULL;
 }
 
@@ -166,9 +164,13 @@ static struct quic_stream *stream_get_or_alloc(struct quic_conn *c, int64_t sid)
     s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->stream_id = sid;
-    s->conn      = c;
+    s->conn = c;
     for (int i = 0; i < QUIC_MAX_STREAMS; i++) {
-        if (!c->streams[i]) { c->streams[i] = s; c->stream_count++; return s; }
+        if (!c->streams[i]) {
+            c->streams[i] = s;
+            c->stream_count++;
+            return s;
+        }
     }
     free(s);
     return NULL;
@@ -180,7 +182,11 @@ static void stream_free(struct quic_conn *c, struct quic_stream *s)
     free(s->req_body);
     free(s->resp_buf);
     for (int i = 0; i < QUIC_MAX_STREAMS; i++) {
-        if (c->streams[i] == s) { c->streams[i] = NULL; c->stream_count--; break; }
+        if (c->streams[i] == s) {
+            c->streams[i] = NULL;
+            c->stream_count--;
+            break;
+        }
     }
     free(s);
 }
@@ -188,18 +194,18 @@ static void stream_free(struct quic_conn *c, struct quic_stream *s)
 /* ---- Backend proxy (detached, async via completion ring) ---- */
 
 struct proxy_args {
-    struct quic_server     *server;
+    struct quic_server *server;
     struct sockaddr_storage peer_addr;
-    socklen_t               peer_addrlen;
-    int64_t                 stream_id;
-    int                     route_idx;
-    int                     backend_idx;
-    char                    backend_addr[256];
-    char                    method[16];
-    char                    url[512];
-    char                    authority[256];
-    uint8_t                *req_body;
-    size_t                  req_body_len;
+    socklen_t peer_addrlen;
+    int64_t stream_id;
+    int route_idx;
+    int backend_idx;
+    char backend_addr[256];
+    char method[16];
+    char url[512];
+    char authority[256];
+    uint8_t *req_body;
+    size_t req_body_len;
 };
 
 /* Decode chunked transfer-encoding in-place; returns new body length. */
@@ -233,7 +239,7 @@ static void *proxy_thread(void *arg)
 {
     struct proxy_args *pa = arg;
     uint8_t *resp_buf = NULL;
-    size_t   resp_len = 0;
+    size_t resp_len = 0;
 
     char host[256] = {0}, port_str[16] = {0};
     const char *colon = strrchr(pa->backend_addr, ':');
@@ -244,7 +250,7 @@ static void *proxy_thread(void *arg)
     snprintf(port_str, sizeof(port_str), "%s", colon + 1);
 
     {
-        struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+        struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
         struct addrinfo *res = NULL;
         if (getaddrinfo(host, port_str, &hints, &res) != 0) goto push;
 
@@ -253,19 +259,19 @@ static void *proxy_thread(void *arg)
             fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd < 0) continue;
             if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
-            close(fd); fd = -1;
+            close(fd);
+            fd = -1;
         }
         freeaddrinfo(res);
         if (fd < 0) goto push;
 
         /* HTTP/1.1 request */
         char req_hdr[2048];
-        int rn = snprintf(req_hdr, sizeof(req_hdr),
+        int rn = snprintf(
+            req_hdr, sizeof(req_hdr),
             "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n",
-            pa->method[0]    ? pa->method    : "GET",
-            pa->url[0]       ? pa->url       : "/",
-            pa->authority[0] ? pa->authority : host,
-            pa->req_body_len);
+            pa->method[0] ? pa->method : "GET", pa->url[0] ? pa->url : "/",
+            pa->authority[0] ? pa->authority : host, pa->req_body_len);
         send(fd, req_hdr, (size_t)rn, MSG_NOSIGNAL);
         if (pa->req_body && pa->req_body_len)
             send(fd, pa->req_body, pa->req_body_len, MSG_NOSIGNAL);
@@ -273,7 +279,10 @@ static void *proxy_thread(void *arg)
         /* Read full response */
         size_t cap = 65536, len = 0;
         uint8_t *buf = malloc(cap);
-        if (!buf) { close(fd); goto push; }
+        if (!buf) {
+            close(fd);
+            goto push;
+        }
 
         while (1) {
             if (len == cap) {
@@ -281,7 +290,8 @@ static void *proxy_thread(void *arg)
                 size_t ncap = cap * 2 < QUIC_RESP_MAX ? cap * 2 : QUIC_RESP_MAX;
                 uint8_t *nb = realloc(buf, ncap);
                 if (!nb) break;
-                buf = nb; cap = ncap;
+                buf = nb;
+                cap = ncap;
             }
             ssize_t r = recv(fd, buf + len, cap - len, 0);
             if (r <= 0) break;
@@ -297,12 +307,12 @@ static void *proxy_thread(void *arg)
             if (!te) te = memmem(buf, hdr_area, "\r\ntransfer-encoding:", 20);
             bool chunked = false;
             if (te) {
-                const uint8_t *tv  = te + 20;
+                const uint8_t *tv = te + 20;
                 const uint8_t *eol = memmem(tv, (size_t)(hdr_end_p - tv), "\r\n", 2);
                 if (!eol) eol = hdr_end_p;
-                while (tv < eol && (*tv == ' ' || *tv == '\t')) tv++;
-                if ((size_t)(eol - tv) >= 7 &&
-                    strncasecmp((const char *)tv, "chunked", 7) == 0)
+                while (tv < eol && (*tv == ' ' || *tv == '\t'))
+                    tv++;
+                if ((size_t)(eol - tv) >= 7 && strncasecmp((const char *)tv, "chunked", 7) == 0)
                     chunked = true;
             }
             if (chunked) {
@@ -312,15 +322,14 @@ static void *proxy_thread(void *arg)
             }
         }
 
-        if (pa->server->cache && pa->server->cache->index &&
-            strcmp(pa->method, "GET") == 0 && len > 0) {
+        if (pa->server->cache && pa->server->cache->index && strcmp(pa->method, "GET") == 0 &&
+            len > 0) {
             const uint8_t *hdr_end2 = memmem(buf, len, "\r\n\r\n", 4);
             if (hdr_end2) {
                 size_t hdr_len = (size_t)(hdr_end2 + 4 - buf);
                 size_t body_len = len - hdr_len;
-                bool is_chunked =
-                    memmem(buf, hdr_len, "\r\nTransfer-Encoding:", 20) ||
-                    memmem(buf, hdr_len, "\r\ntransfer-encoding:", 20);
+                bool is_chunked = memmem(buf, hdr_len, "\r\nTransfer-Encoding:", 20) ||
+                                  memmem(buf, hdr_len, "\r\ntransfer-encoding:", 20);
                 int status = 0;
                 if (len > 12) {
                     const char *sp = (const char *)buf + 9;
@@ -331,8 +340,8 @@ static void *proxy_thread(void *arg)
                 if (!is_chunked && status == 200 && ttl > 0 && body_len > 0) {
                     char cache_key[1024];
                     snprintf(cache_key, sizeof(cache_key), "%s|%s", pa->authority, pa->url);
-                    cache_store(pa->server->cache, cache_key, strlen(cache_key),
-                                (uint16_t)status, ttl, buf, hdr_len, buf + hdr_len, body_len);
+                    cache_store(pa->server->cache, cache_key, strlen(cache_key), (uint16_t)status,
+                                ttl, buf, hdr_len, buf + hdr_len, body_len);
                     log_debug("h3_cache_store", "stream=%lld url=%s ttl=%u body=%zu",
                               (long long)pa->stream_id, cache_key, ttl, body_len);
                 }
@@ -352,10 +361,10 @@ push:;
         struct proxy_completion *comp = &qs->comp_ring[qs->comp_tail];
         memcpy(&comp->peer_addr, &pa->peer_addr, pa->peer_addrlen);
         comp->peer_addrlen = pa->peer_addrlen;
-        comp->stream_id    = pa->stream_id;
-        comp->resp_buf     = resp_buf;
-        comp->resp_len     = resp_len;
-        qs->comp_tail      = next;
+        comp->stream_id = pa->stream_id;
+        comp->resp_buf = resp_buf;
+        comp->resp_len = resp_len;
+        qs->comp_tail = next;
         uint64_t one = 1;
         (void)write(qs->comp_efd, &one, sizeof(one));
         resp_buf = NULL; /* ownership transferred */
@@ -375,32 +384,29 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
     struct quic_server *qs = c->server;
 
     if (s->req_too_large) {
-        static const char r413[] =
-            "HTTP/1.1 413 Payload Too Large\r\n"
-            "Content-Length: 0\r\n\r\n";
+        static const char r413[] = "HTTP/1.1 413 Payload Too Large\r\n"
+                                   "Content-Length: 0\r\n\r\n";
         s->resp_buf = dup_http_response(r413, &s->resp_len);
         return;
     }
 
-    if (qs->cache && qs->cache->index &&
-        s->method[0] && strcmp(s->method, "GET") == 0) {
+    if (qs->cache && qs->cache->index && s->method[0] && strcmp(s->method, "GET") == 0) {
         char cache_key[1024];
         snprintf(cache_key, sizeof(cache_key), "%s|%s", s->authority, s->url);
         struct cached_response cached;
         if (cache_fetch_copy(qs->cache, cache_key, strlen(cache_key), &cached) == 0) {
             s->resp_buf = cached.data;
             s->resp_len = cached.header_len + cached.body_len;
-            log_debug("h3_cache_hit", "stream=%lld url=%s",
-                      (long long)s->stream_id, cache_key);
+            log_debug("h3_cache_hit", "stream=%lld url=%s", (long long)s->stream_id, cache_key);
             return;
         }
     }
 
     int route_idx = 0;
     for (int i = 0; i < qs->cfg->route_count; i++) {
-        if (s->authority[0] &&
-            strcasecmp(s->authority, qs->cfg->routes[i].hostname) == 0) {
-            route_idx = i; break;
+        if (s->authority[0] && strcasecmp(s->authority, qs->cfg->routes[i].hostname) == 0) {
+            route_idx = i;
+            break;
         }
     }
 
@@ -416,19 +422,22 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
     {
         struct proxy_args *pa = calloc(1, sizeof(*pa));
         if (!pa) goto err_502;
-        pa->server       = qs;
+        pa->server = qs;
         memcpy(&pa->peer_addr, &c->peer_addr, c->peer_addrlen);
         pa->peer_addrlen = c->peer_addrlen;
-        pa->stream_id    = s->stream_id;
-        pa->route_idx    = route_idx;
-        pa->backend_idx  = backend_idx;
+        pa->stream_id = s->stream_id;
+        pa->route_idx = route_idx;
+        pa->backend_idx = backend_idx;
         snprintf(pa->backend_addr, sizeof(pa->backend_addr), "%s", addr);
         snprintf(pa->method, sizeof(pa->method), "%s", s->method);
         snprintf(pa->url, sizeof(pa->url), "%s", s->url);
         snprintf(pa->authority, sizeof(pa->authority), "%s", s->authority);
         if (s->req_body_len > 0) {
             pa->req_body = malloc(s->req_body_len);
-            if (!pa->req_body) { free(pa); goto err_502; }
+            if (!pa->req_body) {
+                free(pa);
+                goto err_502;
+            }
             memcpy(pa->req_body, s->req_body, s->req_body_len);
             pa->req_body_len = s->req_body_len;
         }
@@ -460,153 +469,154 @@ static ngtcp2_conn *quic_get_conn(ngtcp2_crypto_conn_ref *ref)
     return ((struct quic_conn *)ref->user_data)->conn;
 }
 
-static int cb_recv_client_initial(ngtcp2_conn *conn, const ngtcp2_cid *dcid,
-                                   void *user_data)
+static int cb_recv_client_initial(ngtcp2_conn *conn, const ngtcp2_cid *dcid, void *user_data)
 {
     (void)conn;
-    return ngtcp2_crypto_recv_client_initial_cb(
-        ((struct quic_conn *)user_data)->conn, dcid, user_data);
+    return ngtcp2_crypto_recv_client_initial_cb(((struct quic_conn *)user_data)->conn, dcid,
+                                                user_data);
 }
 
-static int cb_recv_crypto_data(ngtcp2_conn *conn,
-                                ngtcp2_encryption_level level,
-                                uint64_t offset,
-                                const uint8_t *data, size_t datalen,
-                                void *user_data)
+static int cb_recv_crypto_data(ngtcp2_conn *conn, ngtcp2_encryption_level level, uint64_t offset,
+                               const uint8_t *data, size_t datalen, void *user_data)
 {
     (void)conn;
-    return ngtcp2_crypto_recv_crypto_data_cb(
-        ((struct quic_conn *)user_data)->conn,
-        level, offset, data, datalen, user_data);
+    return ngtcp2_crypto_recv_crypto_data_cb(((struct quic_conn *)user_data)->conn, level, offset,
+                                             data, datalen, user_data);
 }
 
 static int cb_handshake_completed(ngtcp2_conn *conn, void *user_data);
 
-static int cb_recv_stream_data(ngtcp2_conn *conn, uint32_t flags,
-                                int64_t stream_id, uint64_t offset,
-                                const uint8_t *data, size_t datalen,
-                                void *user_data, void *stream_user_data)
+static int cb_recv_stream_data(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
+                               uint64_t offset, const uint8_t *data, size_t datalen,
+                               void *user_data, void *stream_user_data)
 {
-    (void)conn; (void)offset; (void)stream_user_data;
+    (void)conn;
+    (void)offset;
+    (void)stream_user_data;
     struct quic_conn *c = user_data;
     if (!c->h3conn) return 0;
     nghttp3_ssize consumed = nghttp3_conn_read_stream(
-        c->h3conn, stream_id, data, datalen,
-        (flags & NGTCP2_STREAM_DATA_FLAG_FIN) ? 1 : 0);
+        c->h3conn, stream_id, data, datalen, (flags & NGTCP2_STREAM_DATA_FLAG_FIN) ? 1 : 0);
     if (consumed < 0) return NGTCP2_ERR_CALLBACK_FAILURE;
     ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, (uint64_t)consumed);
     ngtcp2_conn_extend_max_offset(c->conn, (uint64_t)consumed);
     return 0;
 }
 
-static int cb_acked_stream_data_offset(ngtcp2_conn *conn, int64_t stream_id,
-                                        uint64_t offset, uint64_t datalen,
-                                        void *user_data, void *stream_user_data)
+static int cb_acked_stream_data_offset(ngtcp2_conn *conn, int64_t stream_id, uint64_t offset,
+                                       uint64_t datalen, void *user_data, void *stream_user_data)
 {
-    (void)conn; (void)offset; (void)stream_user_data;
+    (void)conn;
+    (void)offset;
+    (void)stream_user_data;
     struct quic_conn *c = user_data;
-    if (c->h3conn)
-        nghttp3_conn_add_ack_offset(c->h3conn, stream_id, datalen);
+    if (c->h3conn) nghttp3_conn_add_ack_offset(c->h3conn, stream_id, datalen);
     return 0;
 }
 
-static int cb_stream_close(ngtcp2_conn *conn, uint32_t flags,
-                            int64_t stream_id, uint64_t app_error_code,
-                            void *user_data, void *stream_user_data)
+static int cb_stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
+                           uint64_t app_error_code, void *user_data, void *stream_user_data)
 {
-    (void)conn; (void)flags; (void)stream_user_data;
+    (void)conn;
+    (void)flags;
+    (void)stream_user_data;
     struct quic_conn *c = user_data;
-    if (c->h3conn)
-        nghttp3_conn_close_stream(c->h3conn, stream_id, app_error_code);
+    if (c->h3conn) nghttp3_conn_close_stream(c->h3conn, stream_id, app_error_code);
     struct quic_stream *s = stream_find(c, stream_id);
     if (s) stream_free(c, s);
     return 0;
 }
 
-static void cb_rand(uint8_t *dest, size_t destlen,
-                    const ngtcp2_rand_ctx *rand_ctx)
+static void cb_rand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *rand_ctx)
 {
     (void)rand_ctx;
     ptls_minicrypto_random_bytes(dest, destlen);
 }
 
-static int cb_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid,
-                                     uint8_t *token, size_t cidlen,
-                                     void *user_data)
+static int cb_get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
+                                    size_t cidlen, void *user_data)
 {
-    (void)conn; (void)user_data;
+    (void)conn;
+    (void)user_data;
     ptls_minicrypto_random_bytes(cid->data, cidlen);
     cid->datalen = cidlen;
     ptls_minicrypto_random_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
     return 0;
 }
 
-static int cb_get_path_challenge_data(ngtcp2_conn *conn, uint8_t *data,
-                                       void *user_data)
+static int cb_get_path_challenge_data(ngtcp2_conn *conn, uint8_t *data, void *user_data)
 {
-    (void)conn; (void)user_data;
+    (void)conn;
+    (void)user_data;
     ptls_minicrypto_random_bytes(data, NGTCP2_PATH_CHALLENGE_DATALEN);
     return 0;
 }
 
 static const ngtcp2_callbacks g_quic_cbs = {
-    .recv_client_initial      = cb_recv_client_initial,
-    .recv_crypto_data         = cb_recv_crypto_data,
-    .handshake_completed      = cb_handshake_completed,
-    .encrypt                  = ngtcp2_crypto_encrypt_cb,
-    .decrypt                  = ngtcp2_crypto_decrypt_cb,
-    .hp_mask                  = ngtcp2_crypto_hp_mask_cb,
-    .recv_stream_data         = cb_recv_stream_data,
+    .recv_client_initial = cb_recv_client_initial,
+    .recv_crypto_data = cb_recv_crypto_data,
+    .handshake_completed = cb_handshake_completed,
+    .encrypt = ngtcp2_crypto_encrypt_cb,
+    .decrypt = ngtcp2_crypto_decrypt_cb,
+    .hp_mask = ngtcp2_crypto_hp_mask_cb,
+    .recv_stream_data = cb_recv_stream_data,
     .acked_stream_data_offset = cb_acked_stream_data_offset,
-    .stream_close             = cb_stream_close,
-    .rand                     = cb_rand,
-    .get_new_connection_id    = cb_get_new_connection_id,
-    .update_key               = ngtcp2_crypto_update_key_cb,
-    .delete_crypto_aead_ctx   = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
+    .stream_close = cb_stream_close,
+    .rand = cb_rand,
+    .get_new_connection_id = cb_get_new_connection_id,
+    .update_key = ngtcp2_crypto_update_key_cb,
+    .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
     .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
-    .get_path_challenge_data  = cb_get_path_challenge_data,
-    .version_negotiation      = ngtcp2_crypto_version_negotiation_cb,
+    .get_path_challenge_data = cb_get_path_challenge_data,
+    .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
 };
 
 /* ---- nghttp3 callbacks ---- */
 
-static int h3_begin_headers(nghttp3_conn *h3, int64_t stream_id,
-                             void *conn_user_data, void *stream_user_data)
+static int h3_begin_headers(nghttp3_conn *h3, int64_t stream_id, void *conn_user_data,
+                            void *stream_user_data)
 {
-    (void)h3; (void)stream_user_data;
+    (void)h3;
+    (void)stream_user_data;
     struct quic_conn *c = conn_user_data;
     return stream_get_or_alloc(c, stream_id) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
 }
 
-static int h3_recv_header(nghttp3_conn *h3, int64_t stream_id,
-                           int32_t token,
-                           nghttp3_rcbuf *name, nghttp3_rcbuf *value,
-                           uint8_t flags,
-                           void *conn_user_data, void *stream_user_data)
+static int h3_recv_header(nghttp3_conn *h3, int64_t stream_id, int32_t token, nghttp3_rcbuf *name,
+                          nghttp3_rcbuf *value, uint8_t flags, void *conn_user_data,
+                          void *stream_user_data)
 {
-    (void)h3; (void)token; (void)flags; (void)stream_user_data;
+    (void)h3;
+    (void)token;
+    (void)flags;
+    (void)stream_user_data;
     struct quic_stream *s = stream_find((struct quic_conn *)conn_user_data, stream_id);
     if (!s) return 0;
 
     nghttp3_vec nv = nghttp3_rcbuf_get_buf(name);
     nghttp3_vec vv = nghttp3_rcbuf_get_buf(value);
 
-#define HDR_COPY(field, hname) \
-    do { if (nv.len == sizeof(hname)-1 && memcmp(nv.base, hname, nv.len) == 0) { \
-        size_t l = vv.len < sizeof(s->field)-1 ? vv.len : sizeof(s->field)-1; \
-        memcpy(s->field, vv.base, l); s->field[l] = '\0'; } } while(0)
+#define HDR_COPY(field, hname)                                                                     \
+    do {                                                                                           \
+        if (nv.len == sizeof(hname) - 1 && memcmp(nv.base, hname, nv.len) == 0) {                  \
+            size_t l = vv.len < sizeof(s->field) - 1 ? vv.len : sizeof(s->field) - 1;              \
+            memcpy(s->field, vv.base, l);                                                          \
+            s->field[l] = '\0';                                                                    \
+        }                                                                                          \
+    } while (0)
 
-    HDR_COPY(method,    ":method");
-    HDR_COPY(url,       ":path");
+    HDR_COPY(method, ":method");
+    HDR_COPY(url, ":path");
     HDR_COPY(authority, ":authority");
 #undef HDR_COPY
     return 0;
 }
 
-static int h3_end_headers(nghttp3_conn *h3, int64_t stream_id, int fin,
-                           void *conn_user_data, void *stream_user_data)
+static int h3_end_headers(nghttp3_conn *h3, int64_t stream_id, int fin, void *conn_user_data,
+                          void *stream_user_data)
 {
-    (void)h3; (void)stream_user_data;
+    (void)h3;
+    (void)stream_user_data;
     struct quic_conn *c = conn_user_data;
     struct quic_stream *s = stream_find(c, stream_id);
     if (!s) return 0;
@@ -618,11 +628,11 @@ static int h3_end_headers(nghttp3_conn *h3, int64_t stream_id, int fin,
     return 0;
 }
 
-static int h3_recv_data(nghttp3_conn *h3, int64_t stream_id,
-                         const uint8_t *data, size_t datalen,
-                         void *conn_user_data, void *stream_user_data)
+static int h3_recv_data(nghttp3_conn *h3, int64_t stream_id, const uint8_t *data, size_t datalen,
+                        void *conn_user_data, void *stream_user_data)
 {
-    (void)h3; (void)stream_user_data;
+    (void)h3;
+    (void)stream_user_data;
     struct quic_conn *c = (struct quic_conn *)conn_user_data;
     struct quic_stream *s = stream_find(c, stream_id);
     if (!s) return 0;
@@ -646,10 +656,11 @@ static int h3_recv_data(nghttp3_conn *h3, int64_t stream_id,
     return 0;
 }
 
-static int h3_end_stream(nghttp3_conn *h3, int64_t stream_id,
-                          void *conn_user_data, void *stream_user_data)
+static int h3_end_stream(nghttp3_conn *h3, int64_t stream_id, void *conn_user_data,
+                         void *stream_user_data)
 {
-    (void)h3; (void)stream_user_data;
+    (void)h3;
+    (void)stream_user_data;
     struct quic_conn *c = conn_user_data;
     struct quic_stream *s = stream_find(c, stream_id);
     if (!s || s->request_done) return 0;
@@ -658,11 +669,11 @@ static int h3_end_stream(nghttp3_conn *h3, int64_t stream_id,
     return 0;
 }
 
-static int h3_deferred_consume(nghttp3_conn *h3, int64_t stream_id,
-                                size_t consumed,
-                                void *conn_user_data, void *stream_user_data)
+static int h3_deferred_consume(nghttp3_conn *h3, int64_t stream_id, size_t consumed,
+                               void *conn_user_data, void *stream_user_data)
 {
-    (void)h3; (void)stream_user_data;
+    (void)h3;
+    (void)stream_user_data;
     struct quic_conn *c = conn_user_data;
     ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, consumed);
     ngtcp2_conn_extend_max_offset(c->conn, consumed);
@@ -670,11 +681,11 @@ static int h3_deferred_consume(nghttp3_conn *h3, int64_t stream_id,
 }
 
 static const nghttp3_callbacks g_h3cbs = {
-    .begin_headers    = h3_begin_headers,
-    .recv_header      = h3_recv_header,
-    .end_headers      = h3_end_headers,
-    .recv_data        = h3_recv_data,
-    .end_stream       = h3_end_stream,
+    .begin_headers = h3_begin_headers,
+    .recv_header = h3_recv_header,
+    .end_headers = h3_end_headers,
+    .recv_data = h3_recv_data,
+    .end_stream = h3_end_stream,
     .deferred_consume = h3_deferred_consume,
 };
 
@@ -705,25 +716,36 @@ static int cb_handshake_completed(ngtcp2_conn *conn, void *user_data)
 
 /* ---- nghttp3 read_data: deliver response body bytes ---- */
 
-static nghttp3_ssize h3_read_data(nghttp3_conn *h3, int64_t stream_id,
-                                   nghttp3_vec *vec, size_t veccnt,
-                                   uint32_t *pflags,
-                                   void *conn_user_data, void *stream_user_data)
+static nghttp3_ssize h3_read_data(nghttp3_conn *h3, int64_t stream_id, nghttp3_vec *vec,
+                                  size_t veccnt, uint32_t *pflags, void *conn_user_data,
+                                  void *stream_user_data)
 {
-    (void)h3; (void)stream_id; (void)veccnt; (void)conn_user_data;
+    (void)h3;
+    (void)stream_id;
+    (void)veccnt;
+    (void)conn_user_data;
     struct quic_stream *s = stream_user_data;
-    if (!s || !s->resp_buf) { *pflags = NGHTTP3_DATA_FLAG_EOF; return 0; }
+    if (!s || !s->resp_buf) {
+        *pflags = NGHTTP3_DATA_FLAG_EOF;
+        return 0;
+    }
 
     const char *hdr_end = memmem(s->resp_buf, s->resp_len, "\r\n\r\n", 4);
-    if (!hdr_end) { *pflags = NGHTTP3_DATA_FLAG_EOF; return 0; }
+    if (!hdr_end) {
+        *pflags = NGHTTP3_DATA_FLAG_EOF;
+        return 0;
+    }
     size_t body_start = (size_t)(hdr_end + 4 - (char *)s->resp_buf);
-    size_t body_len   = s->resp_len > body_start ? s->resp_len - body_start : 0;
+    size_t body_len = s->resp_len > body_start ? s->resp_len - body_start : 0;
 
-    if (s->resp_offset >= body_len) { *pflags = NGHTTP3_DATA_FLAG_EOF; return 0; }
+    if (s->resp_offset >= body_len) {
+        *pflags = NGHTTP3_DATA_FLAG_EOF;
+        return 0;
+    }
 
-    vec[0].base     = s->resp_buf + body_start + s->resp_offset;
-    vec[0].len      = body_len - s->resp_offset;
-    s->resp_offset  = body_len;
+    vec[0].base = s->resp_buf + body_start + s->resp_offset;
+    vec[0].len = body_len - s->resp_offset;
+    s->resp_offset = body_len;
     *pflags = NGHTTP3_DATA_FLAG_EOF;
     return 1;
 }
@@ -753,25 +775,26 @@ static void submit_h3_response(struct quic_conn *c, struct quic_stream *s)
     size_t nvlen = 0;
     bool hsts_seen = false;
 
-    nva[nvlen++] = (nghttp3_nv){
-        .name     = (const uint8_t *)":status",
-        .value    = (const uint8_t *)status_str,
-        .namelen  = 7,
-        .valuelen = strlen(status_str),
-        .flags    = NGHTTP3_NV_FLAG_NONE };
+    nva[nvlen++] = (nghttp3_nv){.name = (const uint8_t *)":status",
+                                .value = (const uint8_t *)status_str,
+                                .namelen = 7,
+                                .valuelen = strlen(status_str),
+                                .flags = NGHTTP3_NV_FLAG_NONE};
 
-    nva[nvlen++] = (nghttp3_nv){
-        .name     = (const uint8_t *)"alt-svc",
-        .value    = (const uint8_t *)"h3=\":443\"; ma=86400",
-        .namelen  = 7,
-        .valuelen = 18,
-        .flags    = NGHTTP3_NV_FLAG_NONE };
+    nva[nvlen++] = (nghttp3_nv){.name = (const uint8_t *)"alt-svc",
+                                .value = (const uint8_t *)"h3=\":443\"; ma=86400",
+                                .namelen = 7,
+                                .valuelen = 18,
+                                .flags = NGHTTP3_NV_FLAG_NONE};
 
     /* Walk HTTP/1.1 headers; skip hop-by-hop */
     const char *p = (char *)s->resp_buf;
-    size_t rem    = s->resp_len;
+    size_t rem = s->resp_len;
     const char *nl = memmem(p, rem, "\r\n", 2); /* skip status line */
-    if (nl) { rem -= (size_t)(nl + 2 - p); p = nl + 2; }
+    if (nl) {
+        rem -= (size_t)(nl + 2 - p);
+        p = nl + 2;
+    }
 
     /* Storage for lowercased name/value copies */
     static __thread char hdr_names[MAX_H3_HDRS][128];
@@ -787,47 +810,48 @@ static void submit_h3_response(struct quic_conn *c, struct quic_stream *s)
 
         size_t nlen = (size_t)(colon - p);
         const char *vs = colon + 1;
-        while (vs < lend && (*vs == ' ' || *vs == '\t')) vs++;
+        while (vs < lend && (*vs == ' ' || *vs == '\t'))
+            vs++;
         size_t vlen = (size_t)(lend - vs);
 
         /* Skip hop-by-hop */
         if ((nlen == 10 && strncasecmp(p, "connection", 10) == 0) ||
             (nlen == 17 && strncasecmp(p, "transfer-encoding", 17) == 0) ||
             (nlen == 10 && strncasecmp(p, "keep-alive", 10) == 0) ||
-            (nlen ==  6 && strncasecmp(p, "pragma", 6) == 0)) {
-            rem -= (size_t)(lend + 2 - p); p = lend + 2; continue;
+            (nlen == 6 && strncasecmp(p, "pragma", 6) == 0)) {
+            rem -= (size_t)(lend + 2 - p);
+            p = lend + 2;
+            continue;
         }
 
-        if (nlen == 25 && strncasecmp(p, "strict-transport-security", 25) == 0)
-            hsts_seen = true;
+        if (nlen == 25 && strncasecmp(p, "strict-transport-security", 25) == 0) hsts_seen = true;
 
-        size_t nl2 = nlen < sizeof(hdr_names[0])-1 ? nlen : sizeof(hdr_names[0])-1;
-        size_t vl2 = vlen < sizeof(hdr_vals[0])-1  ? vlen : sizeof(hdr_vals[0])-1;
+        size_t nl2 = nlen < sizeof(hdr_names[0]) - 1 ? nlen : sizeof(hdr_names[0]) - 1;
+        size_t vl2 = vlen < sizeof(hdr_vals[0]) - 1 ? vlen : sizeof(hdr_vals[0]) - 1;
         for (size_t i = 0; i < nl2; i++)
             hdr_names[hi][i] = (char)tolower((unsigned char)p[i]);
         hdr_names[hi][nl2] = '\0';
         memcpy(hdr_vals[hi], vs, vl2);
         hdr_vals[hi][vl2] = '\0';
 
-        nva[nvlen++] = (nghttp3_nv){
-            .name     = (const uint8_t *)hdr_names[hi],
-            .value    = (const uint8_t *)hdr_vals[hi],
-            .namelen  = nl2,
-            .valuelen = vl2,
-            .flags    = NGHTTP3_NV_FLAG_NONE };
+        nva[nvlen++] = (nghttp3_nv){.name = (const uint8_t *)hdr_names[hi],
+                                    .value = (const uint8_t *)hdr_vals[hi],
+                                    .namelen = nl2,
+                                    .valuelen = vl2,
+                                    .flags = NGHTTP3_NV_FLAG_NONE};
         hi++;
 
-        rem -= (size_t)(lend + 2 - p); p = lend + 2;
+        rem -= (size_t)(lend + 2 - p);
+        p = lend + 2;
     }
 
     if (!hsts_seen && nvlen < MAX_H3_HDRS) {
         static const uint8_t hsts[] = "max-age=31536000; includeSubDomains";
-        nva[nvlen++] = (nghttp3_nv){
-            .name     = (const uint8_t *)"strict-transport-security",
-            .value    = hsts,
-            .namelen  = 25,
-            .valuelen = sizeof(hsts) - 1,
-            .flags    = NGHTTP3_NV_FLAG_NONE };
+        nva[nvlen++] = (nghttp3_nv){.name = (const uint8_t *)"strict-transport-security",
+                                    .value = hsts,
+                                    .namelen = 25,
+                                    .valuelen = sizeof(hsts) - 1,
+                                    .flags = NGHTTP3_NV_FLAG_NONE};
     }
 
     /* Body */
@@ -835,16 +859,14 @@ static void submit_h3_response(struct quic_conn *c, struct quic_stream *s)
     size_t body_len = 0;
     if (hdr_end) {
         size_t ho = (size_t)(hdr_end + 4 - (char *)s->resp_buf);
-        body_len  = s->resp_len > ho ? s->resp_len - ho : 0;
+        body_len = s->resp_len > ho ? s->resp_len - ho : 0;
     }
 
-    nghttp3_data_reader dr = { .read_data = h3_read_data };
-    int rv = nghttp3_conn_submit_response(c->h3conn, s->stream_id,
-                                          nva, nvlen,
-                                          body_len ? &dr : NULL);
+    nghttp3_data_reader dr = {.read_data = h3_read_data};
+    int rv =
+        nghttp3_conn_submit_response(c->h3conn, s->stream_id, nva, nvlen, body_len ? &dr : NULL);
     if (rv != 0)
-        log_error("quic_h3", "submit_response sid=%lld err=%d",
-            (long long)s->stream_id, rv);
+        log_error("quic_h3", "submit_response sid=%lld err=%d", (long long)s->stream_id, rv);
 }
 
 /* ---- QUIC connection send ---- */
@@ -857,8 +879,7 @@ static int conn_send(struct quic_conn *c)
         /* Submit responses for any ready streams */
         for (int i = 0; i < QUIC_MAX_STREAMS; i++) {
             struct quic_stream *s = c->streams[i];
-            if (s && s->request_done && s->resp_buf && !s->resp_submitted)
-                submit_h3_response(c, s);
+            if (s && s->request_done && s->resp_buf && !s->resp_submitted) submit_h3_response(c, s);
         }
 
         /* Flush nghttp3 → ngtcp2 */
@@ -866,37 +887,39 @@ static int conn_send(struct quic_conn *c)
             nghttp3_vec vec[16];
             int64_t stream_id;
             int fin;
-            nghttp3_ssize sveccnt = nghttp3_conn_writev_stream(
-                c->h3conn, &stream_id, &fin, vec, 16);
+            nghttp3_ssize sveccnt =
+                nghttp3_conn_writev_stream(c->h3conn, &stream_id, &fin, vec, 16);
             if (sveccnt < 0 || (sveccnt == 0 && stream_id < 0)) break;
 
             size_t total = 0;
             ngtcp2_vec nv[16];
             for (nghttp3_ssize i = 0; i < sveccnt; i++) {
-                nv[i].base = vec[i].base; nv[i].len = vec[i].len;
+                nv[i].base = vec[i].base;
+                nv[i].len = vec[i].len;
                 total += vec[i].len;
             }
 
             uint32_t wf = fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0;
-            ngtcp2_ssize n = ngtcp2_conn_writev_stream(
-                c->conn, NULL, NULL,
-                c->send_buf, sizeof(c->send_buf),
-                NULL, wf, stream_id, nv, (size_t)sveccnt, ts);
+            ngtcp2_ssize n =
+                ngtcp2_conn_writev_stream(c->conn, NULL, NULL, c->send_buf, sizeof(c->send_buf),
+                                          NULL, wf, stream_id, nv, (size_t)sveccnt, ts);
             if (n <= 0) break;
 
             sendto(c->server->udp_fd, c->send_buf, (size_t)n, MSG_DONTWAIT,
                    (struct sockaddr *)&c->peer_addr, c->peer_addrlen);
 
-            if (total > 0)
-                nghttp3_conn_add_write_offset(c->h3conn, stream_id, total);
+            if (total > 0) nghttp3_conn_add_write_offset(c->h3conn, stream_id, total);
         }
     }
 
     /* Flush ngtcp2 control / ack / handshake packets */
     for (;;) {
-        ngtcp2_ssize n = ngtcp2_conn_write_pkt(
-            c->conn, NULL, NULL, c->send_buf, sizeof(c->send_buf), ts);
-        if (n < 0) { if (n == NGTCP2_ERR_WRITE_MORE) continue; break; }
+        ngtcp2_ssize n =
+            ngtcp2_conn_write_pkt(c->conn, NULL, NULL, c->send_buf, sizeof(c->send_buf), ts);
+        if (n < 0) {
+            if (n == NGTCP2_ERR_WRITE_MORE) continue;
+            break;
+        }
         if (n == 0) break;
         sendto(c->server->udp_fd, c->send_buf, (size_t)n, MSG_DONTWAIT,
                (struct sockaddr *)&c->peer_addr, c->peer_addrlen);
@@ -906,10 +929,8 @@ static int conn_send(struct quic_conn *c)
 
 /* ---- Connection lifecycle ---- */
 
-static struct quic_conn *conn_new(struct quic_server *qs,
-                                   const struct sockaddr *peer,
-                                   socklen_t peer_addrlen,
-                                   const uint8_t *pkt, size_t pktlen)
+static struct quic_conn *conn_new(struct quic_server *qs, const struct sockaddr *peer,
+                                  socklen_t peer_addrlen, const uint8_t *pkt, size_t pktlen)
 {
     ngtcp2_pkt_hd hd;
     if (ngtcp2_pkt_decode_hd_long(&hd, pkt, pktlen) < 0) return NULL;
@@ -921,12 +942,18 @@ static struct quic_conn *conn_new(struct quic_server *qs,
     c->peer_addrlen = peer_addrlen;
 
     ptls_context_t *pctx = qs->ptls_ctx_count > 0 ? qs->ptls_ctx[0] : NULL;
-    if (!pctx) { free(c); return NULL; }
+    if (!pctx) {
+        free(c);
+        return NULL;
+    }
 
     c->ptls = ptls_new(pctx, 1 /* is_server */);
-    if (!c->ptls) { free(c); return NULL; }
+    if (!c->ptls) {
+        free(c);
+        return NULL;
+    }
 
-    c->conn_ref.get_conn  = quic_get_conn;
+    c->conn_ref.get_conn = quic_get_conn;
     c->conn_ref.user_data = c;
     *(ngtcp2_crypto_conn_ref **)ptls_get_data_ptr(c->ptls) = &c->conn_ref;
 
@@ -934,7 +961,10 @@ static struct quic_conn *conn_new(struct quic_server *qs,
     c->ptls_ctx.ptls = c->ptls;
 
     if (ngtcp2_crypto_picotls_configure_server_session(&c->ptls_ctx) != 0) {
-        ptls_free(c->ptls); c->ptls = NULL; free(c); return NULL;
+        ptls_free(c->ptls);
+        c->ptls = NULL;
+        free(c);
+        return NULL;
     }
 
     /* Generate server connection ID */
@@ -949,31 +979,30 @@ static struct quic_conn *conn_new(struct quic_server *qs,
 
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
-    params.initial_max_stream_data_bidi_local  = 256 * 1024;
+    params.initial_max_stream_data_bidi_local = 256 * 1024;
     params.initial_max_stream_data_bidi_remote = 256 * 1024;
-    params.initial_max_stream_data_uni         = 256 * 1024;
-    params.initial_max_data                    = 1 * 1024 * 1024;
-    params.initial_max_streams_bidi            = 100;
-    params.initial_max_streams_uni             = 3;
-    params.max_idle_timeout                    = 30 * NGTCP2_SECONDS;
-    params.active_connection_id_limit          = 7;
+    params.initial_max_stream_data_uni = 256 * 1024;
+    params.initial_max_data = 1 * 1024 * 1024;
+    params.initial_max_streams_bidi = 100;
+    params.initial_max_streams_uni = 3;
+    params.max_idle_timeout = 30 * NGTCP2_SECONDS;
+    params.active_connection_id_limit = 7;
     /* Required by ngtcp2: server must echo the client's Initial DCID */
-    params.original_dcid                       = hd.dcid;
-    params.original_dcid_present               = 1;
+    params.original_dcid = hd.dcid;
+    params.original_dcid_present = 1;
 
     ngtcp2_path path;
-    ngtcp2_addr_init(&path.local,
-        (const ngtcp2_sockaddr *)&qs->local_addr,
-        (ngtcp2_socklen)qs->local_addrlen);
-    ngtcp2_addr_init(&path.remote,
-        (const ngtcp2_sockaddr *)peer,
-        (ngtcp2_socklen)peer_addrlen);
+    ngtcp2_addr_init(&path.local, (const ngtcp2_sockaddr *)&qs->local_addr,
+                     (ngtcp2_socklen)qs->local_addrlen);
+    ngtcp2_addr_init(&path.remote, (const ngtcp2_sockaddr *)peer, (ngtcp2_socklen)peer_addrlen);
 
-    if (ngtcp2_conn_server_new(&c->conn, &hd.dcid, &scid, &path,
-                                hd.version, &g_quic_cbs,
-                                &settings, &params, NULL, c) != 0) {
+    if (ngtcp2_conn_server_new(&c->conn, &hd.dcid, &scid, &path, hd.version, &g_quic_cbs, &settings,
+                               &params, NULL, c) != 0) {
         ngtcp2_crypto_picotls_deconfigure_session(&c->ptls_ctx);
-        ptls_free(c->ptls); c->ptls = NULL; free(c); return NULL;
+        ptls_free(c->ptls);
+        c->ptls = NULL;
+        free(c);
+        return NULL;
     }
 
     ngtcp2_conn_set_tls_native_handle(c->conn, &c->ptls_ctx);
@@ -987,35 +1016,44 @@ static void conn_free(struct quic_server *qs, struct quic_conn *c)
     for (int i = 0; i < QUIC_MAX_STREAMS; i++) {
         if (c->streams[i]) stream_free(c, c->streams[i]);
     }
-    if (c->h3conn)  { nghttp3_conn_del(c->h3conn);          c->h3conn  = NULL; }
-    if (c->conn)    { ngtcp2_conn_del(c->conn);              c->conn    = NULL; }
+    if (c->h3conn) {
+        nghttp3_conn_del(c->h3conn);
+        c->h3conn = NULL;
+    }
+    if (c->conn) {
+        ngtcp2_conn_del(c->conn);
+        c->conn = NULL;
+    }
     ngtcp2_crypto_picotls_deconfigure_session(&c->ptls_ctx);
-    if (c->ptls)    { ptls_free(c->ptls);                    c->ptls    = NULL; }
+    if (c->ptls) {
+        ptls_free(c->ptls);
+        c->ptls = NULL;
+    }
     for (int i = 0; i < QUIC_MAX_CONNS; i++) {
-        if (qs->conns[i] == c) { qs->conns[i] = NULL; qs->conn_count--; break; }
+        if (qs->conns[i] == c) {
+            qs->conns[i] = NULL;
+            qs->conn_count--;
+            break;
+        }
     }
     free(c);
 }
 
-static struct quic_conn *conn_find(struct quic_server *qs,
-                                    const struct sockaddr *peer,
-                                    socklen_t peer_len)
+static struct quic_conn *conn_find(struct quic_server *qs, const struct sockaddr *peer,
+                                   socklen_t peer_len)
 {
     for (int i = 0; i < QUIC_MAX_CONNS; i++) {
         struct quic_conn *c = qs->conns[i];
         if (!c) continue;
-        if (c->peer_addrlen == peer_len &&
-            memcmp(&c->peer_addr, peer, peer_len) == 0)
-            return c;
+        if (c->peer_addrlen == peer_len && memcmp(&c->peer_addr, peer, peer_len) == 0) return c;
     }
     return NULL;
 }
 
 /* ---- Packet dispatch ---- */
 
-static void dispatch_packet(struct quic_server *qs,
-                             const struct sockaddr *peer, socklen_t peer_len,
-                             const uint8_t *pkt, size_t pktlen)
+static void dispatch_packet(struct quic_server *qs, const struct sockaddr *peer, socklen_t peer_len,
+                            const uint8_t *pkt, size_t pktlen)
 {
     struct quic_conn *c = conn_find(qs, peer, peer_len);
 
@@ -1024,25 +1062,28 @@ static void dispatch_packet(struct quic_server *qs,
         if (pktlen < 1 || (pkt[0] & 0x80) == 0) return;
         c = conn_new(qs, peer, peer_len, pkt, pktlen);
         if (!c) return;
-        if (qs->conn_count >= QUIC_MAX_CONNS) { conn_free(qs, c); return; }
+        if (qs->conn_count >= QUIC_MAX_CONNS) {
+            conn_free(qs, c);
+            return;
+        }
         for (int i = 0; i < QUIC_MAX_CONNS; i++) {
-            if (!qs->conns[i]) { qs->conns[i] = c; qs->conn_count++; break; }
+            if (!qs->conns[i]) {
+                qs->conns[i] = c;
+                qs->conn_count++;
+                break;
+            }
         }
     }
 
     ngtcp2_path path;
-    ngtcp2_addr_init(&path.local,
-        (const ngtcp2_sockaddr *)&qs->local_addr,
-        (ngtcp2_socklen)qs->local_addrlen);
-    ngtcp2_addr_init(&path.remote,
-        (const ngtcp2_sockaddr *)peer,
-        (ngtcp2_socklen)peer_len);
+    ngtcp2_addr_init(&path.local, (const ngtcp2_sockaddr *)&qs->local_addr,
+                     (ngtcp2_socklen)qs->local_addrlen);
+    ngtcp2_addr_init(&path.remote, (const ngtcp2_sockaddr *)peer, (ngtcp2_socklen)peer_len);
 
     ngtcp2_pkt_info pi = {0};
     int rv = ngtcp2_conn_read_pkt(c->conn, &path, &pi, pkt, pktlen, now_ns());
     if (rv != 0 && rv != NGTCP2_ERR_DRAINING) {
-        if (rv != NGTCP2_ERR_CRYPTO)
-            log_debug("quic_read", "read_pkt: %s", ngtcp2_strerror(rv));
+        if (rv != NGTCP2_ERR_CRYPTO) log_debug("quic_read", "read_pkt: %s", ngtcp2_strerror(rv));
         conn_free(qs, c);
         return;
     }
@@ -1055,9 +1096,8 @@ static void dispatch_packet(struct quic_server *qs,
 
 /* Minimal on_client_hello for QUIC: accept "h3" ALPN only.
  * Does NOT access conn_tls_state — the data_ptr holds ngtcp2_crypto_conn_ref. */
-static int quic_on_client_hello(ptls_on_client_hello_t *self,
-                                 ptls_t *tls,
-                                 ptls_on_client_hello_parameters_t *params)
+static int quic_on_client_hello(ptls_on_client_hello_t *self, ptls_t *tls,
+                                ptls_on_client_hello_parameters_t *params)
 {
     (void)self;
     for (size_t i = 0; i < params->negotiated_protocols.count; i++) {
@@ -1070,9 +1110,7 @@ static int quic_on_client_hello(ptls_on_client_hello_t *self,
     return 0;
 }
 
-static ptls_on_client_hello_t g_quic_on_client_hello = {
-    .cb = quic_on_client_hello
-};
+static ptls_on_client_hello_t g_quic_on_client_hello = {.cb = quic_on_client_hello};
 
 /*
  * Create a shallow copy of the route's ptls_context_t with QUIC-specific
@@ -1082,14 +1120,13 @@ static ptls_on_client_hello_t g_quic_on_client_hello = {
  */
 static ptls_context_t *make_quic_ptls_ctx(struct tls_ctx *tls, int route_idx)
 {
-    if (!tls || route_idx >= tls->route_count || !tls->routes[route_idx].ctx)
-        return NULL;
+    if (!tls || route_idx >= tls->route_count || !tls->routes[route_idx].ctx) return NULL;
 
     ptls_context_t *src = tls->routes[route_idx].ctx;
 
     ptls_context_t *ctx = malloc(sizeof(*ctx));
     if (!ctx) return NULL;
-    *ctx = *src;   /* shallow copy — shares cert/key/sign_certificate */
+    *ctx = *src; /* shallow copy — shares cert/key/sign_certificate */
 
     /* Apply QUIC-specific settings without touching the TCP context */
     ngtcp2_crypto_picotls_configure_server_context(ctx);
@@ -1107,10 +1144,10 @@ static void *quic_thread(void *arg)
 {
     struct quic_server *qs = arg;
 
-    struct epoll_event ev = { .events = EPOLLIN, .data.fd = qs->udp_fd };
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = qs->udp_fd};
     epoll_ctl(qs->epoll_fd, EPOLL_CTL_ADD, qs->udp_fd, &ev);
 
-    struct epoll_event ev2 = { .events = EPOLLIN, .data.fd = qs->comp_efd };
+    struct epoll_event ev2 = {.events = EPOLLIN, .data.fd = qs->comp_efd};
     epoll_ctl(qs->epoll_fd, EPOLL_CTL_ADD, qs->comp_efd, &ev2);
 
     uint8_t pkt_buf[65536];
@@ -1125,7 +1162,8 @@ static void *quic_thread(void *arg)
             struct quic_conn *c = qs->conns[i];
             if (!c) continue;
             if (ts - c->last_active > 60ULL * NGTCP2_SECONDS) {
-                conn_free(qs, c); continue;
+                conn_free(qs, c);
+                continue;
             }
             ngtcp2_tstamp exp = ngtcp2_conn_get_expiry(c->conn);
             if (exp <= ts) {
@@ -1147,20 +1185,21 @@ static void *quic_thread(void *arg)
                         pthread_mutex_unlock(&qs->comp_mu);
                         break;
                     }
-                    struct proxy_completion comp =
-                        qs->comp_ring[qs->comp_head];
-                    qs->comp_head =
-                        (qs->comp_head + 1) % QUIC_COMP_RING_SIZE;
+                    struct proxy_completion comp = qs->comp_ring[qs->comp_head];
+                    qs->comp_head = (qs->comp_head + 1) % QUIC_COMP_RING_SIZE;
                     pthread_mutex_unlock(&qs->comp_mu);
 
-                    struct quic_conn *qc = conn_find(
-                        qs, (struct sockaddr *)&comp.peer_addr,
-                        comp.peer_addrlen);
-                    if (!qc) { free(comp.resp_buf); continue; }
+                    struct quic_conn *qc =
+                        conn_find(qs, (struct sockaddr *)&comp.peer_addr, comp.peer_addrlen);
+                    if (!qc) {
+                        free(comp.resp_buf);
+                        continue;
+                    }
 
                     struct quic_stream *ss = stream_find(qc, comp.stream_id);
                     if (!ss || ss->resp_buf) {
-                        free(comp.resp_buf); continue;
+                        free(comp.resp_buf);
+                        continue;
                     }
 
                     ss->resp_buf = comp.resp_buf;
@@ -1171,10 +1210,9 @@ static void *quic_thread(void *arg)
                 struct sockaddr_storage peer;
                 socklen_t plen = sizeof(peer);
                 ssize_t r = recvfrom(qs->udp_fd, pkt_buf, sizeof(pkt_buf), 0,
-                                      (struct sockaddr *)&peer, &plen);
+                                     (struct sockaddr *)&peer, &plen);
                 if (r <= 0) continue;
-                dispatch_packet(qs, (struct sockaddr *)&peer, plen,
-                                 pkt_buf, (size_t)r);
+                dispatch_packet(qs, (struct sockaddr *)&peer, plen, pkt_buf, (size_t)r);
             }
         }
     }
@@ -1187,12 +1225,8 @@ static void *quic_thread(void *arg)
 
 /* ---- Public API ---- */
 
-int quic_server_init(struct quic_server **out,
-                     struct tls_ctx *tls,
-                     struct cache *cache,
-                     struct vortex_config *cfg,
-                     const char *bind_addr,
-                     uint16_t port)
+int quic_server_init(struct quic_server **out, struct tls_ctx *tls, struct cache *cache,
+                     struct vortex_config *cfg, const char *bind_addr, uint16_t port)
 {
     *out = NULL;
     struct quic_server *qs = calloc(1, sizeof(*qs));
@@ -1201,35 +1235,47 @@ int quic_server_init(struct quic_server **out,
 
     qs->cfg = cfg;
     qs->cache = cache;
-    if (router_init(&qs->router, cfg) != 0) { free(qs); return -1; }
+    if (router_init(&qs->router, cfg) != 0) {
+        free(qs);
+        return -1;
+    }
 
     /* Build ptls_context_t per route */
     int nctx = tls ? tls->route_count : 0;
     for (int i = 0; i < nctx && i < VORTEX_MAX_ROUTES; i++) {
         qs->ptls_ctx[i] = make_quic_ptls_ctx(tls, i);
-        if (qs->ptls_ctx[i]) qs->ptls_ctx_count = i + 1;
-        else log_warn("quic_init", "no ptls_ctx for route %d — skipping", i);
+        if (qs->ptls_ctx[i])
+            qs->ptls_ctx_count = i + 1;
+        else
+            log_warn("quic_init", "no ptls_ctx for route %d — skipping", i);
     }
     if (qs->ptls_ctx_count == 0) {
         log_error("quic_init", "no certs available — QUIC disabled");
-        router_destroy(&qs->router); free(qs); return -1;
+        router_destroy(&qs->router);
+        free(qs);
+        return -1;
     }
 
     /* Create UDP socket */
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", port);
-    struct addrinfo hints = { .ai_family   = AF_UNSPEC,
-                              .ai_socktype = SOCK_DGRAM,
-                              .ai_flags    = AI_PASSIVE };
+    struct addrinfo hints = {
+        .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM, .ai_flags = AI_PASSIVE};
     struct addrinfo *res = NULL;
     if (getaddrinfo(bind_addr[0] ? bind_addr : NULL, port_str, &hints, &res) != 0) {
-        router_destroy(&qs->router); free(qs); return -1;
+        router_destroy(&qs->router);
+        free(qs);
+        return -1;
     }
 
-    int fd = socket(res->ai_family,
-                    res->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                    res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); router_destroy(&qs->router); free(qs); return -1; }
+    int fd =
+        socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        router_destroy(&qs->router);
+        free(qs);
+        return -1;
+    }
 
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -1237,7 +1283,11 @@ int quic_server_init(struct quic_server **out,
 
     if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
         log_error("quic_init", "bind %s:%u: %s", bind_addr, port, strerror(errno));
-        close(fd); freeaddrinfo(res); router_destroy(&qs->router); free(qs); return -1;
+        close(fd);
+        freeaddrinfo(res);
+        router_destroy(&qs->router);
+        free(qs);
+        return -1;
     }
 
     memcpy(&qs->local_addr, res->ai_addr, res->ai_addrlen);
@@ -1247,12 +1297,19 @@ int quic_server_init(struct quic_server **out,
 
     qs->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (qs->epoll_fd < 0) {
-        close(fd); router_destroy(&qs->router); free(qs); return -1;
+        close(fd);
+        router_destroy(&qs->router);
+        free(qs);
+        return -1;
     }
 
     qs->comp_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (qs->comp_efd < 0) {
-        close(qs->epoll_fd); close(fd); router_destroy(&qs->router); free(qs); return -1;
+        close(qs->epoll_fd);
+        close(fd);
+        router_destroy(&qs->router);
+        free(qs);
+        return -1;
     }
     pthread_mutex_init(&qs->comp_mu, NULL);
 
@@ -1266,14 +1323,29 @@ int quic_server_start(struct quic_server *qs)
     return pthread_create(&qs->thread, NULL, quic_thread, qs);
 }
 
-void quic_server_stop(struct quic_server *qs) { qs->stop = 1; }
-void quic_server_join(struct quic_server *qs) { pthread_join(qs->thread, NULL); }
+void quic_server_stop(struct quic_server *qs)
+{
+    qs->stop = 1;
+}
+void quic_server_join(struct quic_server *qs)
+{
+    pthread_join(qs->thread, NULL);
+}
 
 void quic_server_destroy(struct quic_server *qs)
 {
-    if (qs->epoll_fd >= 0) { close(qs->epoll_fd); qs->epoll_fd = -1; }
-    if (qs->udp_fd   >= 0) { close(qs->udp_fd);   qs->udp_fd   = -1; }
-    if (qs->comp_efd >= 0) { close(qs->comp_efd);  qs->comp_efd = -1; }
+    if (qs->epoll_fd >= 0) {
+        close(qs->epoll_fd);
+        qs->epoll_fd = -1;
+    }
+    if (qs->udp_fd >= 0) {
+        close(qs->udp_fd);
+        qs->udp_fd = -1;
+    }
+    if (qs->comp_efd >= 0) {
+        close(qs->comp_efd);
+        qs->comp_efd = -1;
+    }
     pthread_mutex_destroy(&qs->comp_mu);
     for (int i = 0; i < VORTEX_MAX_ROUTES; i++) {
         /* Only free the wrapper — cert/key are owned by the main tls_ctx */

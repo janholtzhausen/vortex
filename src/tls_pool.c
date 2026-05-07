@@ -13,7 +13,7 @@
 struct tls_pool g_tls_pool;
 
 _Static_assert(sizeof(struct tls_handshake_result) <= 4096,
-    "tls_handshake_result must fit in PIPE_BUF");
+               "tls_handshake_result must fit in PIPE_BUF");
 
 static void *tls_pool_worker_thread(void *arg)
 {
@@ -36,10 +36,10 @@ static void *tls_pool_worker_thread(void *arg)
         pthread_mutex_unlock(&pool->mu);
 
         struct tls_handshake_result res = {
-            .kind      = job.kind,
-            .cid       = job.cid,
+            .kind = job.kind,
+            .cid = job.cid,
             .client_fd = job.client_fd,
-            .ok        = false,
+            .ok = false,
         };
 
         if (job.kind == TLS_HANDSHAKE_FRONTEND) {
@@ -47,26 +47,24 @@ static void *tls_pool_worker_thread(void *arg)
             int route_idx = 0;
             bool ktls_tx = false, ktls_rx = false, h2 = false;
             uint8_t *pending_data = NULL;
-            size_t   pending_data_len = 0;
+            size_t pending_data_len = 0;
 
-            ptls_t *ptls = tls_accept(job.tls, job.client_fd,
-                                       &route_idx, sni, sizeof(sni),
-                                       &ktls_tx, &ktls_rx, &h2,
-                                       &pending_data, &pending_data_len);
+            ptls_t *ptls = tls_accept(job.tls, job.client_fd, &route_idx, sni, sizeof(sni),
+                                      &ktls_tx, &ktls_rx, &h2, &pending_data, &pending_data_len);
 
             if (!ptls && !ktls_tx) {
-                log_debug("tls_pool", "frontend handshake failed cid=%u fd=%d",
-                          job.cid, job.client_fd);
+                log_debug("tls_pool", "frontend handshake failed cid=%u fd=%d", job.cid,
+                          job.client_fd);
                 free(pending_data);
             } else {
-                res.ok               = true;
-                res.tls_route_idx    = route_idx;
-                res.tls_version      = PTLS_PROTOCOL_VERSION_TLS13;
-                res.h2_negotiated    = h2;
-                res.ktls_tx          = ktls_tx;
-                res.ktls_rx          = ktls_rx;
-                res.ssl              = ptls; /* NULL if kTLS took over */
-                res.pending_data     = pending_data;
+                res.ok = true;
+                res.tls_route_idx = route_idx;
+                res.tls_version = PTLS_PROTOCOL_VERSION_TLS13;
+                res.h2_negotiated = h2;
+                res.ktls_tx = ktls_tx;
+                res.ktls_rx = ktls_rx;
+                res.ssl = ptls; /* NULL if kTLS took over */
+                res.pending_data = pending_data;
                 res.pending_data_len = (uint32_t)pending_data_len;
 
                 if (!ktls_tx) {
@@ -86,21 +84,16 @@ static void *tls_pool_worker_thread(void *arg)
                 const char *addr = job.backend_addr;
                 const char *colon = strrchr(addr, ':');
                 size_t host_len = colon ? (size_t)(colon - addr) : strlen(addr);
-                if (host_len >= sizeof(sni_buf))
-                    host_len = sizeof(sni_buf) - 1;
+                if (host_len >= sizeof(sni_buf)) host_len = sizeof(sni_buf) - 1;
                 memcpy(sni_buf, addr, host_len);
                 sni_buf[host_len] = '\0';
                 server_name = sni_buf;
             }
 
             struct tls_session_ticket *new_ticket = NULL;
-            ptls_t *ptls = tls_backend_connect(
-                job.backend_tls_client_ctx,
-                job.client_fd,
-                server_name,
-                job.timeout_ms ? job.timeout_ms : 30000,
-                job.resume_session,
-                &new_ticket);
+            ptls_t *ptls = tls_backend_connect(job.backend_tls_client_ctx, job.client_fd,
+                                               server_name, job.timeout_ms ? job.timeout_ms : 30000,
+                                               job.resume_session, &new_ticket);
 
             if (job.resume_session) {
                 free(job.resume_session);
@@ -108,13 +101,13 @@ static void *tls_pool_worker_thread(void *arg)
             }
 
             if (ptls) {
-                res.ok             = true;
-                res.ssl            = ptls;
+                res.ok = true;
+                res.ssl = ptls;
                 res.backend_session = new_ticket;
             } else {
                 free(new_ticket);
-                log_warn("tls_pool", "backend handshake failed cid=%u fd=%d sni=%s",
-                         job.cid, job.client_fd, server_name);
+                log_warn("tls_pool", "backend handshake failed cid=%u fd=%d sni=%s", job.cid,
+                         job.client_fd, server_name);
             }
         }
 
@@ -126,33 +119,33 @@ static void *tls_pool_worker_thread(void *arg)
         /* Push result to the per-worker MPSC ring, then send a 1-byte wakeup.
          * The ring slot is always available because CAP(256) > max in-flight. */
         if (job.result_ring) {
-            uint32_t idx = atomic_fetch_add_explicit(&job.result_ring->tail, 1,
-                               memory_order_relaxed) % TLS_RESULT_RING_CAP;
+            uint32_t idx =
+                atomic_fetch_add_explicit(&job.result_ring->tail, 1, memory_order_relaxed) %
+                TLS_RESULT_RING_CAP;
             /* Spin until the consumer has cleared this slot (should be instant) */
-            while (atomic_load_explicit(&job.result_ring->slots[idx].ready,
-                                         memory_order_acquire) != 0)
+            while (atomic_load_explicit(&job.result_ring->slots[idx].ready, memory_order_acquire) !=
+                   0)
                 ;
             job.result_ring->slots[idx].data = res;
-            atomic_store_explicit(&job.result_ring->slots[idx].ready, 1,
-                                   memory_order_release);
+            atomic_store_explicit(&job.result_ring->slots[idx].ready, 1, memory_order_release);
             const uint8_t wake = 1;
             ssize_t wr = write(job.result_pipe_wr, &wake, sizeof(wake));
-            if (wr != 1)
-                log_error("tls_pool", "wakeup pipe write failed cid=%u", job.cid);
+            if (wr != 1) log_error("tls_pool", "wakeup pipe write failed cid=%u", job.cid);
         } else {
             /* Fallback: write full struct to pipe (should not occur) */
             ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
             if (wr != (ssize_t)sizeof(res)) {
                 log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
-                if (res.ssl && !res.ktls_tx)
-                    ptls_free(res.ssl);
+                if (res.ssl && !res.ktls_tx) ptls_free(res.ssl);
                 free(res.backend_session);
             }
         }
 
         pthread_mutex_lock(&pool->mu);
-        if (res.ok) pool->completed_total++;
-        else pool->failed_total++;
+        if (res.ok)
+            pool->completed_total++;
+        else
+            pool->failed_total++;
         if (pool->active_handshakes > 0) pool->active_handshakes--;
         pthread_mutex_unlock(&pool->mu);
     }
@@ -170,8 +163,7 @@ void tls_pool_init(void)
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 256 * 1024); /* 256KB per thread */
-        pthread_create(&g_tls_pool.threads[i], &attr,
-                       tls_pool_worker_thread, &g_tls_pool);
+        pthread_create(&g_tls_pool.threads[i], &attr, tls_pool_worker_thread, &g_tls_pool);
         pthread_attr_destroy(&attr);
     }
     log_info("tls_pool", "started %d handshake threads", TLS_POOL_THREADS);
@@ -179,8 +171,7 @@ void tls_pool_init(void)
 
 void tls_pool_destroy(void)
 {
-    if (!g_tls_pool.initialized)
-        return;
+    if (!g_tls_pool.initialized) return;
     pthread_mutex_lock(&g_tls_pool.mu);
     g_tls_pool.shutdown = true;
     while (g_tls_pool.count > 0) {
@@ -203,8 +194,7 @@ void tls_pool_destroy(void)
 
 bool tls_pool_submit(struct tls_handshake_job job)
 {
-    if (!g_tls_pool.initialized)
-        return false;
+    if (!g_tls_pool.initialized) return false;
     pthread_mutex_lock(&g_tls_pool.mu);
     if (g_tls_pool.count >= TLS_POOL_QUEUE) {
         g_tls_pool.dropped_total++;
@@ -225,8 +215,7 @@ void tls_pool_snapshot(struct tls_pool_stats *out)
 {
     if (!out) return;
     memset(out, 0, sizeof(*out));
-    if (!g_tls_pool.initialized)
-        return;
+    if (!g_tls_pool.initialized) return;
     pthread_mutex_lock(&g_tls_pool.mu);
     out->queue_depth = (uint32_t)g_tls_pool.count;
     out->active_handshakes = g_tls_pool.active_handshakes;

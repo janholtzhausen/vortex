@@ -16,95 +16,85 @@
 
 #define METRICS_BUF_SIZE (64 * 1024)
 
-static void write_metric_counter(char *buf, size_t *pos, size_t bufsz,
-    const char *name, const char *help, uint64_t val)
+static void write_metric_counter(char *buf, size_t *pos, size_t bufsz, const char *name,
+                                 const char *help, uint64_t val)
 {
-    *pos += snprintf(buf + *pos, bufsz - *pos,
-        "# HELP %s %s\n# TYPE %s counter\n%s %llu\n",
-        name, help, name, name, (unsigned long long)val);
+    *pos += snprintf(buf + *pos, bufsz - *pos, "# HELP %s %s\n# TYPE %s counter\n%s %llu\n", name,
+                     help, name, name, (unsigned long long)val);
 }
 
-static void write_metric_gauge(char *buf, size_t *pos, size_t bufsz,
-    const char *name, const char *help, uint64_t val)
+static void write_metric_gauge(char *buf, size_t *pos, size_t bufsz, const char *name,
+                               const char *help, uint64_t val)
 {
-    *pos += snprintf(buf + *pos, bufsz - *pos,
-        "# HELP %s %s\n# TYPE %s gauge\n%s %llu\n",
-        name, help, name, name, (unsigned long long)val);
+    *pos += snprintf(buf + *pos, bufsz - *pos, "# HELP %s %s\n# TYPE %s gauge\n%s %llu\n", name,
+                     help, name, name, (unsigned long long)val);
 }
 
-static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
-    size_t *out_len)
+static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz, size_t *out_len)
 {
     size_t pos = 0;
     time_t now = time(NULL);
 
-    write_metric_gauge(buf, &pos, bufsz,
-        "vortex_uptime_seconds", "Seconds since vortex started",
-        (uint64_t)(now - (time_t)ms->start_time));
+    write_metric_gauge(buf, &pos, bufsz, "vortex_uptime_seconds", "Seconds since vortex started",
+                       (uint64_t)(now - (time_t)ms->start_time));
 
-    write_metric_gauge(buf, &pos, bufsz,
-        "vortex_worker_threads", "Number of worker threads",
-        (uint64_t)ms->num_workers);
+    write_metric_gauge(buf, &pos, bufsz, "vortex_worker_threads", "Number of worker threads",
+                       (uint64_t)ms->num_workers);
 
     pos += snprintf(buf + pos, bufsz - pos,
-        "# HELP vortex_worker_pool_exhausted Pool exhaustion events per worker\n"
-        "# TYPE vortex_worker_pool_exhausted counter\n");
+                    "# HELP vortex_worker_pool_exhausted Pool exhaustion events per worker\n"
+                    "# TYPE vortex_worker_pool_exhausted counter\n");
     for (int i = 0; i < ms->num_workers; i++) {
-        pos += snprintf(buf + pos, bufsz - pos,
-            "vortex_worker_pool_exhausted{worker=\"%d\"} %llu\n",
-            i, (unsigned long long)ms->workers[i]->pool_exhausted);
+        pos +=
+            snprintf(buf + pos, bufsz - pos, "vortex_worker_pool_exhausted{worker=\"%d\"} %llu\n",
+                     i, (unsigned long long)ms->workers[i]->pool_exhausted);
     }
 
     /* Aggregate worker stats */
-    uint64_t total_accepted  = 0, total_completed = 0, total_errors = 0;
-    uint64_t total_active    = 0;
-    uint64_t total_tls12     = 0, total_tls13 = 0, total_ktls = 0;
+    uint64_t total_accepted = 0, total_completed = 0, total_errors = 0;
+    uint64_t total_active = 0;
+    uint64_t total_tls12 = 0, total_tls13 = 0, total_ktls = 0;
     for (int i = 0; i < ms->num_workers; i++) {
-        total_accepted  += ms->workers[i]->accepted;
+        total_accepted += ms->workers[i]->accepted;
         total_completed += ms->workers[i]->completed;
-        total_errors    += ms->workers[i]->errors;
-        total_active    += ms->workers[i]->pool.active;
-        total_tls12     += ms->workers[i]->tls12_count;
-        total_tls13     += ms->workers[i]->tls13_count;
-        total_ktls      += ms->workers[i]->ktls_count;
+        total_errors += ms->workers[i]->errors;
+        total_active += ms->workers[i]->pool.active;
+        total_tls12 += ms->workers[i]->tls12_count;
+        total_tls13 += ms->workers[i]->tls13_count;
+        total_ktls += ms->workers[i]->ktls_count;
     }
 
-    write_metric_gauge(buf, &pos, bufsz,
-        "vortex_connections_active", "Currently active connections", total_active);
-    write_metric_counter(buf, &pos, bufsz,
-        "vortex_connections_total", "Total accepted connections", total_accepted);
+    write_metric_gauge(buf, &pos, bufsz, "vortex_connections_active",
+                       "Currently active connections", total_active);
+    write_metric_counter(buf, &pos, bufsz, "vortex_connections_total", "Total accepted connections",
+                         total_accepted);
 
     /* TLS stats */
     if (total_tls12 + total_tls13 > 0) {
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_tls12_handshakes_total", "TLS 1.2 handshakes completed", total_tls12);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_tls13_handshakes_total", "TLS 1.3 handshakes completed", total_tls13);
-        write_metric_gauge(buf, &pos, bufsz,
-            "vortex_ktls_connections_total", "Connections using kernel TLS", total_ktls);
+        write_metric_counter(buf, &pos, bufsz, "vortex_tls12_handshakes_total",
+                             "TLS 1.2 handshakes completed", total_tls12);
+        write_metric_counter(buf, &pos, bufsz, "vortex_tls13_handshakes_total",
+                             "TLS 1.3 handshakes completed", total_tls13);
+        write_metric_gauge(buf, &pos, bufsz, "vortex_ktls_connections_total",
+                           "Connections using kernel TLS", total_ktls);
     }
 
     {
         struct tls_pool_stats tls_stats = {0};
         tls_pool_snapshot(&tls_stats);
-        write_metric_gauge(buf, &pos, bufsz,
-            "vortex_tls_pool_queue_depth", "Pending TLS handshakes in the pool queue",
-            tls_stats.queue_depth);
-        write_metric_gauge(buf, &pos, bufsz,
-            "vortex_tls_pool_active_handshakes", "TLS handshakes currently executing",
-            tls_stats.active_handshakes);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_tls_pool_submitted_total", "TLS handshakes submitted to the pool",
-            tls_stats.submitted_total);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_tls_pool_completed_total", "TLS handshakes completed successfully",
-            tls_stats.completed_total);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_tls_pool_failed_total", "TLS handshakes that failed in the pool",
-            tls_stats.failed_total);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_tls_pool_dropped_total", "TLS handshakes dropped because the pool queue was full",
-            tls_stats.dropped_total);
+        write_metric_gauge(buf, &pos, bufsz, "vortex_tls_pool_queue_depth",
+                           "Pending TLS handshakes in the pool queue", tls_stats.queue_depth);
+        write_metric_gauge(buf, &pos, bufsz, "vortex_tls_pool_active_handshakes",
+                           "TLS handshakes currently executing", tls_stats.active_handshakes);
+        write_metric_counter(buf, &pos, bufsz, "vortex_tls_pool_submitted_total",
+                             "TLS handshakes submitted to the pool", tls_stats.submitted_total);
+        write_metric_counter(buf, &pos, bufsz, "vortex_tls_pool_completed_total",
+                             "TLS handshakes completed successfully", tls_stats.completed_total);
+        write_metric_counter(buf, &pos, bufsz, "vortex_tls_pool_failed_total",
+                             "TLS handshakes that failed in the pool", tls_stats.failed_total);
+        write_metric_counter(buf, &pos, bufsz, "vortex_tls_pool_dropped_total",
+                             "TLS handshakes dropped because the pool queue was full",
+                             tls_stats.dropped_total);
     }
 
     {
@@ -112,43 +102,42 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
         for (int i = 0; i < ms->num_workers; i++) {
             struct compress_pool_stats ws = {0};
             compress_pool_snapshot(&ms->workers[i]->compress_pool, &ws);
-            compress_stats.queue_depth     += ws.queue_depth;
-            compress_stats.active_jobs     += ws.active_jobs;
+            compress_stats.queue_depth += ws.queue_depth;
+            compress_stats.active_jobs += ws.active_jobs;
             compress_stats.submitted_total += ws.submitted_total;
             compress_stats.completed_total += ws.completed_total;
-            compress_stats.failed_total    += ws.failed_total;
-            compress_stats.dropped_total   += ws.dropped_total;
+            compress_stats.failed_total += ws.failed_total;
+            compress_stats.dropped_total += ws.dropped_total;
         }
-        write_metric_gauge(buf, &pos, bufsz,
-            "vortex_compress_pool_queue_depth", "Pending compression jobs in the pool queue",
-            compress_stats.queue_depth);
-        write_metric_gauge(buf, &pos, bufsz,
-            "vortex_compress_pool_active_jobs", "Compression jobs currently executing",
-            compress_stats.active_jobs);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_compress_pool_submitted_total", "Compression jobs submitted to the pool",
-            compress_stats.submitted_total);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_compress_pool_completed_total", "Compression jobs completed successfully",
-            compress_stats.completed_total);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_compress_pool_failed_total", "Compression jobs that failed or were not beneficial",
-            compress_stats.failed_total);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_compress_pool_dropped_total", "Compression jobs dropped because the pool queue was full",
-            compress_stats.dropped_total);
+        write_metric_gauge(buf, &pos, bufsz, "vortex_compress_pool_queue_depth",
+                           "Pending compression jobs in the pool queue",
+                           compress_stats.queue_depth);
+        write_metric_gauge(buf, &pos, bufsz, "vortex_compress_pool_active_jobs",
+                           "Compression jobs currently executing", compress_stats.active_jobs);
+        write_metric_counter(buf, &pos, bufsz, "vortex_compress_pool_submitted_total",
+                             "Compression jobs submitted to the pool",
+                             compress_stats.submitted_total);
+        write_metric_counter(buf, &pos, bufsz, "vortex_compress_pool_completed_total",
+                             "Compression jobs completed successfully",
+                             compress_stats.completed_total);
+        write_metric_counter(buf, &pos, bufsz, "vortex_compress_pool_failed_total",
+                             "Compression jobs that failed or were not beneficial",
+                             compress_stats.failed_total);
+        write_metric_counter(buf, &pos, bufsz, "vortex_compress_pool_dropped_total",
+                             "Compression jobs dropped because the pool queue was full",
+                             compress_stats.dropped_total);
     }
 
     /* Cert expiry */
     if (ms->cert_info && ms->cert_info_count > 0) {
         for (int i = 0; i < ms->cert_info_count; i++) {
             if (!ms->cert_info[i].not_after) continue;
-            pos += snprintf(buf + pos, bufsz - pos,
-                "# HELP vortex_cert_expiry_seconds Seconds until cert expiry\n"
-                "# TYPE vortex_cert_expiry_seconds gauge\n"
-                "vortex_cert_expiry_seconds{hostname=\"%s\"} %lld\n",
-                ms->cert_info[i].hostname,
-                (long long)(ms->cert_info[i].not_after - now));
+            pos +=
+                snprintf(buf + pos, bufsz - pos,
+                         "# HELP vortex_cert_expiry_seconds Seconds until cert expiry\n"
+                         "# TYPE vortex_cert_expiry_seconds gauge\n"
+                         "vortex_cert_expiry_seconds{hostname=\"%s\"} %lld\n",
+                         ms->cert_info[i].hostname, (long long)(ms->cert_info[i].not_after - now));
         }
     }
 
@@ -157,39 +146,35 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
     for (int i = 0; i < ms->num_workers; i++) {
         struct cache *c = ms->workers[i]->cache;
         if (!c) continue;
-        cache_hits       += c->hits;
-        cache_misses     += c->misses;
-        cache_evictions  += c->evictions;
-        cache_stores     += c->stores;
+        cache_hits += c->hits;
+        cache_misses += c->misses;
+        cache_evictions += c->evictions;
+        cache_stores += c->stores;
         cache_slab_bytes += c->slab_size;
     }
     if (cache_hits || cache_misses || cache_evictions || cache_stores || cache_slab_bytes) {
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_hits_total", "Cache hits", cache_hits);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_misses_total", "Cache misses", cache_misses);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_evictions_total", "Cache evictions", cache_evictions);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_cache_stores_total", "Cache stores", cache_stores);
-        write_metric_gauge(buf, &pos, bufsz,
-            "vortex_cache_memory_bytes", "Cache slab memory bytes",
-            cache_slab_bytes);
+        write_metric_counter(buf, &pos, bufsz, "vortex_cache_hits_total", "Cache hits", cache_hits);
+        write_metric_counter(buf, &pos, bufsz, "vortex_cache_misses_total", "Cache misses",
+                             cache_misses);
+        write_metric_counter(buf, &pos, bufsz, "vortex_cache_evictions_total", "Cache evictions",
+                             cache_evictions);
+        write_metric_counter(buf, &pos, bufsz, "vortex_cache_stores_total", "Cache stores",
+                             cache_stores);
+        write_metric_gauge(buf, &pos, bufsz, "vortex_cache_memory_bytes", "Cache slab memory bytes",
+                           cache_slab_bytes);
     }
 
     /* XDP/BPF metrics */
     struct vortex_metrics bpf_m;
     if (bpf_loader_is_active() && bpf_metrics_read(&bpf_m) == 0) {
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_xdp_rx_packets_total", "XDP received packets", bpf_m.rx_packets);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_xdp_rx_bytes_total", "XDP received bytes", bpf_m.rx_bytes);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_xdp_dropped_ratelimit_total", "XDP dropped (rate limit)",
-            bpf_m.dropped_ratelimit);
-        write_metric_counter(buf, &pos, bufsz,
-            "vortex_xdp_dropped_blocklist_total", "XDP dropped (blocklist)",
-            bpf_m.dropped_blocklist);
+        write_metric_counter(buf, &pos, bufsz, "vortex_xdp_rx_packets_total",
+                             "XDP received packets", bpf_m.rx_packets);
+        write_metric_counter(buf, &pos, bufsz, "vortex_xdp_rx_bytes_total", "XDP received bytes",
+                             bpf_m.rx_bytes);
+        write_metric_counter(buf, &pos, bufsz, "vortex_xdp_dropped_ratelimit_total",
+                             "XDP dropped (rate limit)", bpf_m.dropped_ratelimit);
+        write_metric_counter(buf, &pos, bufsz, "vortex_xdp_dropped_blocklist_total",
+                             "XDP dropped (blocklist)", bpf_m.dropped_blocklist);
     }
 
     *out_len = pos;
@@ -199,14 +184,20 @@ static void handle_metrics_request(struct metrics_server *ms, int client_fd)
 {
     char req[1024];
     ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
-    if (n <= 0) { close(client_fd); return; }
+    if (n <= 0) {
+        close(client_fd);
+        return;
+    }
     req[n] = '\0';
 
     /* Check path */
     bool is_metrics = strstr(req, "GET /metrics") != NULL;
 
     char *body = malloc(METRICS_BUF_SIZE);
-    if (!body) { close(client_fd); return; }
+    if (!body) {
+        close(client_fd);
+        return;
+    }
 
     size_t body_len = 0;
     if (is_metrics) {
@@ -215,12 +206,11 @@ static void handle_metrics_request(struct metrics_server *ms, int client_fd)
 
     char header[512];
     int hlen = snprintf(header, sizeof(header),
-        "HTTP/1.1 %s\r\n"
-        "Content-Type: text/plain; version=0.0.4\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n",
-        is_metrics ? "200 OK" : "404 Not Found",
-        body_len);
+                        "HTTP/1.1 %s\r\n"
+                        "Content-Type: text/plain; version=0.0.4\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: close\r\n\r\n",
+                        is_metrics ? "200 OK" : "404 Not Found", body_len);
 
     send(client_fd, header, hlen, MSG_NOSIGNAL);
     if (body_len > 0) send(client_fd, body, body_len, MSG_NOSIGNAL);
@@ -236,8 +226,7 @@ static void *metrics_thread(void *arg)
     while (ms->running) {
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
-        int client_fd = accept(ms->listen_fd,
-            (struct sockaddr *)&client_addr, &addrlen);
+        int client_fd = accept(ms->listen_fd, (struct sockaddr *)&client_addr, &addrlen);
         if (client_fd < 0) {
             if (!ms->running) break;
             continue;
@@ -247,19 +236,18 @@ static void *metrics_thread(void *arg)
     return NULL;
 }
 
-int metrics_init(struct metrics_server *ms,
-                 const char *bind_addr, uint16_t port,
+int metrics_init(struct metrics_server *ms, const char *bind_addr, uint16_t port,
                  struct worker **workers, int num_workers)
 {
     memset(ms, 0, sizeof(*ms));
-    ms->workers     = workers;
+    ms->workers = workers;
     ms->num_workers = num_workers;
-    ms->start_time  = (uint64_t)time(NULL);
-    ms->listen_fd   = -1;
+    ms->start_time = (uint64_t)time(NULL);
+    ms->listen_fd = -1;
 
     struct sockaddr_in sa = {
         .sin_family = AF_INET,
-        .sin_port   = htons(port),
+        .sin_port = htons(port),
     };
     inet_pton(AF_INET, bind_addr, &sa.sin_addr);
 
@@ -280,8 +268,7 @@ int metrics_init(struct metrics_server *ms,
     }
 
     listen(ms->listen_fd, 8);
-    log_info("metrics_init", "metrics endpoint: http://%s:%d/metrics",
-        bind_addr, port);
+    log_info("metrics_init", "metrics endpoint: http://%s:%d/metrics", bind_addr, port);
     return 0;
 }
 

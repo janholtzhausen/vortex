@@ -16,26 +16,25 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#define BPF_PIN_DIR  "/sys/fs/bpf/vortex"
+#define BPF_PIN_DIR "/sys/fs/bpf/vortex"
 
-static struct bpf_object  *g_obj      = NULL;
-static struct bpf_program *g_prog     = NULL;
-static struct bpf_link    *g_link     = NULL;
-static int                 g_ifindex  = -1;
-static int                 g_map_rate_limit_fd  = -1;
-static int                 g_map_blocklist_fd   = -1;
-static int                 g_map_rate_limit_v6_fd  = -1;
-static int                 g_map_blocklist_v6_fd   = -1;
-static int                 g_map_metrics_fd     = -1;
-static int                 g_map_rate_config_fd = -1;
-static int                 g_map_conntrack_fd   = -1;
-static int                 g_map_conntrack_v6_fd = -1;
-static int                 g_map_port_config_fd = -1;
-static int                 g_xdp_active         = 0;
+static struct bpf_object *g_obj = NULL;
+static struct bpf_program *g_prog = NULL;
+static struct bpf_link *g_link = NULL;
+static int g_ifindex = -1;
+static int g_map_rate_limit_fd = -1;
+static int g_map_blocklist_fd = -1;
+static int g_map_rate_limit_v6_fd = -1;
+static int g_map_blocklist_v6_fd = -1;
+static int g_map_metrics_fd = -1;
+static int g_map_rate_config_fd = -1;
+static int g_map_conntrack_fd = -1;
+static int g_map_conntrack_v6_fd = -1;
+static int g_map_port_config_fd = -1;
+static int g_xdp_active = 0;
 
 /* Suppress verbose libbpf logs unless VORTEX_DEBUG is set */
-static int libbpf_print_fn(enum libbpf_print_level level,
-                            const char *format, va_list args)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
 #ifndef VORTEX_DEBUG
     if (level == LIBBPF_DEBUG) return 0;
@@ -79,8 +78,8 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
     };
     g_obj = bpf_object__open_file(bpf_obj_path, &opts);
     if (!g_obj) {
-        log_error("bpf_loader", "bpf_object__open_file(%s) failed: %s",
-            bpf_obj_path, strerror(errno));
+        log_error("bpf_loader", "bpf_object__open_file(%s) failed: %s", bpf_obj_path,
+                  strerror(errno));
         return -1;
     }
 
@@ -106,8 +105,7 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
     unsigned int xdp_flags = XDP_FLAGS_DRV_MODE;
     g_link = bpf_program__attach_xdp(g_prog, g_ifindex);
     if (!g_link) {
-        log_warn("bpf_loader",
-            "native XDP attach failed on %s, falling back to SKB mode", ifname);
+        log_warn("bpf_loader", "native XDP attach failed on %s, falling back to SKB mode", ifname);
         xdp_flags = XDP_FLAGS_SKB_MODE;
 
         /* For SKB mode we need to use the older API via netlink */
@@ -181,8 +179,7 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
         char pin_path[256];
         snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/conn_track_map");
         bpf_map__pin(map, pin_path);
-        log_info("bpf_loader", "conntrack map loaded: max_entries=%u",
-            CT_MAP_MAX_ENTRIES);
+        log_info("bpf_loader", "conntrack map loaded: max_entries=%u", CT_MAP_MAX_ENTRIES);
     } else {
         log_warn("bpf_loader", "conn_track_map not found in BPF object");
     }
@@ -193,8 +190,7 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
         char pin_path[256];
         snprintf(pin_path, sizeof(pin_path), BPF_PIN_DIR "/conn_track_map_v6");
         bpf_map__pin(map, pin_path);
-        log_info("bpf_loader", "ipv6 conntrack map loaded: max_entries=%u",
-            CT_MAP_MAX_ENTRIES);
+        log_info("bpf_loader", "ipv6 conntrack map loaded: max_entries=%u", CT_MAP_MAX_ENTRIES);
     } else {
         log_warn("bpf_loader", "conn_track_map_v6 not found in BPF object");
     }
@@ -211,8 +207,8 @@ int bpf_loader_init(const char *bpf_obj_path, const char *ifname)
     }
 
     g_xdp_active = 1;
-    log_info("bpf_loader", "BPF loader initialised: obj=%s if=%s ifindex=%d",
-        bpf_obj_path, ifname, g_ifindex);
+    log_info("bpf_loader", "BPF loader initialised: obj=%s if=%s ifindex=%d", bpf_obj_path, ifname,
+             g_ifindex);
     return 0;
 }
 
@@ -230,15 +226,24 @@ void bpf_loader_detach(void)
 
     /* Unpin maps */
     char path[256];
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_limit_map");  unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_limit_map_v6"); unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/blocklist_map");   unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/blocklist_map_v6"); unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/metrics_map");     unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_config_map"); unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map");  unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map_v6"); unlink(path);
-    snprintf(path, sizeof(path), BPF_PIN_DIR "/port_config_map"); unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_limit_map");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_limit_map_v6");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/blocklist_map");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/blocklist_map_v6");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/metrics_map");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/rate_config_map");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/conn_track_map_v6");
+    unlink(path);
+    snprintf(path, sizeof(path), BPF_PIN_DIR "/port_config_map");
+    unlink(path);
     rmdir(BPF_PIN_DIR);
 
     if (g_obj) {
@@ -254,7 +259,7 @@ int bpf_blocklist_add(uint32_t ip_host)
 {
     if (g_map_blocklist_fd < 0) return -1;
     uint32_t key = htonl(ip_host);
-    uint8_t  val = 1;
+    uint8_t val = 1;
     return bpf_map_update_elem(g_map_blocklist_fd, &key, &val, BPF_ANY);
 }
 
@@ -300,7 +305,7 @@ int bpf_rate_limit_set(uint32_t ip_host, uint64_t tokens_per_sec)
     if (g_map_rate_limit_fd < 0) return -1;
     uint32_t key = htonl(ip_host);
     struct rate_limit_entry entry = {
-        .tokens         = tokens_per_sec * RATE_SCALE,
+        .tokens = tokens_per_sec * RATE_SCALE,
         .last_refill_ns = 0,
     };
     return bpf_map_update_elem(g_map_rate_limit_fd, &key, &entry, BPF_ANY);
@@ -323,12 +328,12 @@ int bpf_metrics_read(struct vortex_metrics *out)
     int ret = bpf_map_lookup_elem(g_map_metrics_fd, &key, per_cpu);
     if (ret == 0) {
         for (int i = 0; i < num_cpus; i++) {
-            out->rx_packets        += per_cpu[i].rx_packets;
-            out->rx_bytes          += per_cpu[i].rx_bytes;
+            out->rx_packets += per_cpu[i].rx_packets;
+            out->rx_bytes += per_cpu[i].rx_bytes;
             out->dropped_ratelimit += per_cpu[i].dropped_ratelimit;
             out->dropped_blocklist += per_cpu[i].dropped_blocklist;
-            out->dropped_invalid   += per_cpu[i].dropped_invalid;
-            out->passed            += per_cpu[i].passed;
+            out->dropped_invalid += per_cpu[i].dropped_invalid;
+            out->passed += per_cpu[i].passed;
             out->dropped_conntrack += per_cpu[i].dropped_conntrack;
         }
     }
@@ -367,7 +372,7 @@ int bpf_rate_config_set(uint32_t tokens_per_sec, uint32_t burst)
     if (g_map_rate_config_fd < 0) return -1;
     struct rate_config cfg = {
         .tokens_per_sec = tokens_per_sec,
-        .burst          = burst,
+        .burst = burst,
     };
     uint32_t key = 0;
     return bpf_map_update_elem(g_map_rate_config_fd, &key, &cfg, BPF_ANY);
@@ -376,15 +381,15 @@ int bpf_rate_config_set(uint32_t tokens_per_sec, uint32_t burst)
 int bpf_port_config_set(const uint16_t *ports, uint8_t count)
 {
     if (g_map_port_config_fd < 0) return -1;
-    
+
     struct port_config cfg = {0};
-    if (count > 16) count = 16;  /* Safety limit */
-    
+    if (count > 16) count = 16; /* Safety limit */
+
     cfg.count = count;
     for (int i = 0; i < count; i++) {
         cfg.ports[i] = htons(ports[i]);
     }
-    
+
     uint32_t key = 0;
     return bpf_map_update_elem(g_map_port_config_fd, &key, &cfg, BPF_ANY);
 }
@@ -421,8 +426,7 @@ int bpf_blocklist_load_file(const char *path)
 
     FILE *f = fopen(path, "r");
     if (!f) {
-        log_warn("bpf_blocklist", "cannot open blocklist file %s: %s",
-            path, strerror(errno));
+        log_warn("bpf_blocklist", "cannot open blocklist file %s: %s", path, strerror(errno));
         return -1;
     }
 
@@ -431,7 +435,8 @@ int bpf_blocklist_load_file(const char *path)
     while (fgets(line, sizeof(line), f)) {
         /* Strip leading whitespace */
         char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
+        while (*p == ' ' || *p == '\t')
+            p++;
         /* Skip comments and blank lines */
         if (*p == '#' || *p == '\0' || *p == '\n' || *p == '\r') continue;
         /* Strip trailing whitespace */
@@ -453,8 +458,7 @@ int bpf_blocklist_load_file(const char *path)
             log_warn("bpf_blocklist", "invalid IP in blocklist: '%s'", p);
             continue;
         }
-        if (bpf_blocklist_add_addr(&ip) == 0)
-            count++;
+        if (bpf_blocklist_add_addr(&ip) == 0) count++;
     }
     fclose(f);
     log_info("bpf_blocklist", "loaded %d IPs from %s", count, path);
@@ -466,14 +470,16 @@ int bpf_loader_apply_config(const struct xdp_config *xdp)
     if (!g_xdp_active) return 0;
 
     /* Apply rate limit config */
-    uint32_t rps   = (xdp->rate_limit_enabled && xdp->rate_limit_rps > 0)
-                     ? xdp->rate_limit_rps   : (uint32_t)DEFAULT_TOKENS_PER_SEC;
+    uint32_t rps = (xdp->rate_limit_enabled && xdp->rate_limit_rps > 0)
+                       ? xdp->rate_limit_rps
+                       : (uint32_t)DEFAULT_TOKENS_PER_SEC;
     uint32_t burst = (xdp->rate_limit_enabled && xdp->rate_limit_burst > 0)
-                     ? xdp->rate_limit_burst : (uint32_t)DEFAULT_BURST_TOKENS;
+                         ? xdp->rate_limit_burst
+                         : (uint32_t)DEFAULT_BURST_TOKENS;
 
     if (!xdp->rate_limit_enabled) {
         /* Effectively disable rate limiting with an astronomically high limit */
-        rps   = UINT32_MAX;
+        rps = UINT32_MAX;
         burst = UINT32_MAX;
     }
 

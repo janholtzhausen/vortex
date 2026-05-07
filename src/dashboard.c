@@ -21,9 +21,9 @@
 
 #define DASHBOARD_CLIENT_MAX 8
 #define DASHBOARD_HTML_PATH "/"
-#define DASHBOARD_WS_PATH   "/ws"
-#define DASHBOARD_HTML_BUF  (16 * 1024)
-#define DASHBOARD_JSON_BUF  (256 * 1024)
+#define DASHBOARD_WS_PATH "/ws"
+#define DASHBOARD_HTML_BUF (16 * 1024)
+#define DASHBOARD_JSON_BUF (256 * 1024)
 
 struct route_sample {
     uint64_t bytes_in;
@@ -32,47 +32,166 @@ struct route_sample {
 
 struct blocked_ip {
     struct vortex_ip_addr ip;
-    time_t   expire_at;
+    time_t expire_at;
 };
 
 static const char k_dashboard_html[] =
-"<!doctype html>\n"
-"<html lang=\"en\">\n"
-"<head>\n"
-"<meta charset=\"utf-8\">\n"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
-"<title>vortex dashboard</title>\n"
-"<style>\n"
-":root{color-scheme:dark;--bg:#0a1019;--panel:#101a28;--panel2:#152235;--line:#25344b;--text:#e9f0ff;--muted:#8fa4c2;--good:#4dd9a6;--warn:#ffb347;--bad:#ff6b6b;--accent:#66b3ff}\n"
-"*{box-sizing:border-box}body{margin:0;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;color:var(--text);background:radial-gradient(circle at top,#183253 0,#0a1019 55%)}\n"
-".wrap{max-width:1400px;margin:0 auto;padding:20px}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:18px}.title h1{margin:0;font-size:28px;letter-spacing:.03em;text-transform:uppercase}.title p{margin:6px 0 0;color:var(--muted)}\n"
-".live{display:flex;align-items:center;gap:10px;padding:10px 14px;border:1px solid var(--line);background:rgba(16,26,40,.78);border-radius:14px}.dot{width:10px;height:10px;border-radius:50%;background:var(--bad);box-shadow:0 0 14px currentColor}.dot.on{background:var(--good)}\n"
-".grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:14px}.card,.section{border:1px solid var(--line);background:linear-gradient(180deg,rgba(16,26,40,.94),rgba(11,18,29,.98));border-radius:16px;overflow:hidden}.card{padding:16px}.card h2,.section h2{margin:0 0 12px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}\n"
-".metric{font-size:34px;font-weight:700}.sub{color:var(--muted);margin-top:4px}.section{padding:16px;margin-bottom:14px}.routes{display:grid;gap:12px}.route{padding:14px;border:1px solid var(--line);border-radius:14px;background:rgba(21,34,53,.72)}.route-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.route-name{font-size:18px;font-weight:700}.route-stats{color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.badge{padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:#0c1522;color:var(--text)}.badge.open{border-color:rgba(255,107,107,.5);color:#ffd1d1}.badge.half{border-color:rgba(255,179,71,.5);color:#ffe0b2}.badge.closed{border-color:rgba(77,217,166,.45);color:#cbffe8}\n"
-".split{display:grid;grid-template-columns:1.2fr .8fr;gap:14px}.bar{height:14px;background:#09111b;border-radius:999px;overflow:hidden;border:1px solid var(--line);margin-top:12px}.fill{height:100%;background:linear-gradient(90deg,var(--good),var(--accent))}.security{display:grid;grid-template-columns:1fr 1fr;gap:14px}.kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px}.kv div{padding:10px 12px;background:rgba(10,16,25,.64);border:1px solid var(--line);border-radius:12px}.label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.value{display:block;font-size:22px;font-weight:700;margin-top:2px}.list{margin-top:12px;display:grid;gap:8px}.ip{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:rgba(10,16,25,.64)}\n"
-"@media (max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.split,.security{grid-template-columns:1fr}}@media (max-width:720px){.wrap{padding:14px}.top{flex-direction:column;align-items:stretch}.grid{grid-template-columns:1fr}.route-head,.ip{flex-direction:column;align-items:flex-start}}\n"
-"</style>\n"
-"</head>\n"
-"<body>\n"
-"<div class=\"wrap\">\n"
-"<div class=\"top\"><div class=\"title\"><h1>vortex dashboard</h1><p>Real-time route, cache, TLS, and XDP state</p></div><div class=\"live\"><span id=\"dot\" class=\"dot\"></span><strong id=\"live\">offline</strong><span id=\"stamp\">waiting</span></div></div>\n"
-"<div class=\"grid\" id=\"summary\"></div>\n"
-"<div class=\"section\"><h2>Routes</h2><div class=\"routes\" id=\"routes\"></div></div>\n"
-"<div class=\"split\"><div class=\"section\"><h2>Cache</h2><div id=\"cache\"></div></div><div class=\"section\"><h2>TLS</h2><div id=\"tls\"></div></div></div>\n"
-"<div class=\"section\"><h2>Security</h2><div class=\"security\"><div id=\"blocklist\"></div><div id=\"xdp\"></div></div></div>\n"
-"</div>\n"
-"<script>\n"
-"const $=s=>document.querySelector(s);const fmtInt=n=>new Intl.NumberFormat().format(n||0);const fmtRate=n=>{n=Number(n)||0;if(n>=1e9)return(n/1e9).toFixed(2)+' GB/s';if(n>=1e6)return(n/1e6).toFixed(2)+' MB/s';if(n>=1e3)return(n/1e3).toFixed(2)+' KB/s';return n+' B/s'};const fmtBytes=n=>{n=Number(n)||0;if(n>=1<<30)return(n/(1<<30)).toFixed(2)+' GB';if(n>=1<<20)return(n/(1<<20)).toFixed(1)+' MB';if(n>=1<<10)return(n/(1<<10)).toFixed(1)+' KB';return n+' B'};const fmtDur=s=>{s=Math.max(0,Math.floor(s||0));const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return h?`${h}h ${m}m`:m?`${m}m ${x}s`:`${x}s`};const esc=s=>String(s==null?'':s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\n"
-"function render(data){$('#dot').classList.add('on');$('#live').textContent='live';$('#stamp').textContent=`up ${fmtDur(data.uptime_seconds)}   ${data.generated_at}`;$('#summary').innerHTML=[['Active',fmtInt(data.summary.active),`${data.summary.workers} workers`],['Total',fmtInt(data.summary.accepted),`${fmtInt(data.summary.errors)} errors`],['Cache',`${data.cache.hit_rate.toFixed(1)}%`,`${fmtInt(data.cache.hits)} hits`],['TLS',fmtInt(data.summary.tls13+data.summary.tls12),`kTLS ${fmtInt(data.summary.ktls)}`]].map(([a,b,c])=>`<div class=\"card\"><h2>${a}</h2><div class=\"metric\">${b}</div><div class=\"sub\">${c}</div></div>`).join('');\n"
-"$('#routes').innerHTML=data.routes.map(r=>`<div class=\"route\"><div class=\"route-head\"><div><div class=\"route-name\">${esc(r.hostname)}</div><div class=\"route-stats\">Active ${fmtInt(r.active)}   Down ${fmtRate(r.bps_in)}   Up ${fmtRate(r.bps_out)}</div></div><div class=\"route-stats\">${fmtInt(r.backends.length)} backends</div></div><div class=\"badges\">${r.backends.map(b=>`<span class=\"badge ${b.state}\">${b.state==='open'?'⚡':b.state==='half'?'◐':'●'} ${esc(b.address)}${b.fail_count?` (${fmtInt(b.fail_count)} fail)`:''}${b.state==='open'&&b.open_for_ms?` ${Math.ceil(b.open_for_ms/1000)}s`:''}</span>`).join('')}</div></div>`).join('')||'<div class=\"sub\">No routes configured.</div>';\n"
-"$('#cache').innerHTML=`<div class=\"kv\"><div><span class=\"label\">Hits</span><span class=\"value\">${fmtInt(data.cache.hits)}</span></div><div><span class=\"label\">Misses</span><span class=\"value\">${fmtInt(data.cache.misses)}</span></div><div><span class=\"label\">Evictions</span><span class=\"value\">${fmtInt(data.cache.evictions)}</span></div><div><span class=\"label\">Memory</span><span class=\"value\">${fmtBytes(data.cache.slab_size)}</span></div></div><div class=\"bar\"><div class=\"fill\" style=\"width:${Math.max(0,Math.min(100,data.cache.hit_rate))}%\"></div></div><div class=\"sub\">Stores ${fmtInt(data.cache.stores)} in the shared cache</div>`;\n"
-"$('#tls').innerHTML=`<div class=\"kv\"><div><span class=\"label\">TLS 1.2</span><span class=\"value\">${fmtInt(data.summary.tls12)}</span></div><div><span class=\"label\">TLS 1.3</span><span class=\"value\">${fmtInt(data.summary.tls13)}</span></div><div><span class=\"label\">kTLS</span><span class=\"value\">${fmtInt(data.summary.ktls)}</span></div><div><span class=\"label\">Completed</span><span class=\"value\">${fmtInt(data.summary.completed)}</span></div></div>`;\n"
-"$('#blocklist').innerHTML=`<div class=\"kv\"><div><span class=\"label\">Tarpitted Now</span><span class=\"value\">${fmtInt(data.security.tarpit_active)}</span></div><div><span class=\"label\">Tarpit Total</span><span class=\"value\">${fmtInt(data.security.tarpit_total)}</span></div><div><span class=\"label\">Blocked IPs</span><span class=\"value\">${fmtInt(data.security.blocked.length)}</span></div><div><span class=\"label\">Workers</span><span class=\"value\">${fmtInt(data.summary.workers)}</span></div></div><div class=\"list\">${data.security.blocked.map(ip=>`<div class=\"ip\"><strong>${esc(ip.ip)}</strong><span>${ip.ttl_seconds>0?`expires ${fmtDur(ip.ttl_seconds)}`:'expired'}</span></div>`).join('')||'<div class=\"sub\">No blocked IPs.</div>'}</div>`;\n"
-"$('#xdp').innerHTML=`<div class=\"kv\"><div><span class=\"label\">Status</span><span class=\"value\">${data.xdp.active?'active':'inactive'}</span></div><div><span class=\"label\">RX Packets</span><span class=\"value\">${fmtInt(data.xdp.rx_packets)}</span></div><div><span class=\"label\">RX Bytes</span><span class=\"value\">${fmtBytes(data.xdp.rx_bytes)}</span></div><div><span class=\"label\">Passed</span><span class=\"value\">${fmtInt(data.xdp.passed)}</span></div><div><span class=\"label\">Rate Limit</span><span class=\"value\">${fmtInt(data.xdp.dropped_ratelimit)}</span></div><div><span class=\"label\">Blocklist</span><span class=\"value\">${fmtInt(data.xdp.dropped_blocklist)}</span></div><div><span class=\"label\">Invalid</span><span class=\"value\">${fmtInt(data.xdp.dropped_invalid)}</span></div><div><span class=\"label\">Conntrack</span><span class=\"value\">${fmtInt(data.xdp.dropped_conntrack)}</span></div></div>`}\n"
-"let ws;function connect(){$('#dot').classList.remove('on');$('#live').textContent='reconnecting';const proto=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(`${proto}://${location.host}/ws`);ws.onmessage=e=>{try{render(JSON.parse(e.data))}catch(_){}};ws.onopen=()=>{$('#dot').classList.add('on');$('#live').textContent='live'};ws.onclose=()=>{setTimeout(connect,1000)};ws.onerror=()=>ws.close()}connect();\n"
-"</script>\n"
-"</body>\n"
-"</html>\n";
+    "<!doctype html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    "<title>vortex dashboard</title>\n"
+    "<style>\n"
+    ":root{color-scheme:dark;--bg:#0a1019;--panel:#101a28;--panel2:#152235;--line:#25344b;--text:#"
+    "e9f0ff;--muted:#8fa4c2;--good:#4dd9a6;--warn:#ffb347;--bad:#ff6b6b;--accent:#66b3ff}\n"
+    "*{box-sizing:border-box}body{margin:0;font:14px/1.45 "
+    "ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe "
+    "UI\",sans-serif;color:var(--text);background:radial-gradient(circle at top,#183253 0,#0a1019 "
+    "55%)}\n"
+    ".wrap{max-width:1400px;margin:0 "
+    "auto;padding:20px}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:"
+    "16px;margin-bottom:18px}.title "
+    "h1{margin:0;font-size:28px;letter-spacing:.03em;text-transform:uppercase}.title p{margin:6px "
+    "0 0;color:var(--muted)}\n"
+    ".live{display:flex;align-items:center;gap:10px;padding:10px 14px;border:1px solid "
+    "var(--line);background:rgba(16,26,40,.78);border-radius:14px}.dot{width:10px;height:10px;"
+    "border-radius:50%;background:var(--bad);box-shadow:0 0 14px "
+    "currentColor}.dot.on{background:var(--good)}\n"
+    ".grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:14px}."
+    "card,.section{border:1px solid "
+    "var(--line);background:linear-gradient(180deg,rgba(16,26,40,.94),rgba(11,18,29,.98));border-"
+    "radius:16px;overflow:hidden}.card{padding:16px}.card h2,.section h2{margin:0 0 "
+    "12px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}\n"
+    ".metric{font-size:34px;font-weight:700}.sub{color:var(--muted);margin-top:4px}.section{"
+    "padding:16px;margin-bottom:14px}.routes{display:grid;gap:12px}.route{padding:14px;border:1px "
+    "solid "
+    "var(--line);border-radius:14px;background:rgba(21,34,53,.72)}.route-head{display:flex;justify-"
+    "content:space-between;gap:12px;align-items:center}.route-name{font-size:18px;font-weight:700}."
+    "route-stats{color:var(--muted)}.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}."
+    "badge{padding:6px 10px;border-radius:999px;border:1px solid "
+    "var(--line);background:#0c1522;color:var(--text)}.badge.open{border-color:rgba(255,107,107,.5)"
+    ";color:#ffd1d1}.badge.half{border-color:rgba(255,179,71,.5);color:#ffe0b2}.badge.closed{"
+    "border-color:rgba(77,217,166,.45);color:#cbffe8}\n"
+    ".split{display:grid;grid-template-columns:1.2fr "
+    ".8fr;gap:14px}.bar{height:14px;background:#09111b;border-radius:999px;overflow:hidden;border:"
+    "1px solid "
+    "var(--line);margin-top:12px}.fill{height:100%;background:linear-gradient(90deg,var(--good),"
+    "var(--accent))}.security{display:grid;grid-template-columns:1fr "
+    "1fr;gap:14px}.kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px}.kv "
+    "div{padding:10px 12px;background:rgba(10,16,25,.64);border:1px solid "
+    "var(--line);border-radius:12px}.label{display:block;font-size:12px;color:var(--muted);text-"
+    "transform:uppercase;letter-spacing:.08em}.value{display:block;font-size:22px;font-weight:700;"
+    "margin-top:2px}.list{margin-top:12px;display:grid;gap:8px}.ip{display:flex;justify-content:"
+    "space-between;gap:8px;padding:10px 12px;border:1px solid "
+    "var(--line);border-radius:12px;background:rgba(10,16,25,.64)}\n"
+    "@media "
+    "(max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.split,.security{grid-"
+    "template-columns:1fr}}@media "
+    "(max-width:720px){.wrap{padding:14px}.top{flex-direction:column;align-items:stretch}.grid{"
+    "grid-template-columns:1fr}.route-head,.ip{flex-direction:column;align-items:flex-start}}\n"
+    "</style>\n"
+    "</head>\n"
+    "<body>\n"
+    "<div class=\"wrap\">\n"
+    "<div class=\"top\"><div class=\"title\"><h1>vortex dashboard</h1><p>Real-time route, cache, "
+    "TLS, and XDP state</p></div><div class=\"live\"><span id=\"dot\" class=\"dot\"></span><strong "
+    "id=\"live\">offline</strong><span id=\"stamp\">waiting</span></div></div>\n"
+    "<div class=\"grid\" id=\"summary\"></div>\n"
+    "<div class=\"section\"><h2>Routes</h2><div class=\"routes\" id=\"routes\"></div></div>\n"
+    "<div class=\"split\"><div class=\"section\"><h2>Cache</h2><div id=\"cache\"></div></div><div "
+    "class=\"section\"><h2>TLS</h2><div id=\"tls\"></div></div></div>\n"
+    "<div class=\"section\"><h2>Security</h2><div class=\"security\"><div "
+    "id=\"blocklist\"></div><div id=\"xdp\"></div></div></div>\n"
+    "</div>\n"
+    "<script>\n"
+    "const $=s=>document.querySelector(s);const fmtInt=n=>new "
+    "Intl.NumberFormat().format(n||0);const "
+    "fmtRate=n=>{n=Number(n)||0;if(n>=1e9)return(n/1e9).toFixed(2)+' "
+    "GB/s';if(n>=1e6)return(n/1e6).toFixed(2)+' MB/s';if(n>=1e3)return(n/1e3).toFixed(2)+' "
+    "KB/s';return n+' B/s'};const "
+    "fmtBytes=n=>{n=Number(n)||0;if(n>=1<<30)return(n/(1<<30)).toFixed(2)+' "
+    "GB';if(n>=1<<20)return(n/(1<<20)).toFixed(1)+' MB';if(n>=1<<10)return(n/(1<<10)).toFixed(1)+' "
+    "KB';return n+' B'};const fmtDur=s=>{s=Math.max(0,Math.floor(s||0));const "
+    "h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return h?`${h}h ${m}m`:m?`${m}m "
+    "${x}s`:`${x}s`};const "
+    "esc=s=>String(s==null?'':s).replace(/[&<>\"']/"
+    "g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\n"
+    "function "
+    "render(data){$('#dot').classList.add('on');$('#live').textContent='live';$('#stamp')."
+    "textContent=`up ${fmtDur(data.uptime_seconds)}   "
+    "${data.generated_at}`;$('#summary').innerHTML=[['Active',fmtInt(data.summary.active),`${data."
+    "summary.workers} "
+    "workers`],['Total',fmtInt(data.summary.accepted),`${fmtInt(data.summary.errors)} "
+    "errors`],['Cache',`${data.cache.hit_rate.toFixed(1)}%`,`${fmtInt(data.cache.hits)} "
+    "hits`],['TLS',fmtInt(data.summary.tls13+data.summary.tls12),`kTLS "
+    "${fmtInt(data.summary.ktls)}`]].map(([a,b,c])=>`<div class=\"card\"><h2>${a}</h2><div "
+    "class=\"metric\">${b}</div><div class=\"sub\">${c}</div></div>`).join('');\n"
+    "$('#routes').innerHTML=data.routes.map(r=>`<div class=\"route\"><div "
+    "class=\"route-head\"><div><div class=\"route-name\">${esc(r.hostname)}</div><div "
+    "class=\"route-stats\">Active ${fmtInt(r.active)}   Down ${fmtRate(r.bps_in)}   Up "
+    "${fmtRate(r.bps_out)}</div></div><div class=\"route-stats\">${fmtInt(r.backends.length)} "
+    "backends</div></div><div class=\"badges\">${r.backends.map(b=>`<span class=\"badge "
+    "${b.state}\">${b.state==='open'?'⚡':b.state==='half'?'◐':'●'} "
+    "${esc(b.address)}${b.fail_count?` (${fmtInt(b.fail_count)} "
+    "fail)`:''}${b.state==='open'&&b.open_for_ms?` "
+    "${Math.ceil(b.open_for_ms/1000)}s`:''}</span>`).join('')}</div></div>`).join('')||'<div "
+    "class=\"sub\">No routes configured.</div>';\n"
+    "$('#cache').innerHTML=`<div class=\"kv\"><div><span class=\"label\">Hits</span><span "
+    "class=\"value\">${fmtInt(data.cache.hits)}</span></div><div><span "
+    "class=\"label\">Misses</span><span "
+    "class=\"value\">${fmtInt(data.cache.misses)}</span></div><div><span "
+    "class=\"label\">Evictions</span><span "
+    "class=\"value\">${fmtInt(data.cache.evictions)}</span></div><div><span "
+    "class=\"label\">Memory</span><span "
+    "class=\"value\">${fmtBytes(data.cache.slab_size)}</span></div></div><div class=\"bar\"><div "
+    "class=\"fill\" "
+    "style=\"width:${Math.max(0,Math.min(100,data.cache.hit_rate))}%\"></div></div><div "
+    "class=\"sub\">Stores ${fmtInt(data.cache.stores)} in the shared cache</div>`;\n"
+    "$('#tls').innerHTML=`<div class=\"kv\"><div><span class=\"label\">TLS 1.2</span><span "
+    "class=\"value\">${fmtInt(data.summary.tls12)}</span></div><div><span class=\"label\">TLS "
+    "1.3</span><span class=\"value\">${fmtInt(data.summary.tls13)}</span></div><div><span "
+    "class=\"label\">kTLS</span><span "
+    "class=\"value\">${fmtInt(data.summary.ktls)}</span></div><div><span "
+    "class=\"label\">Completed</span><span "
+    "class=\"value\">${fmtInt(data.summary.completed)}</span></div></div>`;\n"
+    "$('#blocklist').innerHTML=`<div class=\"kv\"><div><span class=\"label\">Tarpitted "
+    "Now</span><span class=\"value\">${fmtInt(data.security.tarpit_active)}</span></div><div><span "
+    "class=\"label\">Tarpit Total</span><span "
+    "class=\"value\">${fmtInt(data.security.tarpit_total)}</span></div><div><span "
+    "class=\"label\">Blocked IPs</span><span "
+    "class=\"value\">${fmtInt(data.security.blocked.length)}</span></div><div><span "
+    "class=\"label\">Workers</span><span "
+    "class=\"value\">${fmtInt(data.summary.workers)}</span></div></div><div "
+    "class=\"list\">${data.security.blocked.map(ip=>`<div "
+    "class=\"ip\"><strong>${esc(ip.ip)}</strong><span>${ip.ttl_seconds>0?`expires "
+    "${fmtDur(ip.ttl_seconds)}`:'expired'}</span></div>`).join('')||'<div class=\"sub\">No blocked "
+    "IPs.</div>'}</div>`;\n"
+    "$('#xdp').innerHTML=`<div class=\"kv\"><div><span class=\"label\">Status</span><span "
+    "class=\"value\">${data.xdp.active?'active':'inactive'}</span></div><div><span "
+    "class=\"label\">RX Packets</span><span "
+    "class=\"value\">${fmtInt(data.xdp.rx_packets)}</span></div><div><span class=\"label\">RX "
+    "Bytes</span><span class=\"value\">${fmtBytes(data.xdp.rx_bytes)}</span></div><div><span "
+    "class=\"label\">Passed</span><span "
+    "class=\"value\">${fmtInt(data.xdp.passed)}</span></div><div><span class=\"label\">Rate "
+    "Limit</span><span "
+    "class=\"value\">${fmtInt(data.xdp.dropped_ratelimit)}</span></div><div><span "
+    "class=\"label\">Blocklist</span><span "
+    "class=\"value\">${fmtInt(data.xdp.dropped_blocklist)}</span></div><div><span "
+    "class=\"label\">Invalid</span><span "
+    "class=\"value\">${fmtInt(data.xdp.dropped_invalid)}</span></div><div><span "
+    "class=\"label\">Conntrack</span><span "
+    "class=\"value\">${fmtInt(data.xdp.dropped_conntrack)}</span></div></div>`}\n"
+    "let ws;function "
+    "connect(){$('#dot').classList.remove('on');$('#live').textContent='reconnecting';const "
+    "proto=location.protocol==='https:'?'wss':'ws';ws=new "
+    "WebSocket(`${proto}://${location.host}/"
+    "ws`);ws.onmessage=e=>{try{render(JSON.parse(e.data))}catch(_){}};ws.onopen=()=>{$('#dot')."
+    "classList.add('on');$('#live').textContent='live'};ws.onclose=()=>{setTimeout(connect,1000)};"
+    "ws.onerror=()=>ws.close()}connect();\n"
+    "</script>\n"
+    "</body>\n"
+    "</html>\n";
 
 static void sha1_bytes(const uint8_t *data, size_t len, uint8_t out[20])
 {
@@ -99,10 +218,8 @@ static void sha1_bytes(const uint8_t *data, size_t len, uint8_t out[20])
         uint32_t w[80];
         for (int i = 0; i < 16; i++) {
             size_t j = off + (size_t)i * 4U;
-            w[i] = ((uint32_t)msg[j] << 24) |
-                   ((uint32_t)msg[j + 1] << 16) |
-                   ((uint32_t)msg[j + 2] << 8) |
-                   ((uint32_t)msg[j + 3]);
+            w[i] = ((uint32_t)msg[j] << 24) | ((uint32_t)msg[j + 1] << 16) |
+                   ((uint32_t)msg[j + 2] << 8) | ((uint32_t)msg[j + 3]);
         }
         for (int i = 16; i < 80; i++) {
             uint32_t v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
@@ -133,13 +250,17 @@ static void sha1_bytes(const uint8_t *data, size_t len, uint8_t out[20])
             a = temp;
         }
 
-        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+        h0 += a;
+        h1 += b;
+        h2 += c;
+        h3 += d;
+        h4 += e;
     }
 
     free(msg);
-    uint32_t h[5] = { h0, h1, h2, h3, h4 };
+    uint32_t h[5] = {h0, h1, h2, h3, h4};
     for (int i = 0; i < 5; i++) {
-        out[i * 4]     = (uint8_t)(h[i] >> 24);
+        out[i * 4] = (uint8_t)(h[i] >> 24);
         out[i * 4 + 1] = (uint8_t)(h[i] >> 16);
         out[i * 4 + 2] = (uint8_t)(h[i] >> 8);
         out[i * 4 + 3] = (uint8_t)(h[i]);
@@ -148,8 +269,7 @@ static void sha1_bytes(const uint8_t *data, size_t len, uint8_t out[20])
 
 static void base64_encode(const uint8_t *in, size_t len, char *out, size_t out_sz)
 {
-    static const char table[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t pos = 0;
     for (size_t i = 0; i < len && pos + 4 < out_sz; i += 3) {
         uint32_t v = (uint32_t)in[i] << 16;
@@ -210,7 +330,8 @@ static const char *find_header_value(const char *req, const char *name)
     while ((p = strstr(p, name)) != NULL) {
         if ((p == req || p[-1] == '\n') && strncasecmp(p, name, nlen) == 0) {
             p += nlen;
-            while (*p == ' ' || *p == '\t') p++;
+            while (*p == ' ' || *p == '\t')
+                p++;
             return p;
         }
         p += nlen;
@@ -225,17 +346,17 @@ static void trim_header_value(char *s)
         *--e = '\0';
 }
 
-static void send_http_simple(int fd, const char *status, const char *ctype,
-                             const void *body, size_t body_len)
+static void send_http_simple(int fd, const char *status, const char *ctype, const void *body,
+                             size_t body_len)
 {
     char header[256];
     int hlen = snprintf(header, sizeof(header),
-        "HTTP/1.1 %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: close\r\n\r\n",
-        status, ctype, body_len);
+                        "HTTP/1.1 %s\r\n"
+                        "Content-Type: %s\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Cache-Control: no-store\r\n"
+                        "Connection: close\r\n\r\n",
+                        status, ctype, body_len);
     if (hlen > 0) {
         send_all(fd, header, (size_t)hlen);
         if (body && body_len > 0) send_all(fd, body, body_len);
@@ -264,8 +385,8 @@ static void format_hms_utc(char out[16], time_t now)
     strftime(out, 16, "%H:%M:%S", &tmv);
 }
 
-static void collect_blocked_ips(struct dashboard_server *ds,
-                                struct blocked_ip **out_ips, size_t *out_count)
+static void collect_blocked_ips(struct dashboard_server *ds, struct blocked_ip **out_ips,
+                                size_t *out_count)
 {
     *out_ips = NULL;
     *out_count = 0;
@@ -288,8 +409,7 @@ static void collect_blocked_ips(struct dashboard_server *ds,
             for (size_t j = 0; j < used; j++) {
                 if (ips[j].ip.family == be->ip.family &&
                     memcmp(ips[j].ip.addr, be->ip.addr, sizeof(be->ip.addr)) == 0) {
-                    if (be->expire_at > ips[j].expire_at)
-                        ips[j].expire_at = be->expire_at;
+                    if (be->expire_at > ips[j].expire_at) ips[j].expire_at = be->expire_at;
                     merged = true;
                     break;
                 }
@@ -306,9 +426,8 @@ static void collect_blocked_ips(struct dashboard_server *ds,
     *out_count = used;
 }
 
-static int build_snapshot_json(struct dashboard_server *ds,
-                               struct route_sample *prev,
-                               char *buf, size_t bufsz, size_t *out_len)
+static int build_snapshot_json(struct dashboard_server *ds, struct route_sample *prev, char *buf,
+                               size_t bufsz, size_t *out_len)
 {
     uint64_t accepted = 0, completed = 0, errors = 0;
     uint64_t active = 0, tls12 = 0, tls13 = 0, ktls = 0;
@@ -345,11 +464,11 @@ static int build_snapshot_json(struct dashboard_server *ds,
     for (int wi = 0; wi < ds->num_workers; wi++) {
         struct cache *c = ds->workers[wi]->cache;
         if (!c) continue;
-        cache_hits       += c->hits;
-        cache_misses     += c->misses;
-        cache_evictions  += c->evictions;
-        cache_stores     += c->stores;
-        cache_slab_size  += c->slab_size;
+        cache_hits += c->hits;
+        cache_misses += c->misses;
+        cache_evictions += c->evictions;
+        cache_stores += c->stores;
+        cache_slab_size += c->slab_size;
     }
 
     double hit_rate = 0.0;
@@ -373,20 +492,15 @@ static int build_snapshot_json(struct dashboard_server *ds,
 
     size_t pos = 0;
     if (appendf(buf, bufsz, &pos,
-        "{\"generated_at\":\"%s\",\"uptime_seconds\":%llu,"
-        "\"summary\":{\"workers\":%d,\"active\":%llu,\"accepted\":%llu,"
-        "\"completed\":%llu,\"errors\":%llu,\"tls12\":%llu,\"tls13\":%llu,\"ktls\":%llu},"
-        "\"routes\":[",
-        timebuf,
-        (unsigned long long)(now_wall - (time_t)ds->start_time),
-        ds->num_workers,
-        (unsigned long long)active,
-        (unsigned long long)accepted,
-        (unsigned long long)completed,
-        (unsigned long long)errors,
-        (unsigned long long)tls12,
-        (unsigned long long)tls13,
-        (unsigned long long)ktls) < 0) {
+                "{\"generated_at\":\"%s\",\"uptime_seconds\":%llu,"
+                "\"summary\":{\"workers\":%d,\"active\":%llu,\"accepted\":%llu,"
+                "\"completed\":%llu,\"errors\":%llu,\"tls12\":%llu,\"tls13\":%llu,\"ktls\":%llu},"
+                "\"routes\":[",
+                timebuf, (unsigned long long)(now_wall - (time_t)ds->start_time), ds->num_workers,
+                (unsigned long long)active, (unsigned long long)accepted,
+                (unsigned long long)completed, (unsigned long long)errors,
+                (unsigned long long)tls12, (unsigned long long)tls13,
+                (unsigned long long)ktls) < 0) {
         free(blocked);
         return -1;
     }
@@ -400,12 +514,10 @@ static int build_snapshot_json(struct dashboard_server *ds,
             route_bps_out = cur[ri].bytes_out - prev[ri].bytes_out;
 
         if (appendf(buf, bufsz, &pos,
-            "%s{\"hostname\":\"%s\",\"active\":%llu,\"bps_in\":%llu,\"bps_out\":%llu,\"backends\":[",
-            ri ? "," : "",
-            rc->hostname,
-            (unsigned long long)route_active[ri],
-            (unsigned long long)route_bps_in,
-            (unsigned long long)route_bps_out) < 0) {
+                    "%s{\"hostname\":\"%s\",\"active\":%llu,\"bps_in\":%llu,\"bps_out\":%llu,"
+                    "\"backends\":[",
+                    ri ? "," : "", rc->hostname, (unsigned long long)route_active[ri],
+                    (unsigned long long)route_bps_in, (unsigned long long)route_bps_out) < 0) {
             free(blocked);
             return -1;
         }
@@ -431,12 +543,10 @@ static int build_snapshot_json(struct dashboard_server *ds,
                 state = "half";
             }
             if (appendf(buf, bufsz, &pos,
-                "%s{\"address\":\"%s\",\"fail_count\":%u,\"state\":\"%s\",\"open_for_ms\":%llu}",
-                bi ? "," : "",
-                rc->backends[bi].address,
-                max_fail_count,
-                state,
-                (unsigned long long)open_for_ms) < 0) {
+                        "%s{\"address\":\"%s\",\"fail_count\":%u,\"state\":\"%s\",\"open_for_ms\":%"
+                        "llu}",
+                        bi ? "," : "", rc->backends[bi].address, max_fail_count, state,
+                        (unsigned long long)open_for_ms) < 0) {
                 free(blocked);
                 return -1;
             }
@@ -449,17 +559,13 @@ static int build_snapshot_json(struct dashboard_server *ds,
     }
 
     if (appendf(buf, bufsz, &pos,
-        "],\"cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"stores\":%llu,"
-        "\"slab_size\":%llu,\"hit_rate\":%.1f},"
-        "\"security\":{\"tarpit_active\":%llu,\"tarpit_total\":%llu,\"blocked\":[",
-        (unsigned long long)cache_hits,
-        (unsigned long long)cache_misses,
-        (unsigned long long)cache_evictions,
-        (unsigned long long)cache_stores,
-        (unsigned long long)cache_slab_size,
-        hit_rate,
-        (unsigned long long)tarpit_active,
-        (unsigned long long)tarpit_total) < 0) {
+                "],\"cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"stores\":%llu,"
+                "\"slab_size\":%llu,\"hit_rate\":%.1f},"
+                "\"security\":{\"tarpit_active\":%llu,\"tarpit_total\":%llu,\"blocked\":[",
+                (unsigned long long)cache_hits, (unsigned long long)cache_misses,
+                (unsigned long long)cache_evictions, (unsigned long long)cache_stores,
+                (unsigned long long)cache_slab_size, hit_rate, (unsigned long long)tarpit_active,
+                (unsigned long long)tarpit_total) < 0) {
         free(blocked);
         return -1;
     }
@@ -468,10 +574,8 @@ static int build_snapshot_json(struct dashboard_server *ds,
         char ipbuf[INET6_ADDRSTRLEN];
         ip_to_str(&blocked[i].ip, ipbuf);
         long ttl = (long)(blocked[i].expire_at - now_wall);
-        if (appendf(buf, bufsz, &pos,
-            "%s{\"ip\":\"%s\",\"ttl_seconds\":%ld}",
-            i ? "," : "",
-            ipbuf, ttl > 0 ? ttl : 0L) < 0) {
+        if (appendf(buf, bufsz, &pos, "%s{\"ip\":\"%s\",\"ttl_seconds\":%ld}", i ? "," : "", ipbuf,
+                    ttl > 0 ? ttl : 0L) < 0) {
             free(blocked);
             return -1;
         }
@@ -479,17 +583,14 @@ static int build_snapshot_json(struct dashboard_server *ds,
     free(blocked);
 
     if (appendf(buf, bufsz, &pos,
-        "]},\"xdp\":{\"active\":%s,\"rx_packets\":%llu,\"rx_bytes\":%llu,"
-        "\"passed\":%llu,\"dropped_ratelimit\":%llu,\"dropped_blocklist\":%llu,"
-        "\"dropped_invalid\":%llu,\"dropped_conntrack\":%llu}}",
-        xdp_active ? "true" : "false",
-        (unsigned long long)xdp.rx_packets,
-        (unsigned long long)xdp.rx_bytes,
-        (unsigned long long)xdp.passed,
-        (unsigned long long)xdp.dropped_ratelimit,
-        (unsigned long long)xdp.dropped_blocklist,
-        (unsigned long long)xdp.dropped_invalid,
-        (unsigned long long)xdp.dropped_conntrack) < 0) {
+                "]},\"xdp\":{\"active\":%s,\"rx_packets\":%llu,\"rx_bytes\":%llu,"
+                "\"passed\":%llu,\"dropped_ratelimit\":%llu,\"dropped_blocklist\":%llu,"
+                "\"dropped_invalid\":%llu,\"dropped_conntrack\":%llu}}",
+                xdp_active ? "true" : "false", (unsigned long long)xdp.rx_packets,
+                (unsigned long long)xdp.rx_bytes, (unsigned long long)xdp.passed,
+                (unsigned long long)xdp.dropped_ratelimit,
+                (unsigned long long)xdp.dropped_blocklist, (unsigned long long)xdp.dropped_invalid,
+                (unsigned long long)xdp.dropped_conntrack) < 0) {
         return -1;
     }
 
@@ -541,11 +642,11 @@ static int websocket_accept(int fd, const char *req)
 
     char resp[256];
     int len = snprintf(resp, sizeof(resp),
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n\r\n",
-        accept_key);
+                       "HTTP/1.1 101 Switching Protocols\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Accept: %s\r\n\r\n",
+                       accept_key);
     return send_all(fd, resp, (size_t)len);
 }
 
@@ -570,13 +671,12 @@ static int handle_http_client(struct dashboard_server *ds, int fd, int *is_ws)
     }
 
     if (strcmp(path, DASHBOARD_HTML_PATH) == 0) {
-        send_http_simple(fd, "200 OK", "text/html; charset=utf-8",
-                         k_dashboard_html, strlen(k_dashboard_html));
+        send_http_simple(fd, "200 OK", "text/html; charset=utf-8", k_dashboard_html,
+                         strlen(k_dashboard_html));
         return -1;
     }
 
-    if (strcmp(path, DASHBOARD_WS_PATH) == 0 &&
-        strstr(req, "Upgrade: websocket") != NULL) {
+    if (strcmp(path, DASHBOARD_WS_PATH) == 0 && strstr(req, "Upgrade: websocket") != NULL) {
         if (websocket_accept(fd, req) == 0) {
             *is_ws = 1;
             return 0;
@@ -598,8 +698,8 @@ static void *dashboard_thread(void *arg)
     memset(prev, 0, sizeof(prev));
 
     set_nonblock(ds->listen_fd);
-    log_info("dashboard_init", "dashboard endpoint: http://%s:%u/",
-             ds->cfg->dashboard.bind_address, (unsigned)ds->cfg->dashboard.port);
+    log_info("dashboard_init", "dashboard endpoint: http://%s:%u/", ds->cfg->dashboard.bind_address,
+             (unsigned)ds->cfg->dashboard.port);
 
     while (ds->running) {
         fd_set rfds;
@@ -613,7 +713,7 @@ static void *dashboard_thread(void *arg)
             }
         }
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         int rc = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (rc < 0) {
             if (errno == EINTR) continue;
@@ -678,10 +778,8 @@ static void *dashboard_thread(void *arg)
     return NULL;
 }
 
-int dashboard_init(struct dashboard_server *ds,
-                   const char *bind_addr, uint16_t port,
-                   struct worker **workers, int num_workers,
-                   struct vortex_config *cfg)
+int dashboard_init(struct dashboard_server *ds, const char *bind_addr, uint16_t port,
+                   struct worker **workers, int num_workers, struct vortex_config *cfg)
 {
     memset(ds, 0, sizeof(*ds));
     ds->workers = workers;

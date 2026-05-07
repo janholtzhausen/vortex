@@ -19,6 +19,6 @@ void log_close(void);
 void log_msg(log_level_t level, const char *event, const char *fmt, ...);
 
 #define log_debug(event, ...) log_msg(LOG_DEBUG, event, __VA_ARGS__)
-#define log_info(event, ...)  log_msg(LOG_INFO,  event, __VA_ARGS__)
-#define log_warn(event, ...)  log_msg(LOG_WARN,  event, __VA_ARGS__)
+#define log_info(event, ...) log_msg(LOG_INFO, event, __VA_ARGS__)
+#define log_warn(event, ...) log_msg(LOG_WARN, event, __VA_ARGS__)
 #define log_error(event, ...) log_msg(LOG_ERROR, event, __VA_ARGS__)

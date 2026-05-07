@@ -20,7 +20,10 @@ static void handle_connection(struct acme_http01_server *srv, int cfd)
 {
     char buf[BUF_SZ];
     ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) { close(cfd); return; }
+    if (n <= 0) {
+        close(cfd);
+        return;
+    }
     buf[n] = '\0';
 
     /* Parse request line: METHOD PATH HTTP/x.y */
@@ -32,35 +35,32 @@ static void handle_connection(struct acme_http01_server *srv, int cfd)
 
     /* ACME challenge request? */
     if (strcmp(method, "GET") == 0 &&
-        strncmp(path, CHALLENGE_PREFIX, strlen(CHALLENGE_PREFIX)) == 0)
-    {
+        strncmp(path, CHALLENGE_PREFIX, strlen(CHALLENGE_PREFIX)) == 0) {
         const char *token = path + strlen(CHALLENGE_PREFIX);
 
         pthread_mutex_lock(&srv->challenge_lock);
-        int match = (srv->challenge_token[0] != '\0' &&
-                     strcmp(token, srv->challenge_token) == 0);
+        int match = (srv->challenge_token[0] != '\0' && strcmp(token, srv->challenge_token) == 0);
         char keyauth[512];
         strncpy(keyauth, srv->challenge_keyauth, sizeof(keyauth) - 1);
-        keyauth[sizeof(keyauth)-1] = '\0';
+        keyauth[sizeof(keyauth) - 1] = '\0';
         pthread_mutex_unlock(&srv->challenge_lock);
 
         if (match) {
             char resp[1024];
             int rlen = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/octet-stream\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(keyauth), keyauth);
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/octet-stream\r\n"
+                                "Content-Length: %zu\r\n"
+                                "Connection: close\r\n"
+                                "\r\n"
+                                "%s",
+                                strlen(keyauth), keyauth);
             send(cfd, resp, (size_t)rlen, MSG_NOSIGNAL);
             log_info("acme_http01", "served challenge token=%s", token);
         } else {
-            const char *not_found =
-                "HTTP/1.1 404 Not Found\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: close\r\n\r\n";
+            const char *not_found = "HTTP/1.1 404 Not Found\r\n"
+                                    "Content-Length: 0\r\n"
+                                    "Connection: close\r\n\r\n";
             send(cfd, not_found, strlen(not_found), MSG_NOSIGNAL);
             log_debug("acme_http01", "unknown token=%s", token);
         }
@@ -71,12 +71,12 @@ static void handle_connection(struct acme_http01_server *srv, int cfd)
         const char *host_hdr = strcasestr(buf, "\r\nHost:");
         if (host_hdr) {
             host_hdr += 7; /* skip "\r\nHost:" */
-            while (*host_hdr == ' ') host_hdr++;
+            while (*host_hdr == ' ')
+                host_hdr++;
             const char *end = strstr(host_hdr, "\r\n");
             size_t hlen = end ? (size_t)(end - host_hdr) : strlen(host_hdr);
             if (hlen < sizeof(location) - 16) {
-                snprintf(location, sizeof(location),
-                    "https://%.*s%s", (int)hlen, host_hdr, path);
+                snprintf(location, sizeof(location), "https://%.*s%s", (int)hlen, host_hdr, path);
             }
         }
 
@@ -84,16 +84,16 @@ static void handle_connection(struct acme_http01_server *srv, int cfd)
         int rlen;
         if (location[0]) {
             rlen = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 301 Moved Permanently\r\n"
-                "Location: %s\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: close\r\n\r\n",
-                location);
+                            "HTTP/1.1 301 Moved Permanently\r\n"
+                            "Location: %s\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n\r\n",
+                            location);
         } else {
             rlen = snprintf(resp, sizeof(resp),
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: close\r\n\r\n");
+                            "HTTP/1.1 400 Bad Request\r\n"
+                            "Content-Length: 0\r\n"
+                            "Connection: close\r\n\r\n");
         }
         send(cfd, resp, (size_t)rlen, MSG_NOSIGNAL);
     }
@@ -110,10 +110,9 @@ static void *server_thread(void *arg)
         FD_ZERO(&rset);
         FD_SET(srv->listen_fd, &rset);
         FD_SET(srv->stop_pipe[0], &rset);
-        int maxfd = (srv->listen_fd > srv->stop_pipe[0])
-                  ? srv->listen_fd : srv->stop_pipe[0];
+        int maxfd = (srv->listen_fd > srv->stop_pipe[0]) ? srv->listen_fd : srv->stop_pipe[0];
 
-        struct timeval tv = { .tv_sec = 2 };
+        struct timeval tv = {.tv_sec = 2};
         int sel = select(maxfd + 1, &rset, NULL, NULL, &tv);
         if (sel < 0) {
             if (errno == EINTR) continue;
@@ -129,7 +128,7 @@ static void *server_thread(void *arg)
             int cfd = accept(srv->listen_fd, (struct sockaddr *)&ca, &calen);
             if (cfd >= 0) {
                 /* Set read/write timeout */
-                struct timeval to = { .tv_sec = 5 };
+                struct timeval to = {.tv_sec = 5};
                 setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
                 setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
                 handle_connection(srv, cfd);
@@ -165,7 +164,7 @@ int acme_http01_start(struct acme_http01_server *srv, int port)
 
     struct sockaddr_in sa = {
         .sin_family = AF_INET,
-        .sin_port   = htons((uint16_t)port),
+        .sin_port = htons((uint16_t)port),
         .sin_addr.s_addr = INADDR_ANY,
     };
     if (bind(srv->listen_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
@@ -177,7 +176,7 @@ int acme_http01_start(struct acme_http01_server *srv, int port)
         goto err;
     }
 
-    srv->port    = port;
+    srv->port = port;
     srv->running = 1;
     if (pthread_create(&srv->thread, NULL, server_thread, srv) != 0) {
         log_error("acme_http01", "pthread_create: %s", strerror(errno));
@@ -188,26 +187,32 @@ int acme_http01_start(struct acme_http01_server *srv, int port)
     return 0;
 
 err:
-    if (srv->listen_fd >= 0) { close(srv->listen_fd); srv->listen_fd = -1; }
-    if (srv->stop_pipe[0] >= 0) { close(srv->stop_pipe[0]); close(srv->stop_pipe[1]); }
+    if (srv->listen_fd >= 0) {
+        close(srv->listen_fd);
+        srv->listen_fd = -1;
+    }
+    if (srv->stop_pipe[0] >= 0) {
+        close(srv->stop_pipe[0]);
+        close(srv->stop_pipe[1]);
+    }
     return -1;
 }
 
-void acme_http01_set_challenge(struct acme_http01_server *srv,
-                                const char *token, const char *key_auth)
+void acme_http01_set_challenge(struct acme_http01_server *srv, const char *token,
+                               const char *key_auth)
 {
     pthread_mutex_lock(&srv->challenge_lock);
-    strncpy(srv->challenge_token,   token,    sizeof(srv->challenge_token)   - 1);
+    strncpy(srv->challenge_token, token, sizeof(srv->challenge_token) - 1);
     strncpy(srv->challenge_keyauth, key_auth, sizeof(srv->challenge_keyauth) - 1);
-    srv->challenge_token[sizeof(srv->challenge_token)-1]   = '\0';
-    srv->challenge_keyauth[sizeof(srv->challenge_keyauth)-1] = '\0';
+    srv->challenge_token[sizeof(srv->challenge_token) - 1] = '\0';
+    srv->challenge_keyauth[sizeof(srv->challenge_keyauth) - 1] = '\0';
     pthread_mutex_unlock(&srv->challenge_lock);
 }
 
 void acme_http01_clear_challenge(struct acme_http01_server *srv)
 {
     pthread_mutex_lock(&srv->challenge_lock);
-    srv->challenge_token[0]   = '\0';
+    srv->challenge_token[0] = '\0';
     srv->challenge_keyauth[0] = '\0';
     pthread_mutex_unlock(&srv->challenge_lock);
 }
@@ -220,8 +225,17 @@ void acme_http01_stop(struct acme_http01_server *srv)
         (void)write(srv->stop_pipe[1], "x", 1);
     }
     pthread_join(srv->thread, NULL);
-    if (srv->listen_fd >= 0) { close(srv->listen_fd); srv->listen_fd = -1; }
-    if (srv->stop_pipe[0] >= 0) { close(srv->stop_pipe[0]); srv->stop_pipe[0] = -1; }
-    if (srv->stop_pipe[1] >= 0) { close(srv->stop_pipe[1]); srv->stop_pipe[1] = -1; }
+    if (srv->listen_fd >= 0) {
+        close(srv->listen_fd);
+        srv->listen_fd = -1;
+    }
+    if (srv->stop_pipe[0] >= 0) {
+        close(srv->stop_pipe[0]);
+        srv->stop_pipe[0] = -1;
+    }
+    if (srv->stop_pipe[1] >= 0) {
+        close(srv->stop_pipe[1]);
+        srv->stop_pipe[1] = -1;
+    }
     pthread_mutex_destroy(&srv->challenge_lock);
 }

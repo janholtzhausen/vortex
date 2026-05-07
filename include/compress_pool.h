@@ -19,10 +19,10 @@ struct compress_pool_stats {
 
 struct compress_result {
     uint32_t cid;
-    bool     ok;
-    bool     used_brotli;
-    size_t   compressed_len;
-    size_t   total_len;
+    bool ok;
+    bool used_brotli;
+    size_t compressed_len;
+    size_t total_len;
 };
 
 /*
@@ -33,45 +33,45 @@ struct compress_result {
 
 struct compress_result_slot {
     struct compress_result data;
-    _Atomic uint8_t        ready;
+    _Atomic uint8_t ready;
 };
 
 struct compress_result_ring {
-    _Atomic uint32_t          tail;
-    char                      _pad[60];
-    uint32_t                  head;
+    _Atomic uint32_t tail;
+    char _pad[60];
+    uint32_t head;
     struct compress_result_slot slots[COMPRESS_RESULT_RING_CAP];
 };
 
 struct compress_job {
     uint32_t cid;
-    int      result_pipe_wr;
+    int result_pipe_wr;
     struct compress_result_ring *result_ring;
     uint8_t *src;
-    size_t   src_len;
+    size_t src_len;
     uint8_t *headers;
-    size_t   header_len;
+    size_t header_len;
     uint8_t *scratch;
-    bool     use_brotli;
-    size_t   buf_size;
+    bool use_brotli;
+    size_t buf_size;
 };
 
 struct compress_pool {
-    pthread_t          *threads;
-    int                 thread_count;
-    pthread_mutex_t     mu;
-    pthread_cond_t      cv;
+    pthread_t *threads;
+    int thread_count;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
     struct compress_job queue[COMPRESS_POOL_QUEUE];
-    int                 head;
-    int                 tail;
-    int                 count;
-    uint32_t            active_jobs;
-    uint64_t            submitted_total;
-    uint64_t            completed_total;
-    uint64_t            failed_total;
-    uint64_t            dropped_total;
-    bool                initialized;
-    bool                shutdown;
+    int head;
+    int tail;
+    int count;
+    uint32_t active_jobs;
+    uint64_t submitted_total;
+    uint64_t completed_total;
+    uint64_t failed_total;
+    uint64_t dropped_total;
+    bool initialized;
+    bool shutdown;
 };
 
 void compress_pool_init(struct compress_pool *pool, int thread_count);

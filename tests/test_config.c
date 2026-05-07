@@ -7,19 +7,21 @@
 #include "../include/config.h"
 #include "../include/log.h"
 
-#define ASSERT(cond, msg) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg); \
-        exit(1); \
-    } \
-    printf("  PASS: %s\n", msg); \
-} while(0)
+#define ASSERT(cond, msg)                                                                          \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg);                        \
+            exit(1);                                                                               \
+        }                                                                                          \
+        printf("  PASS: %s\n", msg);                                                               \
+    } while (0)
 
 static void write_test_yaml(const char *path)
 {
     FILE *f = fopen(path, "w");
     assert(f);
-    fprintf(f,
+    fprintf(
+        f,
         "global:\n"
         "  workers: 4\n"
         "  bind_address: \"127.0.0.1\"\n"
@@ -61,11 +63,13 @@ static void write_test_yaml(const char *path)
         "    auth:\n"
         "      enabled: true\n"
         "      users:\n"
-        "        - \"admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc=\"\n"
+        "        - "
+        "\"admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+" // pragma: allowlist
+                                                                                // secret
+        "tOSyi5AORw9EiZ0XG3ILt27KXWTzc=\"\n" // pragma: allowlist secret
         "    cache:\n"
         "      enabled: true\n"
-        "      ttl: 60\n"
-    );
+        "      ttl: 60\n");
     fclose(f);
 }
 
@@ -73,10 +77,11 @@ static void write_auth_file(const char *path)
 {
     FILE *f = fopen(path, "w");
     assert(f);
-    fprintf(f,
-        "# vortex auth verifier file\n"
-        "admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+tOSyi5AORw9EiZ0XG3ILt27KXWTzc=\n"
-    );
+    fprintf(
+        f, "# vortex auth verifier file\n"
+           "admin:$scrypt$ln=15,r=8,p=1$AQIDBAUGBwgJCgsMDQ4PEA==$1b98GT+mgzwTa+" // pragma:
+                                                                                 // allowlist secret
+           "tOSyi5AORw9EiZ0XG3ILt27KXWTzc=\n"); // pragma: allowlist secret
     fclose(f);
 }
 
@@ -89,11 +94,11 @@ int main(void)
     {
         struct vortex_config cfg;
         config_set_defaults(&cfg);
-        ASSERT(cfg.bind_port == 443,  "default bind_port=443");
-        ASSERT(cfg.http_port == 80,   "default http_port=80");
+        ASSERT(cfg.bind_port == 443, "default bind_port=443");
+        ASSERT(cfg.http_port == 80, "default http_port=80");
         ASSERT(cfg.max_request_body_bytes == 8U * 1024U * 1024U,
-            "default max_request_body_bytes=8MB");
-        ASSERT(cfg.tls.ktls == true,  "default ktls=true");
+               "default max_request_body_bytes=8MB");
+        ASSERT(cfg.tls.ktls == true, "default ktls=true");
         ASSERT(cfg.cache.enabled == true, "default cache.enabled=true");
         ASSERT(cfg.cache.index_entries == 16384, "default index_entries=16384");
         ASSERT(cfg.metrics.port == 9090, "default metrics.port=9090");
@@ -107,10 +112,9 @@ int main(void)
         struct vortex_config cfg;
         int ret = config_load(tmpfile, &cfg);
         ASSERT(ret == 0, "config_load returns 0");
-        ASSERT(cfg.workers == 4,      "workers=4");
+        ASSERT(cfg.workers == 4, "workers=4");
         ASSERT(cfg.bind_port == 8443, "bind_port=8443");
-        ASSERT(cfg.max_request_body_bytes == 4U * 1024U * 1024U,
-            "max_request_body_mb=4");
+        ASSERT(cfg.max_request_body_bytes == 4U * 1024U * 1024U, "max_request_body_mb=4");
         ASSERT(!strcmp(cfg.interface, "lo"), "interface=lo");
         ASSERT(!strcmp(cfg.log_level, "debug"), "log_level=debug");
         ASSERT(cfg.tls.ktls == false, "tls.ktls=false");
@@ -119,10 +123,10 @@ int main(void)
         ASSERT(cfg.xdp.rate_limit_rps == 500, "rate_limit_rps=500");
         ASSERT(cfg.xdp.rate_limit_burst == 1000, "rate_limit_burst=1000");
         ASSERT(cfg.cache.index_entries == 2048, "cache.index_entries=2048");
-        ASSERT(cfg.cache.slab_size_bytes == 32ULL*1024*1024, "slab_size_mb=32");
+        ASSERT(cfg.cache.slab_size_bytes == 32ULL * 1024 * 1024, "slab_size_mb=32");
         ASSERT(cfg.cache.default_ttl == 120, "cache.default_ttl=120");
         ASSERT(cfg.metrics.port == 9091, "metrics.port=9091");
-        ASSERT(cfg.route_count == 1,  "route_count=1");
+        ASSERT(cfg.route_count == 1, "route_count=1");
         ASSERT(!strcmp(cfg.routes[0].hostname, "test.example.com"), "route hostname");
         ASSERT(cfg.routes[0].backend_count == 1, "backend_count=1");
         ASSERT(!strcmp(cfg.routes[0].backends[0].address, "10.0.0.1:8080"), "backend address");
@@ -141,12 +145,10 @@ int main(void)
         setenv("TEST_API_TOKEN", "mysecrettoken", 1);
         const char *tmpfile = "/tmp/vortex_env_test.yaml";
         FILE *f = fopen(tmpfile, "w");
-        fprintf(f,
-            "acme:\n"
-            "  enabled: true\n"
-            "  dns_provider_config:\n"
-            "    api_token: \"${TEST_API_TOKEN}\"\n"
-        );
+        fprintf(f, "acme:\n"
+                   "  enabled: true\n"
+                   "  dns_provider_config:\n"
+                   "    api_token: \"${TEST_API_TOKEN}\"\n");
         fclose(f);
 
         struct vortex_config cfg;
@@ -154,7 +156,7 @@ int main(void)
         int ret = config_load(tmpfile, &cfg);
         ASSERT(ret == 0, "env var config loads");
         ASSERT(!strcmp(cfg.acme.dns_api_token, "mysecrettoken"),
-            "env var ${TEST_API_TOKEN} expanded");
+               "env var ${TEST_API_TOKEN} expanded");
         unlink(tmpfile);
     }
 
@@ -169,14 +171,12 @@ int main(void)
     {
         const char *tmpfile = "/tmp/vortex_auth_missing.yaml";
         FILE *f = fopen(tmpfile, "w");
-        fprintf(f,
-            "routes:\n"
-            "  - hostname: \"auth.example.com\"\n"
-            "    backends:\n"
-            "      - address: \"10.0.0.1:8080\"\n"
-            "    auth:\n"
-            "      enabled: true\n"
-        );
+        fprintf(f, "routes:\n"
+                   "  - hostname: \"auth.example.com\"\n"
+                   "    backends:\n"
+                   "      - address: \"10.0.0.1:8080\"\n"
+                   "    auth:\n"
+                   "      enabled: true\n");
         fclose(f);
 
         struct vortex_config cfg;
@@ -189,16 +189,14 @@ int main(void)
     {
         const char *tmpfile = "/tmp/vortex_auth_invalid.yaml";
         FILE *f = fopen(tmpfile, "w");
-        fprintf(f,
-            "routes:\n"
-            "  - hostname: \"auth.example.com\"\n"
-            "    backends:\n"
-            "      - address: \"10.0.0.1:8080\"\n"
-            "    auth:\n"
-            "      enabled: true\n"
-            "      users:\n"
-            "        - \"admin:plaintext\"\n"
-        );
+        fprintf(f, "routes:\n"
+                   "  - hostname: \"auth.example.com\"\n"
+                   "    backends:\n"
+                   "      - address: \"10.0.0.1:8080\"\n"
+                   "    auth:\n"
+                   "      enabled: true\n"
+                   "      users:\n"
+                   "        - \"admin:plaintext\"\n");
         fclose(f);
 
         struct vortex_config cfg;
@@ -214,14 +212,14 @@ int main(void)
         write_auth_file(authfile);
         FILE *f = fopen(cfgfile, "w");
         fprintf(f,
-            "routes:\n"
-            "  - hostname: \"auth.example.com\"\n"
-            "    backends:\n"
-            "      - address: \"10.0.0.1:8080\"\n"
-            "    auth:\n"
-            "      enabled: true\n"
-            "      file: \"%s\"\n",
-            authfile);
+                "routes:\n"
+                "  - hostname: \"auth.example.com\"\n"
+                "    backends:\n"
+                "      - address: \"10.0.0.1:8080\"\n"
+                "    auth:\n"
+                "      enabled: true\n"
+                "      file: \"%s\"\n",
+                authfile);
         fclose(f);
 
         struct vortex_config cfg;

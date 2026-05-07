@@ -31,13 +31,13 @@
 #define GLOBAL_POOL_SLOTS 256
 
 struct global_backend_conn {
-    int   fd;
+    int fd;
     void *ssl;
 };
 
 struct global_fd_pool {
     pthread_spinlock_t spin;
-    uint32_t           count;
+    uint32_t count;
     struct global_backend_conn conns[GLOBAL_POOL_SLOTS];
 };
 
@@ -54,7 +54,7 @@ static inline bool global_pool_get(int ri, int bi, struct global_backend_conn *o
     bool ok = p->count > 0;
     if (ok && out) {
         *out = p->conns[--p->count];
-        p->conns[p->count] = (struct global_backend_conn){ .fd = -1, .ssl = NULL };
+        p->conns[p->count] = (struct global_backend_conn){.fd = -1, .ssl = NULL};
     }
     pthread_spin_unlock(&p->spin);
     return ok;
@@ -73,8 +73,7 @@ static inline void global_pool_put(int ri, int bi, struct global_backend_conn co
         pthread_spin_unlock(&p->spin);
         close(conn.fd);
 #ifdef VORTEX_PHASE_TLS
-        if (conn.ssl)
-            ptls_free((ptls_t *)conn.ssl);
+        if (conn.ssl) ptls_free((ptls_t *)conn.ssl);
 #endif
     }
 }

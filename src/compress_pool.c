@@ -6,8 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
-_Static_assert(sizeof(struct compress_result) <= 4096,
-    "compress_result must fit in PIPE_BUF");
+_Static_assert(sizeof(struct compress_result) <= 4096, "compress_result must fit in PIPE_BUF");
 
 static void *compress_pool_worker_thread(void *arg)
 {
@@ -34,25 +33,23 @@ static void *compress_pool_worker_thread(void *arg)
             .ok = false,
         };
 
-        res.total_len = compress_http_response_parts(job.headers, job.header_len,
-            job.src, job.src_len, job.scratch, job.buf_size,
+        res.total_len = compress_http_response_parts(
+            job.headers, job.header_len, job.src, job.src_len, job.scratch, job.buf_size,
             job.use_brotli, &res.used_brotli, &res.compressed_len);
-        if (res.total_len > 0)
-            res.ok = true;
+        if (res.total_len > 0) res.ok = true;
 
         if (job.result_ring) {
-            uint32_t idx = atomic_fetch_add_explicit(&job.result_ring->tail, 1,
-                               memory_order_relaxed) % COMPRESS_RESULT_RING_CAP;
-            while (atomic_load_explicit(&job.result_ring->slots[idx].ready,
-                                         memory_order_acquire) != 0)
+            uint32_t idx =
+                atomic_fetch_add_explicit(&job.result_ring->tail, 1, memory_order_relaxed) %
+                COMPRESS_RESULT_RING_CAP;
+            while (atomic_load_explicit(&job.result_ring->slots[idx].ready, memory_order_acquire) !=
+                   0)
                 ;
             job.result_ring->slots[idx].data = res;
-            atomic_store_explicit(&job.result_ring->slots[idx].ready, 1,
-                                   memory_order_release);
+            atomic_store_explicit(&job.result_ring->slots[idx].ready, 1, memory_order_release);
             const uint8_t wake = 1;
             ssize_t wr = write(job.result_pipe_wr, &wake, sizeof(wake));
-            if (wr != 1)
-                log_error("compress_pool", "wakeup pipe write failed cid=%u", job.cid);
+            if (wr != 1) log_error("compress_pool", "wakeup pipe write failed cid=%u", job.cid);
         } else {
             ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
             if (wr != (ssize_t)sizeof(res))
@@ -60,8 +57,10 @@ static void *compress_pool_worker_thread(void *arg)
         }
 
         pthread_mutex_lock(&pool->mu);
-        if (res.ok) pool->completed_total++;
-        else pool->failed_total++;
+        if (res.ok)
+            pool->completed_total++;
+        else
+            pool->failed_total++;
         if (pool->active_jobs > 0) pool->active_jobs--;
         pthread_mutex_unlock(&pool->mu);
     }
@@ -71,8 +70,7 @@ static void *compress_pool_worker_thread(void *arg)
 
 void compress_pool_init(struct compress_pool *pool, int thread_count)
 {
-    if (thread_count <= 0)
-        return;
+    if (thread_count <= 0) return;
 
     memset(pool, 0, sizeof(*pool));
     pool->thread_count = thread_count;
@@ -91,8 +89,7 @@ void compress_pool_init(struct compress_pool *pool, int thread_count)
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 256 * 1024);
-        pthread_create(&pool->threads[i], &attr,
-                       compress_pool_worker_thread, pool);
+        pthread_create(&pool->threads[i], &attr, compress_pool_worker_thread, pool);
         pthread_attr_destroy(&attr);
     }
     log_info("compress_pool", "started %d compression threads", thread_count);
@@ -100,8 +97,7 @@ void compress_pool_init(struct compress_pool *pool, int thread_count)
 
 void compress_pool_destroy(struct compress_pool *pool)
 {
-    if (!pool->initialized)
-        return;
+    if (!pool->initialized) return;
 
     pthread_mutex_lock(&pool->mu);
     pool->shutdown = true;
@@ -123,8 +119,7 @@ void compress_pool_destroy(struct compress_pool *pool)
 
 bool compress_pool_submit(struct compress_pool *pool, struct compress_job job)
 {
-    if (!pool->initialized)
-        return false;
+    if (!pool->initialized) return false;
 
     pthread_mutex_lock(&pool->mu);
     if (pool->count >= COMPRESS_POOL_QUEUE) {
@@ -146,8 +141,7 @@ void compress_pool_snapshot(struct compress_pool *pool, struct compress_pool_sta
 {
     if (!out) return;
     memset(out, 0, sizeof(*out));
-    if (!pool || !pool->initialized)
-        return;
+    if (!pool || !pool->initialized) return;
 
     pthread_mutex_lock(&pool->mu);
     out->queue_depth = (uint32_t)pool->count;

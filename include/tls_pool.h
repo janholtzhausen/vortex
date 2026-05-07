@@ -19,8 +19,8 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
-#define TLS_POOL_THREADS  4     /* worker threads in the pool */
-#define TLS_POOL_QUEUE   128    /* max pending jobs */
+#define TLS_POOL_THREADS 4 /* worker threads in the pool */
+#define TLS_POOL_QUEUE 128 /* max pending jobs */
 
 struct tls_pool_stats {
     uint32_t queue_depth;
@@ -33,27 +33,27 @@ struct tls_pool_stats {
 
 typedef enum {
     TLS_HANDSHAKE_FRONTEND = 0,
-    TLS_HANDSHAKE_BACKEND  = 1,
+    TLS_HANDSHAKE_BACKEND = 1,
 } tls_handshake_kind_t;
 
 /* Result written to the per-worker MPSC ring after handshake completes */
 struct tls_handshake_result {
     tls_handshake_kind_t kind;
-    uint32_t  cid;            /* connection id to resume */
-    int       client_fd;      /* original fd (frontend) */
-    int       tls_route_idx;  /* SNI-matched route (-1 on error) */
-    ptls_t   *ssl;            /* NULL if kTLS took over or on error */
-    bool      ok;             /* false = handshake failed, close and free conn */
-    bool      ktls_tx;
-    bool      ktls_rx;
-    bool      h2_negotiated;  /* ALPN selected "h2" */
-    int       tls_version;    /* PTLS_PROTOCOL_VERSION_TLS13 etc. */
+    uint32_t cid; /* connection id to resume */
+    int client_fd; /* original fd (frontend) */
+    int tls_route_idx; /* SNI-matched route (-1 on error) */
+    ptls_t *ssl; /* NULL if kTLS took over or on error */
+    bool ok; /* false = handshake failed, close and free conn */
+    bool ktls_tx;
+    bool ktls_rx;
+    bool h2_negotiated; /* ALPN selected "h2" */
+    int tls_version; /* PTLS_PROTOCOL_VERSION_TLS13 etc. */
     struct tls_session_ticket *backend_session; /* heap-alloc'd ticket, or NULL */
     /* Pre-decrypted application data that arrived bundled with the TLS Finished
      * in the same recv() call.  Common for H2 clients that send the connection
      * preface immediately after the handshake.  heap-alloc'd; worker must free. */
-    uint8_t  *pending_data;
-    uint32_t  pending_data_len;
+    uint8_t *pending_data;
+    uint32_t pending_data_len;
 };
 
 /*
@@ -66,40 +66,40 @@ struct tls_handshake_result {
 
 struct tls_result_slot {
     struct tls_handshake_result data;
-    _Atomic uint8_t             ready;  /* 0 = empty, 1 = result available */
+    _Atomic uint8_t ready; /* 0 = empty, 1 = result available */
 };
 
 struct tls_result_ring {
-    _Atomic uint32_t      tail;              /* next write index (producers) */
-    char                  _pad[60];          /* isolate tail from head */
-    uint32_t              head;              /* read index (consumer only) */
+    _Atomic uint32_t tail; /* next write index (producers) */
+    char _pad[60]; /* isolate tail from head */
+    uint32_t head; /* read index (consumer only) */
     struct tls_result_slot slots[TLS_RESULT_RING_CAP];
 };
 
 /* Job submitted by the worker to the pool */
 struct tls_handshake_job {
     tls_handshake_kind_t kind;
-    int             client_fd;
-    uint32_t        cid;
+    int client_fd;
+    uint32_t cid;
     struct tls_ctx *tls;
-    int                   result_pipe_wr;  /* write end of per-worker wakeup pipe */
-    struct tls_result_ring *result_ring;  /* per-worker MPSC result ring */
+    int result_pipe_wr; /* write end of per-worker wakeup pipe */
+    struct tls_result_ring *result_ring; /* per-worker MPSC result ring */
     /* backend-only fields */
-    ptls_context_t  *backend_tls_client_ctx;
-    uint32_t         timeout_ms;
-    bool             verify_peer;
-    bool             verify_peer_set;
-    char             backend_addr[256];
-    char             backend_sni[256];
+    ptls_context_t *backend_tls_client_ctx;
+    uint32_t timeout_ms;
+    bool verify_peer;
+    bool verify_peer_set;
+    char backend_addr[256];
+    char backend_sni[256];
     struct tls_session_ticket *resume_session; /* heap-alloc'd, consumed and freed */
 };
 
 struct tls_pool {
-    pthread_t       threads[TLS_POOL_THREADS];
+    pthread_t threads[TLS_POOL_THREADS];
     pthread_mutex_t mu;
-    pthread_cond_t  cv;
+    pthread_cond_t cv;
     struct tls_handshake_job queue[TLS_POOL_QUEUE];
-    int  head, tail, count;
+    int head, tail, count;
     uint32_t active_handshakes;
     uint64_t submitted_total;
     uint64_t completed_total;

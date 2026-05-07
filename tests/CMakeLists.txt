@@ -14,11 +14,16 @@ target_include_directories(test_config PRIVATE
     ../bpf
     ${YAML_INCLUDE_DIRS}
 )
-if(OPENSSL_AVAILABLE)
+if(PICOTLS_AVAILABLE)
     target_compile_definitions(test_config PRIVATE VORTEX_PHASE_TLS=1)
-    target_include_directories(test_config PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(test_config ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
-    target_link_directories(test_config PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
+    target_include_directories(test_config PRIVATE
+        ${PICOTLS_SRC_DIR}/include
+        ${PICOTLS_SRC_DIR}/deps/micro-ecc
+    )
+    target_link_libraries(test_config
+        ${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a
+        ${PICOTLS_BUILD_DIR}/libpicotls-core.a
+    )
 endif()
 target_link_libraries(test_config ${YAML_LIBRARIES} pthread)
 target_link_directories(test_config PRIVATE ${YAML_LIBRARY_DIRS})
@@ -42,11 +47,16 @@ target_include_directories(test_cache PRIVATE
     ../include
     ../src
 )
-if(OPENSSL_AVAILABLE)
+if(PICOTLS_AVAILABLE)
     target_compile_definitions(test_cache PRIVATE VORTEX_PHASE_TLS=1)
-    target_include_directories(test_cache PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(test_cache ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
-    target_link_directories(test_cache PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
+    target_include_directories(test_cache PRIVATE
+        ${PICOTLS_SRC_DIR}/include
+        ${PICOTLS_SRC_DIR}/deps/micro-ecc
+    )
+    target_link_libraries(test_cache
+        ${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a
+        ${PICOTLS_BUILD_DIR}/libpicotls-core.a
+    )
 endif()
 target_link_libraries(test_cache pthread)
 
@@ -58,11 +68,16 @@ target_include_directories(test_auth PRIVATE
     ../include
     ../src
 )
-if(OPENSSL_AVAILABLE)
+if(PICOTLS_AVAILABLE)
     target_compile_definitions(test_auth PRIVATE VORTEX_PHASE_TLS=1)
-    target_include_directories(test_auth PRIVATE ${OPENSSL_INCLUDE_DIR})
-    target_link_libraries(test_auth ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
-    target_link_directories(test_auth PRIVATE "${OPENSSL_ROOT_DIR}/lib64")
+    target_include_directories(test_auth PRIVATE
+        ${PICOTLS_SRC_DIR}/include
+        ${PICOTLS_SRC_DIR}/deps/micro-ecc
+    )
+    target_link_libraries(test_auth
+        ${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a
+        ${PICOTLS_BUILD_DIR}/libpicotls-core.a
+    )
 endif()
 target_link_libraries(test_auth pthread)
 

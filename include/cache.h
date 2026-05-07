@@ -7,21 +7,25 @@
 #include <time.h>
 
 /* Cache entry flags */
-#define CACHE_FLAG_VALID       (1 << 0)
-#define CACHE_FLAG_STALE       (1 << 1)
+#define CACHE_FLAG_VALID (1 << 0)
+#define CACHE_FLAG_STALE (1 << 1)
 #define CACHE_FLAG_REVALIDATING (1 << 2)
-#define CACHE_FLAG_COMPRESSED  (1 << 3)
+#define CACHE_FLAG_COMPRESSED (1 << 3)
 
 /* Content type enum */
 typedef enum {
-    CONTENT_OTHER = 0, CONTENT_HTML, CONTENT_JSON,
-    CONTENT_CSS, CONTENT_JS, CONTENT_IMAGE,
+    CONTENT_OTHER = 0,
+    CONTENT_HTML,
+    CONTENT_JSON,
+    CONTENT_CSS,
+    CONTENT_JS,
+    CONTENT_IMAGE,
 } content_type_t;
 
 /* Cache index entry — exactly 64 bytes, one cache line */
 struct __attribute__((packed, aligned(64))) cache_index_entry {
     uint64_t url_hash;
-    uint64_t body_etag;       /* configured 64-bit ETag fingerprint of response body */
+    uint64_t body_etag; /* configured 64-bit ETag fingerprint of response body */
     uint32_t crc32c;
     uint32_t slab_offset;
     uint32_t body_len;
@@ -30,89 +34,81 @@ struct __attribute__((packed, aligned(64))) cache_index_entry {
     uint32_t last_accessed_ts;
     uint16_t ttl_seconds;
     uint16_t status_code;
-    uint8_t  flags;
-    uint8_t  hit_count;
-    uint8_t  content_type;
-    uint8_t  url_key_len;     /* bytes stored (0..12) */
-    uint32_t url_hash_confirm;/* FNV-1a of full URL — secondary collision check */
+    uint8_t flags;
+    uint8_t hit_count;
+    uint8_t content_type;
+    uint8_t url_key_len; /* bytes stored (0..12) */
+    uint32_t url_hash_confirm; /* FNV-1a of full URL — secondary collision check */
     /* Collision guard: first min(key_len,12) bytes of the cache key.
      * Combined with the 64-bit hash and secondary FNV-1a confirm hash
      * this makes a false-positive essentially impossible while keeping
      * the entry at 64 bytes.
      * 8+8+4+4+4+4+4+2+2+1+1+1+1+4+12 = 60 (+4 alignment padding) */
-    char     url_key[12];     /* first 12 bytes of "host|path" key */
+    char url_key[12]; /* first 12 bytes of "host|path" key */
 };
 _Static_assert(sizeof(struct cache_index_entry) == 64,
-    "cache_index_entry must be exactly 64 bytes");
+               "cache_index_entry must be exactly 64 bytes");
 
 /* High bit of slab_offset distinguishes RAM vs disk slab */
 #define CACHE_SLAB_DISK_FLAG (1u << 31)
 
 struct cache {
-    struct cache_index_entry *index;   /* mmap'd, hugepage-backed if available */
-    size_t index_capacity;             /* Power of 2 */
+    struct cache_index_entry *index; /* mmap'd, hugepage-backed if available */
+    size_t index_capacity; /* Power of 2 */
     size_t index_mask;
 
-    uint8_t *slab;                     /* RAM slab (anonymous mmap) */
-    size_t   slab_size;
-    size_t   slab_watermark;
+    uint8_t *slab; /* RAM slab (anonymous mmap) */
+    size_t slab_size;
+    size_t slab_watermark;
 
-    uint8_t *disk_slab;                /* Disk slab (file-backed mmap), or NULL */
-    size_t   disk_slab_size;
-    size_t   disk_slab_watermark;
+    uint8_t *disk_slab; /* Disk slab (file-backed mmap), or NULL */
+    size_t disk_slab_size;
+    size_t disk_slab_watermark;
 
     /* Stats */
     uint64_t hits;
     uint64_t misses;
     uint64_t evictions;
     uint64_t stores;
-    bool     etag_sha256;
-    bool     verify_crc;
+    bool etag_sha256;
+    bool verify_crc;
 };
 
 struct cached_response {
-    uint8_t  *data;
-    uint32_t  header_len;
-    uint32_t  body_len;
-    uint16_t  status_code;
-    uint64_t  body_etag;
+    uint8_t *data;
+    uint32_t header_len;
+    uint32_t body_len;
+    uint16_t status_code;
+    uint64_t body_etag;
 };
 
-uint64_t cache_compute_body_etag(bool etag_sha256,
-                                 const uint8_t *body, size_t body_len);
+uint64_t cache_compute_body_etag(bool etag_sha256, const uint8_t *body, size_t body_len);
 
 /* disk_path: path for file-backed disk slab (NULL or "" = RAM-only).
  * disk_size: 0 = auto (50% of free space on disk_path's filesystem). */
-int   cache_init(struct cache *c, uint32_t index_entries,
-                 size_t slab_size, bool try_hugepages,
-                 const char *disk_path, size_t disk_size,
-                 bool etag_sha256, bool verify_crc);
-void  cache_destroy(struct cache *c);
+int cache_init(struct cache *c, uint32_t index_entries, size_t slab_size, bool try_hugepages,
+               const char *disk_path, size_t disk_size, bool etag_sha256, bool verify_crc);
+void cache_destroy(struct cache *c);
 
 /* Look up a URL. Returns index entry pointer (may be STALE), or NULL on miss.
  * Caller should call __builtin_prefetch before doing other work. */
-struct cache_index_entry *cache_lookup(struct cache *c, const char *url,
-                                       size_t url_len);
+struct cache_index_entry *cache_lookup(struct cache *c, const char *url, size_t url_len);
 
 /* Store response. Returns 0 on success. */
-int cache_store(struct cache *c, const char *url, size_t url_len,
-                uint16_t status, uint32_t ttl,
-                const uint8_t *headers, size_t header_len,
-                const uint8_t *body, size_t body_len);
-int cache_fetch_copy(struct cache *c, const char *url, size_t url_len,
-                     struct cached_response *out);
+int cache_store(struct cache *c, const char *url, size_t url_len, uint16_t status, uint32_t ttl,
+                const uint8_t *headers, size_t header_len, const uint8_t *body, size_t body_len);
+int cache_fetch_copy(struct cache *c, const char *url, size_t url_len, struct cached_response *out);
 void cache_cached_response_free(struct cached_response *resp);
 
 /* Zero-copy variant: sets out->data to a direct pointer into the slab.
  * The pointer is valid until the next cache_store() call on this cache.
  * Do NOT call cache_cached_response_free() on the result — out->data is
  * not heap-allocated.  Returns 0 on hit, -1 on miss or CRC failure. */
-int cache_fetch_ptr(struct cache *c, const char *url, size_t url_len,
-                    struct cached_response *out);
+int cache_fetch_ptr(struct cache *c, const char *url, size_t url_len, struct cached_response *out);
 
 /* Get pointer to start of full stored response (headers + body) */
 static inline const uint8_t *cache_response_ptr(struct cache *c,
-    const struct cache_index_entry *entry)
+                                                const struct cache_index_entry *entry)
 {
     if (!entry || !(entry->flags & CACHE_FLAG_VALID)) return NULL;
     if (entry->slab_offset & CACHE_SLAB_DISK_FLAG) {
@@ -123,8 +119,7 @@ static inline const uint8_t *cache_response_ptr(struct cache *c,
 }
 
 /* Get slab pointer for body */
-const uint8_t *cache_body_ptr(struct cache *c,
-    const struct cache_index_entry *entry);
+const uint8_t *cache_body_ptr(struct cache *c, const struct cache_index_entry *entry);
 
 /* Select TTL for a URL based on path/extension patterns.
  * Returns 0 for URLs that should not be cached (e.g. API endpoints). */

@@ -20,20 +20,18 @@
 #include <string.h>
 
 /* pull in the parser symbol — we compile worker_proxy.c into this target */
-int parse_http_request_line(const uint8_t *buf, int len,
-                            char *method_out, size_t method_max,
-                            char *url_out,    size_t url_max);
+int parse_http_request_line(const uint8_t *buf, int len, char *method_out, size_t method_max,
+                            char *url_out, size_t url_max);
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    if (size > 65536) return 0;  /* skip implausibly large inputs early */
+    if (size > 65536) return 0; /* skip implausibly large inputs early */
 
     char method[16];
     char url[4096];
 
     /* Primary call with normal-sized output buffers */
-    parse_http_request_line(data, (int)size, method, sizeof(method),
-                            url, sizeof(url));
+    parse_http_request_line(data, (int)size, method, sizeof(method), url, sizeof(url));
 
     /* Stress tiny output buffers — must not overflow */
     char m1[1], u1[1];

@@ -12,9 +12,9 @@ int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
     memset(ctx, 0, sizeof(*ctx));
     ctx->sq_entries = entries;
     ctx->cq_entries = entries * 2;
-    ctx->sqpoll     = sqpoll;
+    ctx->sqpoll = sqpoll;
 
-    struct io_uring_params params = { 0 };
+    struct io_uring_params params = {0};
     params.cq_entries = ctx->cq_entries;
     params.flags = IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER;
 
@@ -48,18 +48,18 @@ int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll)
         return ret;
     }
 
-    log_info("uring_init", "sq_entries=%u cq_entries=%u sqpoll=%d",
-        entries, ctx->cq_entries, sqpoll);
+    log_info("uring_init", "sq_entries=%u cq_entries=%u sqpoll=%d", entries, ctx->cq_entries,
+             sqpoll);
     return 0;
 }
 
 void uring_destroy(struct uring_ctx *ctx)
 {
     if (ctx->recv_ring) {
-        io_uring_free_buf_ring(&ctx->ring, ctx->recv_ring,
-                               ctx->recv_ring_count, (int)ctx->recv_ring_bgid);
+        io_uring_free_buf_ring(&ctx->ring, ctx->recv_ring, ctx->recv_ring_count,
+                               (int)ctx->recv_ring_bgid);
         free(ctx->recv_ring_mem);
-        ctx->recv_ring     = NULL;
+        ctx->recv_ring = NULL;
         ctx->recv_ring_mem = NULL;
     }
     /* queue_exit tears down registered files/buffers along with the ring.
@@ -70,49 +70,46 @@ void uring_destroy(struct uring_ctx *ctx)
     io_uring_queue_exit(&ctx->ring);
 }
 
-int uring_recv_ring_setup(struct uring_ctx *ctx, size_t buf_size,
-                           uint32_t count, uint16_t bgid)
+int uring_recv_ring_setup(struct uring_ctx *ctx, size_t buf_size, uint32_t count, uint16_t bgid)
 {
     /* Kernel requires power-of-two ring entries */
     uint32_t n = 1;
-    while (n < count) n <<= 1;
+    while (n < count)
+        n <<= 1;
     count = n;
 
     uint8_t *mem = malloc((size_t)count * buf_size);
     if (!mem) return -ENOMEM;
 
     int ret;
-    struct io_uring_buf_ring *br =
-        io_uring_setup_buf_ring(&ctx->ring, count, (int)bgid, 0, &ret);
+    struct io_uring_buf_ring *br = io_uring_setup_buf_ring(&ctx->ring, count, (int)bgid, 0, &ret);
     if (!br) {
-        log_error("recv_ring",
-            "io_uring_setup_buf_ring(count=%u bgid=%u): %s",
-            count, bgid, strerror(-ret));
+        log_error("recv_ring", "io_uring_setup_buf_ring(count=%u bgid=%u): %s", count, bgid,
+                  strerror(-ret));
         free(mem);
         return ret;
     }
 
     int mask = io_uring_buf_ring_mask(count);
     for (uint32_t i = 0; i < count; i++) {
-        io_uring_buf_ring_add(br, mem + (size_t)i * buf_size,
-                              (unsigned int)buf_size, (uint16_t)i, mask, (int)i);
+        io_uring_buf_ring_add(br, mem + (size_t)i * buf_size, (unsigned int)buf_size, (uint16_t)i,
+                              mask, (int)i);
     }
     io_uring_buf_ring_advance(br, (int)count);
 
-    ctx->recv_ring       = br;
-    ctx->recv_ring_mem   = mem;
+    ctx->recv_ring = br;
+    ctx->recv_ring_mem = mem;
     ctx->recv_ring_count = count;
-    ctx->recv_ring_bgid  = bgid;
+    ctx->recv_ring_bgid = bgid;
 
-    log_info("recv_ring", "bgid=%u count=%u buf_size=%zu total=%.1f MB",
-             bgid, count, buf_size, (double)count * buf_size / (1024.0 * 1024.0));
+    log_info("recv_ring", "bgid=%u count=%u buf_size=%zu total=%.1f MB", bgid, count, buf_size,
+             (double)count * buf_size / (1024.0 * 1024.0));
     return 0;
 }
 
 void uring_recv_ring_return(struct uring_ctx *ctx, uint16_t buf_id, size_t buf_size)
 {
-    io_uring_buf_ring_add(ctx->recv_ring,
-                          ctx->recv_ring_mem + (size_t)buf_id * buf_size,
+    io_uring_buf_ring_add(ctx->recv_ring, ctx->recv_ring_mem + (size_t)buf_id * buf_size,
                           (unsigned int)buf_size, buf_id,
                           io_uring_buf_ring_mask(ctx->recv_ring_count), 0);
     io_uring_buf_ring_advance(ctx->recv_ring, 1);
@@ -122,14 +119,15 @@ int uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n)
 {
     int ret = io_uring_register_buffers(&ctx->ring, iovecs, n);
     if (ret < 0) {
-        log_error("uring_register_bufs",
-            "io_uring_register_buffers(%u bufs) failed: %s — falling back to unregistered I/O",
-            n, strerror(-ret));
+        log_error(
+            "uring_register_bufs",
+            "io_uring_register_buffers(%u bufs) failed: %s — falling back to unregistered I/O", n,
+            strerror(-ret));
         return ret;
     }
     ctx->bufs_registered = true;
-    log_info("uring_register_bufs", "registered %u fixed buffers (%.1f MB pinned)",
-        n, (double)n * 65536 / (1024 * 1024));
+    log_info("uring_register_bufs", "registered %u fixed buffers (%.1f MB pinned)", n,
+             (double)n * 65536 / (1024 * 1024));
     return 0;
 }
 
@@ -138,8 +136,8 @@ int uring_register_files_sparse(struct uring_ctx *ctx, unsigned int nslots)
     int ret = io_uring_register_files_sparse(&ctx->ring, nslots);
     if (ret < 0) {
         log_error("uring_register_files_sparse",
-            "io_uring_register_files_sparse(%u) failed: %s — fixed-file disabled",
-            nslots, strerror(-ret));
+                  "io_uring_register_files_sparse(%u) failed: %s — fixed-file disabled", nslots,
+                  strerror(-ret));
         return ret;
     }
     ctx->files_registered = true;
@@ -193,8 +191,7 @@ int uring_submit(struct uring_ctx *ctx)
 
 int uring_flush(struct uring_ctx *ctx)
 {
-    if (!ctx->needs_flush)
-        return 0;
+    if (!ctx->needs_flush) return 0;
     ctx->needs_flush = false;
     return uring_submit_real(ctx);
 }
@@ -214,7 +211,8 @@ int uring_wait(struct uring_ctx *ctx, unsigned int min_events)
 
     /* Drain all available completions */
     unsigned head;
-    io_uring_for_each_cqe(&ctx->ring, head, cqe) {
+    io_uring_for_each_cqe(&ctx->ring, head, cqe)
+    {
         count++;
     }
     io_uring_cq_advance(&ctx->ring, count);
@@ -248,8 +246,7 @@ int uring_prep_send(struct uring_ctx *ctx, int fd, const void *buf, size_t len, 
     return 0;
 }
 
-int uring_prep_connect(struct uring_ctx *ctx, int fd,
-                       struct sockaddr *addr, socklen_t addrlen,
+int uring_prep_connect(struct uring_ctx *ctx, int fd, struct sockaddr *addr, socklen_t addrlen,
                        uint32_t conn_id)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
@@ -268,8 +265,7 @@ int uring_prep_close(struct uring_ctx *ctx, int fd, uint32_t conn_id)
     return 0;
 }
 
-int uring_prep_timeout(struct uring_ctx *ctx, struct __kernel_timespec *ts,
-                       uint32_t conn_id)
+int uring_prep_timeout(struct uring_ctx *ctx, struct __kernel_timespec *ts, uint32_t conn_id)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
     if (!sqe) return -EBUSY;

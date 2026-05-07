@@ -9,10 +9,21 @@
 static int g_passed = 0;
 static int g_failed = 0;
 
-#define CHECK(cond, msg) do { \
-    if (cond) { g_passed++; } \
-    else { fprintf(stderr, "FAIL [%s:%d] %s\n", __FILE__, __LINE__, msg); g_failed++; } \
-} while(0)
+#define CHECK(cond, msg)                                                                           \
+    do {                                                                                           \
+        if (cond) {                                                                                \
+            g_passed++;                                                                            \
+        } else {                                                                                   \
+            fprintf(stderr, "FAIL [%s:%d] %s\n", __FILE__, __LINE__, msg);                         \
+            g_failed++;                                                                            \
+        }                                                                                          \
+    } while (0)
+
+#define REQUIRE(cond, msg)                                                                         \
+    do {                                                                                           \
+        CHECK(cond, msg);                                                                          \
+        if (!(cond)) return;                                                                       \
+    } while (0)
 
 static void test_init_destroy(void)
 {
@@ -54,24 +65,23 @@ static void test_store_and_hit(void)
     struct cache c;
     cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
-    const char *url  = "/api/v1/data";
+    const char *url = "/api/v1/data";
     const char *body = "hello world";
-    const char *hdr  = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n";
+    const char *hdr = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n";
 
-    int r = cache_store(&c, url, strlen(url), 200, 300,
-        (const uint8_t *)hdr, strlen(hdr),
-        (const uint8_t *)body, strlen(body));
+    int r = cache_store(&c, url, strlen(url), 200, 300, (const uint8_t *)hdr, strlen(hdr),
+                        (const uint8_t *)body, strlen(body));
     CHECK(r == 0, "cache_store succeeds");
     CHECK(c.stores == 1, "store counter incremented");
 
     struct cache_index_entry *e = cache_lookup(&c, url, strlen(url));
-    CHECK(e != NULL, "cache_lookup hits");
+    REQUIRE(e != NULL, "cache_lookup hits");
     CHECK(e->status_code == 200, "status 200");
     CHECK(e->body_len == 11, "body_len correct");
     CHECK(c.hits == 1, "hit counter incremented");
 
     const uint8_t *body_ptr = cache_body_ptr(&c, e);
-    CHECK(body_ptr != NULL, "body pointer valid");
+    REQUIRE(body_ptr != NULL, "body pointer valid");
     CHECK(memcmp(body_ptr, body, strlen(body)) == 0, "body content matches");
 
     cache_destroy(&c);
@@ -82,11 +92,11 @@ static void test_valid_expired(void)
     struct cache c;
     cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
-    const char *url  = "/short";
+    const char *url = "/short";
     const char *body = "data";
 
-    int r = cache_store(&c, url, strlen(url), 200, 1 /* 1 second TTL */,
-        NULL, 0, (const uint8_t *)body, strlen(body));
+    int r = cache_store(&c, url, strlen(url), 200, 1 /* 1 second TTL */, NULL, 0,
+                        (const uint8_t *)body, strlen(body));
     CHECK(r == 0, "store short-lived entry");
 
     struct cache_index_entry *e = cache_lookup(&c, url, strlen(url));
@@ -110,8 +120,8 @@ static void test_multiple_entries(void)
     for (int i = 0; i < 10; i++) {
         snprintf(url, sizeof(url), "/item/%d", i);
         snprintf(body, sizeof(body), "response %d", i);
-        int r = cache_store(&c, url, strlen(url), 200, 300,
-            NULL, 0, (const uint8_t *)body, strlen(body));
+        int r = cache_store(&c, url, strlen(url), 200, 300, NULL, 0, (const uint8_t *)body,
+                            strlen(body));
         CHECK(r == 0, "store entry");
     }
 
@@ -137,10 +147,8 @@ static void test_update_existing(void)
     cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, false);
 
     const char *url = "/update";
-    cache_store(&c, url, strlen(url), 200, 60,
-        NULL, 0, (const uint8_t *)"v1", 2);
-    cache_store(&c, url, strlen(url), 200, 60,
-        NULL, 0, (const uint8_t *)"v2", 2);
+    cache_store(&c, url, strlen(url), 200, 60, NULL, 0, (const uint8_t *)"v1", 2);
+    cache_store(&c, url, strlen(url), 200, 60, NULL, 0, (const uint8_t *)"v2", 2);
 
     struct cache_index_entry *e = cache_lookup(&c, url, strlen(url));
     CHECK(e != NULL, "found after update");
@@ -161,8 +169,8 @@ static void test_evict(void)
     for (int i = 0; i < 8; i++) {
         snprintf(url, sizeof(url), "/e%d", i);
         snprintf(body, sizeof(body), "b%d", i);
-        if (cache_store(&c, url, strlen(url), 200, 300,
-                NULL, 0, (const uint8_t *)body, strlen(body)) == 0) {
+        if (cache_store(&c, url, strlen(url), 200, 300, NULL, 0, (const uint8_t *)body,
+                        strlen(body)) == 0) {
             stored++;
         }
     }
@@ -187,8 +195,7 @@ static void test_slab_wrap(void)
     const char *body = "0123456789"; /* 10 bytes */
     for (int i = 0; i < 500; i++) {
         snprintf(url, sizeof(url), "/w%d", i);
-        cache_store(&c, url, strlen(url), 200, 300,
-            NULL, 0, (const uint8_t *)body, strlen(body));
+        cache_store(&c, url, strlen(url), 200, 300, NULL, 0, (const uint8_t *)body, strlen(body));
     }
 
     /* Proxy should still work after wrap */
@@ -200,7 +207,7 @@ static void test_sha256_etag_toggle(void)
 {
     struct cache c_xx;
     struct cache c_sha;
-    const char *url  = "/etag";
+    const char *url = "/etag";
     const char *body = "etag-body";
 
     CHECK(cache_init(&c_xx, 64, 1024 * 1024, false, NULL, 0, false, false) == 0,
@@ -208,21 +215,19 @@ static void test_sha256_etag_toggle(void)
     CHECK(cache_init(&c_sha, 64, 1024 * 1024, false, NULL, 0, true, false) == 0,
           "cache_init sha256 etag");
 
-    CHECK(cache_store(&c_xx, url, strlen(url), 200, 60, NULL, 0,
-                      (const uint8_t *)body, strlen(body)) == 0,
+    CHECK(cache_store(&c_xx, url, strlen(url), 200, 60, NULL, 0, (const uint8_t *)body,
+                      strlen(body)) == 0,
           "store xxhash etag entry");
-    CHECK(cache_store(&c_sha, url, strlen(url), 200, 60, NULL, 0,
-                      (const uint8_t *)body, strlen(body)) == 0,
+    CHECK(cache_store(&c_sha, url, strlen(url), 200, 60, NULL, 0, (const uint8_t *)body,
+                      strlen(body)) == 0,
           "store sha256 etag entry");
 
     struct cache_index_entry *e_xx = cache_lookup(&c_xx, url, strlen(url));
     struct cache_index_entry *e_sha = cache_lookup(&c_sha, url, strlen(url));
-    CHECK(e_xx != NULL && e_sha != NULL, "etag entries stored");
-    CHECK(e_xx->body_etag == cache_compute_body_etag(false,
-          (const uint8_t *)body, strlen(body)),
+    REQUIRE(e_xx != NULL && e_sha != NULL, "etag entries stored");
+    CHECK(e_xx->body_etag == cache_compute_body_etag(false, (const uint8_t *)body, strlen(body)),
           "xxhash etag matches helper output");
-    CHECK(e_sha->body_etag == cache_compute_body_etag(true,
-          (const uint8_t *)body, strlen(body)),
+    CHECK(e_sha->body_etag == cache_compute_body_etag(true, (const uint8_t *)body, strlen(body)),
           "sha256 toggle etag matches helper output");
 
     cache_destroy(&c_xx);
@@ -238,14 +243,14 @@ static void test_crc_verify_corruption(void)
 
     CHECK(cache_init(&c, 64, 1024 * 1024, false, NULL, 0, false, true) == 0,
           "cache_init crc verify");
-    CHECK(cache_store(&c, url, strlen(url), 200, 60, NULL, 0,
-                      (const uint8_t *)body, strlen(body)) == 0,
+    CHECK(cache_store(&c, url, strlen(url), 200, 60, NULL, 0, (const uint8_t *)body,
+                      strlen(body)) == 0,
           "store crc-protected entry");
 
     struct cache_index_entry *e = cache_lookup(&c, url, strlen(url));
-    CHECK(e != NULL, "crc entry lookup");
+    REQUIRE(e != NULL, "crc entry lookup");
     const uint8_t *bp = cache_body_ptr(&c, e);
-    CHECK(bp != NULL, "crc body pointer valid");
+    REQUIRE(bp != NULL, "crc body pointer valid");
     ((uint8_t *)bp)[0] ^= 0x01;
 
     CHECK(cache_fetch_copy(&c, url, strlen(url), &out) == -1,

@@ -5,13 +5,14 @@
 
 #include "../include/log.h"
 
-#define ASSERT(cond, msg) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg); \
-        exit(1); \
-    } \
-    printf("  PASS: %s\n", msg); \
-} while(0)
+#define ASSERT(cond, msg)                                                                          \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg);                        \
+            exit(1);                                                                               \
+        }                                                                                          \
+        printf("  PASS: %s\n", msg);                                                               \
+    } while (0)
 
 int main(void)
 {
@@ -36,8 +37,8 @@ int main(void)
             ASSERT(line[0] == '{', "JSON line starts with {");
             ASSERT(strstr(line, "\"level\"") != NULL, "JSON has level field");
             ASSERT(strstr(line, "\"event\"") != NULL, "JSON has event field");
-            ASSERT(strstr(line, "\"ts\"") != NULL,    "JSON has ts field");
-            ASSERT(strstr(line, "\"msg\"") != NULL,   "JSON has msg field");
+            ASSERT(strstr(line, "\"ts\"") != NULL, "JSON has ts field");
+            ASSERT(strstr(line, "\"msg\"") != NULL, "JSON has msg field");
             lines++;
         }
         fclose(f);
@@ -59,7 +60,8 @@ int main(void)
         ASSERT(f != NULL, "filtered log file created");
         char line[1024];
         int lines = 0;
-        while (fgets(line, sizeof(line), f)) lines++;
+        while (fgets(line, sizeof(line), f))
+            lines++;
         fclose(f);
         ASSERT(lines == 2, "only warn+error lines appear with WARN level filter");
         remove(tmpfile);

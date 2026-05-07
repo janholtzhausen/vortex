@@ -17,8 +17,7 @@
  * Uses AVX2 first-byte broadcast scan + scalar confirm.
  * Faster than glibc memmem for needles ≤ 32 bytes and haystacks ≤ 64 KB
  * because it avoids the PLT call and KMP preprocessing overhead. */
-const void *vx_memmem(const void *hay, size_t hlen,
-                      const void *needle, size_t nlen);
+const void *vx_memmem(const void *hay, size_t hlen, const void *needle, size_t nlen);
 
 /* Find first "\r\n" in buf[0..len).  Returns pointer or NULL. */
 const uint8_t *vx_find_crlf(const uint8_t *buf, size_t len);

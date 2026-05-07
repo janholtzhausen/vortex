@@ -5,13 +5,14 @@
 #include "../include/config.h"
 #include "../include/router.h"
 
-#define ASSERT(cond, msg) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg); \
-        exit(1); \
-    } \
-    printf("  PASS: %s\n", msg); \
-} while (0)
+#define ASSERT(cond, msg)                                                                          \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg);                        \
+            exit(1);                                                                               \
+        }                                                                                          \
+        printf("  PASS: %s\n", msg);                                                               \
+    } while (0)
 
 static void init_weighted_route(struct vortex_config *cfg)
 {
@@ -19,10 +20,10 @@ static void init_weighted_route(struct vortex_config *cfg)
     cfg->route_count = 1;
     cfg->routes[0].backend_count = 2;
     cfg->routes[0].lb_algo = LB_WEIGHTED_ROUND_ROBIN;
-    snprintf(cfg->routes[0].backends[0].address, sizeof(cfg->routes[0].backends[0].address),
-             "%s", "10.0.0.1:8080");
-    snprintf(cfg->routes[0].backends[1].address, sizeof(cfg->routes[0].backends[1].address),
-             "%s", "10.0.0.2:8080");
+    snprintf(cfg->routes[0].backends[0].address, sizeof(cfg->routes[0].backends[0].address), "%s",
+             "10.0.0.1:8080");
+    snprintf(cfg->routes[0].backends[1].address, sizeof(cfg->routes[0].backends[1].address), "%s",
+             "10.0.0.2:8080");
     cfg->routes[0].backends[0].weight = 3;
     cfg->routes[0].backends[1].weight = 1;
 }
@@ -33,10 +34,10 @@ static void init_least_conn_route(struct vortex_config *cfg)
     cfg->route_count = 1;
     cfg->routes[0].backend_count = 2;
     cfg->routes[0].lb_algo = LB_LEAST_CONN;
-    snprintf(cfg->routes[0].backends[0].address, sizeof(cfg->routes[0].backends[0].address),
-             "%s", "10.0.0.1:8080");
-    snprintf(cfg->routes[0].backends[1].address, sizeof(cfg->routes[0].backends[1].address),
-             "%s", "10.0.0.2:8080");
+    snprintf(cfg->routes[0].backends[0].address, sizeof(cfg->routes[0].backends[0].address), "%s",
+             "10.0.0.1:8080");
+    snprintf(cfg->routes[0].backends[1].address, sizeof(cfg->routes[0].backends[1].address), "%s",
+             "10.0.0.2:8080");
 }
 
 int main(void)

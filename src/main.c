@@ -11,7 +11,7 @@
 #include <grp.h>
 #include <getopt.h>
 
-#include "util.h"  /* vortex_memcpy, vortex_strncpy, explicit_bzero */
+#include "util.h" /* vortex_memcpy, vortex_strncpy, explicit_bzero */
 
 #include "log.h"
 #include "config.h"
@@ -39,11 +39,11 @@
 #endif
 #endif
 
-static volatile sig_atomic_t g_running  = 1;
-static volatile sig_atomic_t g_reload   = 0;
-static const char            *g_config_path = NULL;
-static struct vortex_config   g_cfg;
-static int                    g_pid_file_written = 0;
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_reload = 0;
+static const char *g_config_path = NULL;
+static struct vortex_config g_cfg;
+static int g_pid_file_written = 0;
 
 static void sig_handler(int sig)
 {
@@ -58,12 +58,12 @@ static void setup_signals(void)
 {
     struct sigaction sa = {
         .sa_handler = sig_handler,
-        .sa_flags   = SA_RESTART,
+        .sa_flags = SA_RESTART,
     };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGHUP,  &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 }
 
@@ -94,19 +94,19 @@ static int write_pid_file(const char *path)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [options]\n"
-        "  -c <config>   Path to config file (default: /etc/vortex/vortex.yaml)\n"
-        "  -d            Daemonise into the background\n"
-        "  -f            Foreground (default; accepted for compatibility)\n"
-        "  -t            Test config and exit\n"
-        "  -v            Verbose (debug logging)\n"
-        "  -h            Show this help\n",
-        prog);
+            "Usage: %s [options]\n"
+            "  -c <config>   Path to config file (default: /etc/vortex/vortex.yaml)\n"
+            "  -d            Daemonise into the background\n"
+            "  -f            Foreground (default; accepted for compatibility)\n"
+            "  -t            Test config and exit\n"
+            "  -v            Verbose (debug logging)\n"
+            "  -h            Show this help\n",
+            prog);
 }
 
-static char   g_bpf_obj_path[512] = "";
-static int    g_no_xdp = 0;
-static int    g_no_tls = 0;
+static char g_bpf_obj_path[512] = "";
+static int g_no_xdp = 0;
+static int g_no_tls = 0;
 
 #ifdef VORTEX_PHASE_TLS
 static bool config_uses_backend_tls(const struct vortex_config *cfg)
@@ -114,8 +114,7 @@ static bool config_uses_backend_tls(const struct vortex_config *cfg)
     for (int ri = 0; ri < cfg->route_count; ri++) {
         const struct route_config *route = &cfg->routes[ri];
         for (int bi = 0; bi < route->backend_count; bi++) {
-            if (route->backends[bi].tls)
-                return true;
+            if (route->backends[bi].tls) return true;
         }
     }
     return false;
@@ -123,40 +122,40 @@ static bool config_uses_backend_tls(const struct vortex_config *cfg)
 #endif
 
 #define MAX_WORKERS 64
-static struct worker  g_workers[MAX_WORKERS];
-static int            g_num_workers = 0;
-static struct cache   g_worker_caches[MAX_WORKERS];
-static int            g_cache_initialized_count = 0;
+static struct worker g_workers[MAX_WORKERS];
+static int g_num_workers = 0;
+static struct cache g_worker_caches[MAX_WORKERS];
+static int g_cache_initialized_count = 0;
 static struct metrics_server g_metrics;
 static struct dashboard_server g_dashboard;
-static int            g_dashboard_started = 0;
+static int g_dashboard_started = 0;
 #ifdef VORTEX_QUIC
 static struct quic_server *g_quic = NULL;
 #endif
 
 #ifdef VORTEX_PHASE_TLS
 static struct metrics_cert_info g_cert_info[VORTEX_MAX_ROUTES];
-static int                      g_cert_info_count = 0;
+static int g_cert_info_count = 0;
 #endif
 #ifdef VORTEX_PHASE_TLS
 static struct tls_ctx g_tls;
 
 /* Renewal background thread */
 static pthread_t g_renewal_thread;
-static int       g_renewal_running = 0;
+static int g_renewal_running = 0;
 static pthread_mutex_t g_renewal_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_renewal_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_renewal_cv = PTHREAD_COND_INITIALIZER;
 
 #ifdef VORTEX_ACME
 /* ---- ACME Cert manager ---- */
 static struct acme_http01_server g_http01_srv;
-static int                       g_http01_started = 0;
-static struct acme_client        g_acme_client;
-static int                       g_acme_inited = 0;
+static int g_http01_started = 0;
+static struct acme_client g_acme_client;
+static int g_acme_inited = 0;
 
 /* DNS-01 provider context */
 static struct acme_dns01_ctx g_dns01_ctx;
-static int                   g_dns01_inited = 0;
+static int g_dns01_inited = 0;
 #endif /* VORTEX_ACME */
 
 static void *renewal_thread_fn(void *arg)
@@ -179,28 +178,25 @@ static void *renewal_thread_fn(void *arg)
         for (int i = 0; i < g_cfg.route_count; i++) {
             const struct route_config *r = &g_cfg.routes[i];
             if (r->cert_provider != CERT_PROVIDER_ACME_HTTP01 &&
-                r->cert_provider != CERT_PROVIDER_ACME_DNS01) continue;
+                r->cert_provider != CERT_PROVIDER_ACME_DNS01)
+                continue;
 
             int days = g_cfg.acme.renewal_days > 0 ? g_cfg.acme.renewal_days : 30;
-            if (!acme_needs_renewal(g_cfg.acme.storage_path,
-                                    r->hostname, days)) continue;
+            if (!acme_needs_renewal(g_cfg.acme.storage_path, r->hostname, days)) continue;
 
             log_info("renewal", "renewing cert for %s", r->hostname);
             struct cert_result res;
             memset(&res, 0, sizeof(res));
             int ok = -1;
-            if (r->cert_provider == CERT_PROVIDER_ACME_HTTP01
-                && g_http01_started) {
-                ok = acme_obtain_http01(&g_acme_client, r->hostname,
-                                         &g_http01_srv, &res);
-            } else if (r->cert_provider == CERT_PROVIDER_ACME_DNS01
-                       && g_dns01_inited) {
+            if (r->cert_provider == CERT_PROVIDER_ACME_HTTP01 && g_http01_started) {
+                ok = acme_obtain_http01(&g_acme_client, r->hostname, &g_http01_srv, &res);
+            } else if (r->cert_provider == CERT_PROVIDER_ACME_DNS01 && g_dns01_inited) {
                 ok = acme_obtain_dns01(&g_dns01_ctx, r->hostname, &res);
             }
             if (ok == 0) {
                 tls_rotate_cert(&g_tls, i, res.cert_pem, res.key_pem);
-                log_info("renewal", "cert rotated for %s, not_after=%ld",
-                    r->hostname, (long)res.not_after);
+                log_info("renewal", "cert rotated for %s, not_after=%ld", r->hostname,
+                         (long)res.not_after);
             } else {
                 log_warn("renewal", "renewal failed for %s", r->hostname);
             }
@@ -218,10 +214,8 @@ static int cert_manager_init(struct vortex_config *cfg)
 #ifdef VORTEX_ACME
     int need_acme_http01 = 0, need_acme_dns01 = 0;
     for (int i = 0; i < cfg->route_count; i++) {
-        if (cfg->routes[i].cert_provider == CERT_PROVIDER_ACME_HTTP01)
-            need_acme_http01 = 1;
-        if (cfg->routes[i].cert_provider == CERT_PROVIDER_ACME_DNS01)
-            need_acme_dns01 = 1;
+        if (cfg->routes[i].cert_provider == CERT_PROVIDER_ACME_HTTP01) need_acme_http01 = 1;
+        if (cfg->routes[i].cert_provider == CERT_PROVIDER_ACME_DNS01) need_acme_dns01 = 1;
     }
     int need_acme = need_acme_http01 || need_acme_dns01;
 
@@ -229,25 +223,26 @@ static int cert_manager_init(struct vortex_config *cfg)
         if (acme_http01_start(&g_http01_srv, cfg->http_port) == 0) {
             g_http01_started = 1;
         } else {
-            log_warn("cert_manager", "HTTP-01 server failed to start on port %d",
-                cfg->http_port);
+            log_warn("cert_manager", "HTTP-01 server failed to start on port %d", cfg->http_port);
         }
     }
 
     if (need_acme && cfg->acme.enabled) {
         memset(&g_acme_client, 0, sizeof(g_acme_client));
-        snprintf(g_acme_client.directory_url, sizeof(g_acme_client.directory_url), "%s", cfg->acme.directory_url);
-        snprintf(g_acme_client.account_key_path, sizeof(g_acme_client.account_key_path), "%s", cfg->acme.account_key_path);
-        snprintf(g_acme_client.storage_path, sizeof(g_acme_client.storage_path), "%s", cfg->acme.storage_path);
+        snprintf(g_acme_client.directory_url, sizeof(g_acme_client.directory_url), "%s",
+                 cfg->acme.directory_url);
+        snprintf(g_acme_client.account_key_path, sizeof(g_acme_client.account_key_path), "%s",
+                 cfg->acme.account_key_path);
+        snprintf(g_acme_client.storage_path, sizeof(g_acme_client.storage_path), "%s",
+                 cfg->acme.storage_path);
         snprintf(g_acme_client.email, sizeof(g_acme_client.email), "%s", cfg->acme.email);
-        g_acme_client.renewal_days = cfg->acme.renewal_days > 0
-                                   ? cfg->acme.renewal_days : 30;
+        g_acme_client.renewal_days = cfg->acme.renewal_days > 0 ? cfg->acme.renewal_days : 30;
 
         if (acme_client_init(&g_acme_client) == 0) {
             g_acme_inited = 1;
         } else {
             log_warn("cert_manager", "ACME client init failed — "
-                "ACME routes will not have certificates");
+                                     "ACME routes will not have certificates");
         }
     }
 
@@ -268,8 +263,7 @@ static int cert_manager_init(struct vortex_config *cfg)
             }
             explicit_bzero(cfg->acme.dns_api_token, sizeof(cfg->acme.dns_api_token));
         } else {
-            log_warn("cert_manager", "unknown dns_provider '%s'",
-                cfg->acme.dns_provider);
+            log_warn("cert_manager", "unknown dns_provider '%s'", cfg->acme.dns_provider);
         }
     }
 
@@ -281,34 +275,28 @@ static int cert_manager_init(struct vortex_config *cfg)
             r->cert_provider == CERT_PROVIDER_ACME_DNS01) {
 
             char cp[4096], kp[4096];
-            snprintf(cp, sizeof(cp), "%s/%s/cert.pem",
-                cfg->acme.storage_path, r->hostname);
-            snprintf(kp, sizeof(kp), "%s/%s/key.pem",
-                cfg->acme.storage_path, r->hostname);
+            snprintf(cp, sizeof(cp), "%s/%s/cert.pem", cfg->acme.storage_path, r->hostname);
+            snprintf(kp, sizeof(kp), "%s/%s/key.pem", cfg->acme.storage_path, r->hostname);
 
             int days = cfg->acme.renewal_days > 0 ? cfg->acme.renewal_days : 30;
-            int needs = acme_needs_renewal(cfg->acme.storage_path,
-                                           r->hostname, days);
+            int needs = acme_needs_renewal(cfg->acme.storage_path, r->hostname, days);
             if (needs) {
                 struct cert_result res;
                 memset(&res, 0, sizeof(res));
                 log_info("cert_manager", "obtaining cert for %s", r->hostname);
 
                 int ok = -1;
-                if (r->cert_provider == CERT_PROVIDER_ACME_HTTP01
-                    && g_acme_inited && g_http01_started) {
-                    ok = acme_obtain_http01(&g_acme_client, r->hostname,
-                                            &g_http01_srv, &res);
-                } else if (r->cert_provider == CERT_PROVIDER_ACME_DNS01
-                           && g_dns01_inited) {
+                if (r->cert_provider == CERT_PROVIDER_ACME_HTTP01 && g_acme_inited &&
+                    g_http01_started) {
+                    ok = acme_obtain_http01(&g_acme_client, r->hostname, &g_http01_srv, &res);
+                } else if (r->cert_provider == CERT_PROVIDER_ACME_DNS01 && g_dns01_inited) {
                     ok = acme_obtain_dns01(&g_dns01_ctx, r->hostname, &res);
                 }
 
                 if (ok == 0) {
                     cert_result_free(&res);
                 } else {
-                    log_warn("cert_manager", "cert obtain failed for %s",
-                        r->hostname);
+                    log_warn("cert_manager", "cert obtain failed for %s", r->hostname);
                     continue;
                 }
             }
@@ -366,13 +354,13 @@ static void cert_manager_reload_static(void)
                 log_warn("cert_reload", "route=%d tls_rotate_cert failed", i);
         } else {
             /* New route — create context with correct hostname */
-            ptls_context_t *ctx = tls_create_ctx_from_pem(&g_tls, res.cert_pem,
-                                                            res.key_pem, r->hostname);
+            ptls_context_t *ctx =
+                tls_create_ctx_from_pem(&g_tls, res.cert_pem, res.key_pem, r->hostname);
             if (ctx) {
                 __atomic_store_n(&g_tls.routes[i].ctx, ctx, __ATOMIC_SEQ_CST);
                 g_tls.routes[i].route_idx = i;
-                log_info("cert_reload", "route=%d cert loaded from %s (new route)",
-                    i, r->cert_path);
+                log_info("cert_reload", "route=%d cert loaded from %s (new route)", i,
+                         r->cert_path);
             } else {
                 log_warn("cert_reload", "route=%d tls_create_ctx_from_pem failed", i);
             }
@@ -401,24 +389,44 @@ static void cert_manager_reload_static(void)
 int main(int argc, char *argv[])
 {
     const char *config_path = "/etc/vortex/vortex.yaml";
-    int foreground  = 1;
+    int foreground = 1;
     int test_config = 0;
-    int verbose     = 0;
-    int daemonize   = 0;
+    int verbose = 0;
+    int daemonize = 0;
 
     int opt;
     while ((opt = getopt(argc, argv, "c:dftb:XTvh")) != -1) {
         switch (opt) {
-        case 'c': config_path = optarg; break;
-        case 'd': daemonize   = 1;      break;
-        case 'f': foreground  = 1;      break;
-        case 't': test_config = 1;      break;
-        case 'b': snprintf(g_bpf_obj_path, sizeof(g_bpf_obj_path), "%s", optarg); break;
-        case 'X': g_no_xdp = 1;         break;
-        case 'T': g_no_tls = 1;         break;
-        case 'v': verbose   = 1;        break;
-        case 'h': usage(argv[0]); return 0;
-        default:  usage(argv[0]); return 1;
+        case 'c':
+            config_path = optarg;
+            break;
+        case 'd':
+            daemonize = 1;
+            break;
+        case 'f':
+            foreground = 1;
+            break;
+        case 't':
+            test_config = 1;
+            break;
+        case 'b':
+            snprintf(g_bpf_obj_path, sizeof(g_bpf_obj_path), "%s", optarg);
+            break;
+        case 'X':
+            g_no_xdp = 1;
+            break;
+        case 'T':
+            g_no_tls = 1;
+            break;
+        case 'v':
+            verbose = 1;
+            break;
+        case 'h':
+            usage(argv[0]);
+            return 0;
+        default:
+            usage(argv[0]);
+            return 1;
         }
     }
 
@@ -439,11 +447,14 @@ int main(int argc, char *argv[])
     }
 
     /* Re-init logging with config settings */
-    log_level_t  lvl = LOG_INFO;
+    log_level_t lvl = LOG_INFO;
     log_format_t fmt = LOG_FMT_JSON;
-    if (!strcmp(g_cfg.log_level, "debug")) lvl = LOG_DEBUG;
-    else if (!strcmp(g_cfg.log_level, "warn"))  lvl = LOG_WARN;
-    else if (!strcmp(g_cfg.log_level, "error")) lvl = LOG_ERROR;
+    if (!strcmp(g_cfg.log_level, "debug"))
+        lvl = LOG_DEBUG;
+    else if (!strcmp(g_cfg.log_level, "warn"))
+        lvl = LOG_WARN;
+    else if (!strcmp(g_cfg.log_level, "error"))
+        lvl = LOG_ERROR;
     if (!strcmp(g_cfg.log_format, "text")) fmt = LOG_FMT_TEXT;
     if (verbose) lvl = LOG_DEBUG;
     log_init(lvl, fmt, NULL);
@@ -457,7 +468,10 @@ int main(int argc, char *argv[])
     if (!foreground) {
         /* Daemonise */
         pid_t pid = fork();
-        if (pid < 0) { perror("fork"); return 1; }
+        if (pid < 0) {
+            perror("fork");
+            return 1;
+        }
         if (pid > 0) return 0; /* parent exits */
         setsid();
         /* Redirect stdio */
@@ -471,8 +485,7 @@ int main(int argc, char *argv[])
     }
 
     if (!foreground) {
-        if (write_pid_file(g_cfg.pid_file) == 0)
-            g_pid_file_written = 1;
+        if (write_pid_file(g_cfg.pid_file) == 0) g_pid_file_written = 1;
     }
 
     /* Phase 1: Load XDP program if interface and BPF obj are configured */
@@ -498,8 +511,7 @@ int main(int argc, char *argv[])
     if (!g_no_tls) {
         for (int i = 0; i < g_cfg.route_count; i++) {
             struct route_config *r = &g_cfg.routes[i];
-            if (r->cert_path[0] != '\0' ||
-                r->cert_provider == CERT_PROVIDER_ACME_HTTP01) {
+            if (r->cert_path[0] != '\0' || r->cert_provider == CERT_PROVIDER_ACME_HTTP01) {
                 tls_needed = 1;
                 break;
             }
@@ -547,13 +559,11 @@ int main(int argc, char *argv[])
 
     bool cache_enabled = g_cfg.cache.enabled;
     if (cache_enabled) {
-        uint32_t total_entries = g_cfg.cache.index_entries > 0 ?
-            g_cfg.cache.index_entries : 16384;
-        size_t total_slab = g_cfg.cache.slab_size_bytes > 0 ?
-            g_cfg.cache.slab_size_bytes : (64ULL * 1024 * 1024);
+        uint32_t total_entries = g_cfg.cache.index_entries > 0 ? g_cfg.cache.index_entries : 16384;
+        size_t total_slab =
+            g_cfg.cache.slab_size_bytes > 0 ? g_cfg.cache.slab_size_bytes : (64ULL * 1024 * 1024);
         /* disk slab: one shared path not split — per-worker RAM only */
-        const char *disk_path = g_cfg.cache.disk_cache_path[0] ?
-            g_cfg.cache.disk_cache_path : NULL;
+        const char *disk_path = g_cfg.cache.disk_cache_path[0] ? g_cfg.cache.disk_cache_path : NULL;
         size_t disk_bytes = (size_t)g_cfg.cache.disk_slab_size_bytes;
 
         uint32_t entries_per = total_entries / (uint32_t)num_workers;
@@ -562,9 +572,8 @@ int main(int argc, char *argv[])
         if (slab_per < 1024 * 1024) slab_per = 1024 * 1024;
 
         for (int i = 0; i < num_workers; i++) {
-            if (cache_init(&g_worker_caches[i], entries_per, slab_per,
-                           g_cfg.cache.use_hugepages, disk_path, disk_bytes,
-                           g_cfg.cache.etag_sha256,
+            if (cache_init(&g_worker_caches[i], entries_per, slab_per, g_cfg.cache.use_hugepages,
+                           disk_path, disk_bytes, g_cfg.cache.etag_sha256,
                            g_cfg.cache.verify_crc) == 0) {
                 g_cache_initialized_count++;
                 /* Only the first worker gets the disk slab to avoid double-mapping */
@@ -574,8 +583,7 @@ int main(int argc, char *argv[])
                 log_warn("main", "worker %d cache init failed — worker will run without cache", i);
             }
         }
-        if (g_cache_initialized_count == 0)
-            cache_enabled = false;
+        if (g_cache_initialized_count == 0) cache_enabled = false;
     }
 
 #ifdef VORTEX_PHASE_TLS
@@ -594,19 +602,17 @@ int main(int argc, char *argv[])
             if (xdp_loaded) bpf_loader_detach();
             return 1;
         }
-        if (setgroups(0, NULL) != 0 ||
-            setgid(pw->pw_gid) != 0 ||
-            setuid(pw->pw_uid) != 0) {
-            log_error("main", "privilege drop to '%s' failed: %s",
-                g_cfg.run_as_user, strerror(errno));
+        if (setgroups(0, NULL) != 0 || setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0) {
+            log_error("main", "privilege drop to '%s' failed: %s", g_cfg.run_as_user,
+                      strerror(errno));
             if (xdp_loaded) bpf_loader_detach();
             return 1;
         }
         /* Prevent re-escalation via exec of any setuid binary */
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
             log_warn("main", "PR_SET_NO_NEW_PRIVS failed: %s", strerror(errno));
-        log_info("main", "privileges dropped to user=%s uid=%d gid=%d",
-            pw->pw_name, (int)pw->pw_uid, (int)pw->pw_gid);
+        log_info("main", "privileges dropped to user=%s uid=%d gid=%d", pw->pw_name,
+                 (int)pw->pw_uid, (int)pw->pw_gid);
     } else if (getuid() == 0) {
         log_warn("main", "running as root — set run_as_user in config to drop privileges");
     }
@@ -616,26 +622,24 @@ int main(int argc, char *argv[])
      * 4-tuple, eliminating accept-queue contention and thundering herd. */
     g_num_workers = num_workers;
     for (int i = 0; i < num_workers; i++) {
-        int lfd = worker_create_listener(g_cfg.bind_address,
-                                         g_cfg.bind_port, 1024, g_cfg.ipv4_only);
+        int lfd =
+            worker_create_listener(g_cfg.bind_address, g_cfg.bind_port, 1024, g_cfg.ipv4_only);
         if (lfd < 0) {
-            log_error("main", "failed to create listener %d on %s:%d",
-                i, g_cfg.bind_address, g_cfg.bind_port);
+            log_error("main", "failed to create listener %d on %s:%d", i, g_cfg.bind_address,
+                      g_cfg.bind_port);
             num_workers = i;
             break;
         }
-        struct cache *wcache = (cache_enabled && i < g_cache_initialized_count)
-                              ? &g_worker_caches[i] : NULL;
-        if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr,
-                        wcache) != 0) {
+        struct cache *wcache =
+            (cache_enabled && i < g_cache_initialized_count) ? &g_worker_caches[i] : NULL;
+        if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr, wcache) != 0) {
             log_error("main", "worker_init failed for worker %d", i);
             close(lfd);
             num_workers = i;
             break;
         }
         if (need_compress_pool)
-            compress_pool_init(&g_workers[i].compress_pool,
-                               g_cfg.compress_pool_threads);
+            compress_pool_init(&g_workers[i].compress_pool, g_cfg.compress_pool_threads);
         if (worker_start(&g_workers[i]) != 0) {
             log_error("main", "worker_start failed for worker %d", i);
             num_workers = i;
@@ -650,10 +654,11 @@ int main(int argc, char *argv[])
 
     /* Start metrics server */
     struct worker *worker_ptrs[MAX_WORKERS];
-    for (int i = 0; i < num_workers; i++) worker_ptrs[i] = &g_workers[i];
+    for (int i = 0; i < num_workers; i++)
+        worker_ptrs[i] = &g_workers[i];
     if (g_cfg.metrics.enabled) {
-        metrics_init(&g_metrics, g_cfg.metrics.bind_address,
-            g_cfg.metrics.port, worker_ptrs, num_workers);
+        metrics_init(&g_metrics, g_cfg.metrics.bind_address, g_cfg.metrics.port, worker_ptrs,
+                     num_workers);
 #ifdef VORTEX_PHASE_TLS
         /* Populate cert expiry info for Prometheus */
         g_cert_info_count = 0;
@@ -663,14 +668,15 @@ int main(int argc, char *argv[])
             struct cert_result cr;
             memset(&cr, 0, sizeof(cr));
             if (static_file_load(r->cert_path, r->key_path, &cr) == 0) {
-                snprintf(g_cert_info[g_cert_info_count].hostname, sizeof(g_cert_info[0].hostname), "%s", r->hostname);
+                snprintf(g_cert_info[g_cert_info_count].hostname, sizeof(g_cert_info[0].hostname),
+                         "%s", r->hostname);
                 g_cert_info[g_cert_info_count].not_after = cr.not_after;
                 g_cert_info_count++;
                 cert_result_free(&cr);
             }
         }
         if (g_cert_info_count > 0) {
-            g_metrics.cert_info       = g_cert_info;
+            g_metrics.cert_info = g_cert_info;
             g_metrics.cert_info_count = g_cert_info_count;
         }
 #endif
@@ -678,17 +684,16 @@ int main(int argc, char *argv[])
     }
 
     if (g_cfg.dashboard.enabled) {
-        if (dashboard_init(&g_dashboard, g_cfg.dashboard.bind_address,
-                           g_cfg.dashboard.port, worker_ptrs, num_workers,
-                           &g_cfg) == 0) {
+        if (dashboard_init(&g_dashboard, g_cfg.dashboard.bind_address, g_cfg.dashboard.port,
+                           worker_ptrs, num_workers, &g_cfg) == 0) {
             if (dashboard_start(&g_dashboard) != 0) {
                 log_warn("main", "dashboard thread start failed");
                 if (g_dashboard.listen_fd >= 0) {
                     close(g_dashboard.listen_fd);
                     g_dashboard.listen_fd = -1;
                 }
-            }
-            else g_dashboard_started = 1;
+            } else
+                g_dashboard_started = 1;
         } else {
             log_warn("main", "dashboard init failed");
         }
@@ -697,8 +702,8 @@ int main(int argc, char *argv[])
 #ifdef VORTEX_QUIC
     /* Start QUIC/HTTP3 server (needs TLS to have been set up) */
     if (tls_ptr && tls_ptr->route_count > 0) {
-        if (quic_server_init(&g_quic, tls_ptr, NULL, &g_cfg,
-                             g_cfg.bind_address, g_cfg.bind_port) == 0) {
+        if (quic_server_init(&g_quic, tls_ptr, NULL, &g_cfg, g_cfg.bind_address, g_cfg.bind_port) ==
+            0) {
             if (quic_server_start(g_quic) != 0) {
                 log_warn("main", "QUIC thread start failed");
                 quic_server_destroy(g_quic);
@@ -712,8 +717,8 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    log_info("vortex_running", "pid=%d workers=%d port=%d",
-        (int)getpid(), num_workers, g_cfg.bind_port);
+    log_info("vortex_running", "pid=%d workers=%d port=%d", (int)getpid(), num_workers,
+             g_cfg.bind_port);
 
     /* Main loop — monitor signals */
     while (g_running) {
@@ -739,15 +744,13 @@ int main(int argc, char *argv[])
             struct vortex_metrics m;
             if (bpf_metrics_read(&m) == 0) {
                 log_debug("xdp_metrics",
-                    "rx_pkts=%llu rx_bytes=%llu passed=%llu "
-                    "drop_rl=%llu drop_bl=%llu drop_inv=%llu drop_ct=%llu",
-                    (unsigned long long)m.rx_packets,
-                    (unsigned long long)m.rx_bytes,
-                    (unsigned long long)m.passed,
-                    (unsigned long long)m.dropped_ratelimit,
-                    (unsigned long long)m.dropped_blocklist,
-                    (unsigned long long)m.dropped_invalid,
-                    (unsigned long long)m.dropped_conntrack);
+                          "rx_pkts=%llu rx_bytes=%llu passed=%llu "
+                          "drop_rl=%llu drop_bl=%llu drop_inv=%llu drop_ct=%llu",
+                          (unsigned long long)m.rx_packets, (unsigned long long)m.rx_bytes,
+                          (unsigned long long)m.passed, (unsigned long long)m.dropped_ratelimit,
+                          (unsigned long long)m.dropped_blocklist,
+                          (unsigned long long)m.dropped_invalid,
+                          (unsigned long long)m.dropped_conntrack);
             }
         }
 
@@ -768,7 +771,8 @@ int main(int argc, char *argv[])
         dashboard_join(&g_dashboard);
         g_dashboard_started = 0;
     }
-    for (int i = 0; i < num_workers; i++) worker_stop(&g_workers[i]);
+    for (int i = 0; i < num_workers; i++)
+        worker_stop(&g_workers[i]);
     for (int i = 0; i < num_workers; i++)
         worker_join(&g_workers[i]);
     if (need_compress_pool) {
@@ -823,8 +827,7 @@ int main(int argc, char *argv[])
         bpf_loader_detach();
     }
 
-    if (g_pid_file_written)
-        unlink(g_cfg.pid_file);
+    if (g_pid_file_written) unlink(g_cfg.pid_file);
     log_close();
     return 0;
 }

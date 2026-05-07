@@ -28,29 +28,23 @@ static uint8_t *alloc_slab(size_t size, bool try_hugepages)
 {
     if (try_hugepages) {
         uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
-                          -1, 0);
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
         if (p != MAP_FAILED) {
-            log_info("conn_pool", "slab %zu MB: explicit 2MB huge pages",
-                     size / (1024 * 1024));
+            log_info("conn_pool", "slab %zu MB: explicit 2MB huge pages", size / (1024 * 1024));
             return p;
         }
-        p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) {
             madvise(p, size, MADV_HUGEPAGE);
-            log_info("conn_pool", "slab %zu MB: THP hint (MADV_HUGEPAGE)",
-                     size / (1024 * 1024));
+            log_info("conn_pool", "slab %zu MB: THP hint (MADV_HUGEPAGE)", size / (1024 * 1024));
             return p;
         }
     }
-    uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    uint8_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return (p == MAP_FAILED) ? NULL : p;
 }
 
-int conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size,
-                   bool hugepages)
+int conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size, bool hugepages)
 {
     memset(pool, 0, sizeof(*pool));
     pool->capacity = capacity;
@@ -90,10 +84,10 @@ int conn_pool_init(struct conn_pool *pool, uint32_t capacity, size_t buf_size,
     pool->free_top = capacity;
     for (uint32_t i = 0; i < capacity; i++) {
         pool->free_list[i] = capacity - 1 - i;
-        pool->hot[i].conn_id   = i;
-        pool->hot[i].client_fd  = -1;
+        pool->hot[i].conn_id = i;
+        pool->hot[i].client_fd = -1;
         pool->hot[i].backend_fd = -1;
-        pool->hot[i].state      = CONN_STATE_FREE;
+        pool->hot[i].state = CONN_STATE_FREE;
     }
 
     log_info("conn_pool_init", "capacity=%u buf_size=%zu", capacity, buf_size);
@@ -108,10 +102,8 @@ oom:
 void conn_pool_destroy(struct conn_pool *pool)
 {
     size_t slab_size = (size_t)pool->capacity * pool->buf_size;
-    if (pool->recv_slab)
-        munmap(pool->recv_slab, slab_size);
-    if (pool->send_slab)
-        munmap(pool->send_slab, slab_size);
+    if (pool->recv_slab) munmap(pool->recv_slab, slab_size);
+    if (pool->send_slab) munmap(pool->send_slab, slab_size);
     free(pool->recv_bufs);
     free(pool->send_bufs);
     free(pool->hot);
@@ -132,10 +124,10 @@ uint32_t conn_alloc(struct conn_pool *pool)
 
     struct conn_hot *h = &pool->hot[id];
     memset(h, 0, sizeof(*h));
-    h->conn_id   = id;
-    h->client_fd  = -1;
+    h->conn_id = id;
+    h->client_fd = -1;
     h->backend_fd = -1;
-    h->state      = CONN_STATE_ACCEPTING;
+    h->state = CONN_STATE_ACCEPTING;
 
     memset(&pool->cold[id], 0, sizeof(pool->cold[id]));
     pool->cold[id].splice_pipe[0] = -1;
@@ -150,20 +142,29 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     if (id >= pool->capacity) return;
 
     struct conn_hot *h = &pool->hot[id];
-    h->state      = CONN_STATE_FREE;
-    h->client_fd  = -1;
+    h->state = CONN_STATE_FREE;
+    h->client_fd = -1;
     h->backend_fd = -1;
-    h->ssl        = NULL;
-    h->flags      = 0;
+    h->ssl = NULL;
+    h->flags = 0;
 
     struct conn_cold *cold = &pool->cold[id];
-    if (cold->splice_pipe[0] >= 0) { close(cold->splice_pipe[0]); cold->splice_pipe[0] = -1; }
-    if (cold->splice_pipe[1] >= 0) { close(cold->splice_pipe[1]); cold->splice_pipe[1] = -1; }
+    if (cold->splice_pipe[0] >= 0) {
+        close(cold->splice_pipe[0]);
+        cold->splice_pipe[0] = -1;
+    }
+    if (cold->splice_pipe[1] >= 0) {
+        close(cold->splice_pipe[1]);
+        cold->splice_pipe[1] = -1;
+    }
     cold->backend_deadline_ns = 0;
-    if (cold->chunk_buf) { free(cold->chunk_buf); cold->chunk_buf = NULL; }
-    cold->chunk_buf_cap   = 0;
-    cold->chunk_hdr_len   = 0;
-    cold->chunk_body_len  = 0;
+    if (cold->chunk_buf) {
+        free(cold->chunk_buf);
+        cold->chunk_buf = NULL;
+    }
+    cold->chunk_buf_cap = 0;
+    cold->chunk_hdr_len = 0;
+    cold->chunk_body_len = 0;
     cold->chunk_remaining = 0;
     cold->chunk_skip_crlf = false;
     cold->h2 = NULL; /* h2_session_free must have been called by conn_close before conn_free */

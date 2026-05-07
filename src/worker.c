@@ -23,7 +23,9 @@ static void *worker_thread(void *arg)
         return NULL;
     }
     if (!(w->uring.ring.features & IORING_FEAT_NODROP))
-        log_warn("worker_thread", "id=%d kernel lacks IORING_FEAT_NODROP — CQ overflow possible; upgrade kernel", w->worker_id);
+        log_warn("worker_thread",
+                 "id=%d kernel lacks IORING_FEAT_NODROP — CQ overflow possible; upgrade kernel",
+                 w->worker_id);
 
     /* Register fixed buffers — one iovec per recv/send slot.
      * recv_buf[cid] → index cid, send_buf[cid] → index (capacity + cid).
@@ -33,10 +35,10 @@ static void *worker_thread(void *arg)
         struct iovec *iovecs = malloc(2 * cap * sizeof(struct iovec));
         if (iovecs) {
             for (uint32_t i = 0; i < cap; i++) {
-                iovecs[i].iov_base          = conn_recv_buf(&w->pool, i);
-                iovecs[i].iov_len           = w->pool.buf_size;
-                iovecs[cap + i].iov_base    = conn_send_buf(&w->pool, i);
-                iovecs[cap + i].iov_len     = w->pool.buf_size;
+                iovecs[i].iov_base = conn_recv_buf(&w->pool, i);
+                iovecs[i].iov_len = w->pool.buf_size;
+                iovecs[cap + i].iov_base = conn_send_buf(&w->pool, i);
+                iovecs[cap + i].iov_len = w->pool.buf_size;
             }
             uring_register_bufs(&w->uring, iovecs, 2 * cap);
             free(iovecs);
@@ -51,8 +53,7 @@ static void *worker_thread(void *arg)
          * One buffer per connection slot (ring count = next power-of-two ≥ cap).
          * Independent of the fixed-buffer registration above. */
         if (uring_recv_ring_setup(&w->uring, w->pool.buf_size, cap, 0) != 0)
-            log_warn("worker_thread",
-                     "recv ring unavailable — H2 uses single-shot recv");
+            log_warn("worker_thread", "recv ring unavailable — H2 uses single-shot recv");
     }
 
     /* Queue the multishot accept — cid=0 means accept op */
@@ -70,8 +71,8 @@ static void *worker_thread(void *arg)
     if (w->tls_done_pipe_rd >= 0) {
         struct io_uring_sqe *psqe = io_uring_get_sqe(&w->uring.ring);
         if (psqe) {
-            io_uring_prep_read(psqe, w->tls_done_pipe_rd,
-                               w->tls_pipe_buf, sizeof(w->tls_pipe_buf), 0);
+            io_uring_prep_read(psqe, w->tls_done_pipe_rd, w->tls_pipe_buf, sizeof(w->tls_pipe_buf),
+                               0);
             psqe->user_data = URING_UD_ENCODE(VORTEX_OP_TLS_DONE, 0);
         }
     }
@@ -79,8 +80,8 @@ static void *worker_thread(void *arg)
     if (w->compress_done_pipe_rd >= 0) {
         struct io_uring_sqe *csqe = io_uring_get_sqe(&w->uring.ring);
         if (csqe) {
-            io_uring_prep_read(csqe, w->compress_done_pipe_rd,
-                               w->compress_pipe_buf, sizeof(w->compress_pipe_buf), 0);
+            io_uring_prep_read(csqe, w->compress_done_pipe_rd, w->compress_pipe_buf,
+                               sizeof(w->compress_pipe_buf), 0);
             csqe->user_data = URING_UD_ENCODE(VORTEX_OP_COMPRESS_DONE, 0);
         }
     }
@@ -96,7 +97,7 @@ static void *worker_thread(void *arg)
         unsigned count = 0;
 
         /* Wait up to 1s so we can check stop flag for graceful shutdown */
-        struct __kernel_timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        struct __kernel_timespec ts = {.tv_sec = 1, .tv_nsec = 0};
         int ret = io_uring_wait_cqe_timeout(&w->uring.ring, &cqe, &ts);
         if (ret == -ETIME) {
             /* Periodic: drip more urandom garbage into tarpitted connections */
@@ -105,10 +106,9 @@ static void *worker_thread(void *arg)
                 if (read(w->urandom_fd, noise, sizeof(noise)) == (ssize_t)sizeof(noise)) {
                     for (uint32_t ti = 0; ti < w->tarpit_count; ti++) {
                         int slot = (int)((w->tarpit_head + ti) % WORKER_TARPIT_MAX);
-                        int tfd  = w->tarpit_fds[slot];
+                        int tfd = w->tarpit_fds[slot];
                         if (tfd < 0) continue;
-                        if (send(tfd, noise, sizeof(noise),
-                                 MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {
+                        if (send(tfd, noise, sizeof(noise), MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {
                             close(tfd);
                             w->tarpit_fds[slot] = -1;
                         }
@@ -119,12 +119,10 @@ static void *worker_thread(void *arg)
             if (w->blocked_count > 0) {
                 time_t now_t = time(NULL);
                 while (w->blocked_count > 0) {
-                    struct blocked_entry *be =
-                        &w->blocked_list[w->blocked_head];
+                    struct blocked_entry *be = &w->blocked_list[w->blocked_head];
                     if (be->expire_at > now_t) break;
                     bpf_blocklist_remove_addr(&be->ip);
-                    w->blocked_head =
-                        (w->blocked_head + 1) % WORKER_BLOCKED_MAX;
+                    w->blocked_head = (w->blocked_head + 1) % WORKER_BLOCKED_MAX;
                     w->blocked_count--;
                 }
             }
@@ -142,15 +140,14 @@ static void *worker_thread(void *arg)
                     /* Deadline breached — record CB failure, send 504, close */
                     int _ri = _h->route_idx, _bi = _h->backend_idx;
                     cb_record_failure(w, _ri, _bi, now_ns,
-                        w->cfg->routes[_ri].health.fail_threshold,
-                        w->cfg->routes[_ri].health.open_ms);
-                    log_warn("backend_timeout",
-                        "conn=%u route=%d backend=%d timed out", _i, _ri, _bi);
+                                      w->cfg->routes[_ri].health.fail_threshold,
+                                      w->cfg->routes[_ri].health.open_ms);
+                    log_warn("backend_timeout", "conn=%u route=%d backend=%d timed out", _i, _ri,
+                             _bi);
                     _cold->backend_deadline_ns = 0;
-                    static const char r504[] =
-                        "HTTP/1.1 504 Gateway Timeout\r\n"
-                        "Content-Length: 15\r\nConnection: close\r\n\r\n"
-                        "Gateway Timeout";
+                    static const char r504[] = "HTTP/1.1 504 Gateway Timeout\r\n"
+                                               "Content-Length: 15\r\nConnection: close\r\n\r\n"
+                                               "Gateway Timeout";
                     send(_h->client_fd, r504, sizeof(r504) - 1, MSG_NOSIGNAL);
                     conn_close(w, _i, false);
                 }
@@ -164,7 +161,8 @@ static void *worker_thread(void *arg)
         }
 
         /* Process all available completions */
-        io_uring_for_each_cqe(&w->uring.ring, head, cqe) {
+        io_uring_for_each_cqe(&w->uring.ring, head, cqe)
+        {
             handle_proxy_data(w, cqe);
             count++;
             (void)head;
@@ -174,11 +172,9 @@ static void *worker_thread(void *arg)
         uring_flush(&w->uring);
     }
 
-    log_info("worker_stop", "id=%d accepted=%llu completed=%llu errors=%llu",
-        w->worker_id,
-        (unsigned long long)w->accepted,
-        (unsigned long long)w->completed,
-        (unsigned long long)w->errors);
+    log_info("worker_stop", "id=%d accepted=%llu completed=%llu errors=%llu", w->worker_id,
+             (unsigned long long)w->accepted, (unsigned long long)w->completed,
+             (unsigned long long)w->errors);
 
     /* ---- Graceful ring drain ----
      * io_uring_unregister_buffers() (inside uring_destroy) blocks until all
@@ -191,20 +187,29 @@ static void *worker_thread(void *arg)
     for (uint32_t i = 0; i < w->pool.capacity; i++) {
         struct conn_hot *h = &w->pool.hot[i];
         if (h->state == CONN_STATE_FREE) continue;
-        if (h->client_fd  >= 0) { close(h->client_fd);  h->client_fd  = -1; }
-        if (h->backend_fd >= 0) { close(h->backend_fd); h->backend_fd = -1; }
+        if (h->client_fd >= 0) {
+            close(h->client_fd);
+            h->client_fd = -1;
+        }
+        if (h->backend_fd >= 0) {
+            close(h->backend_fd);
+            h->backend_fd = -1;
+        }
     }
 
     /* 2. Close tarpit fds */
     for (uint32_t i = 0; i < w->tarpit_count; i++) {
         int idx = (int)((w->tarpit_head + i) % WORKER_TARPIT_MAX);
-        if (w->tarpit_fds[idx] >= 0) { close(w->tarpit_fds[idx]); w->tarpit_fds[idx] = -1; }
+        if (w->tarpit_fds[idx] >= 0) {
+            close(w->tarpit_fds[idx]);
+            w->tarpit_fds[idx] = -1;
+        }
     }
 
     /* 3. Drain any cancellation CQEs the kernel posts after fd close */
     {
         struct io_uring_cqe *cqe;
-        struct __kernel_timespec drain_ts = { .tv_sec = 0, .tv_nsec = 100000000L }; /* 100ms */
+        struct __kernel_timespec drain_ts = {.tv_sec = 0, .tv_nsec = 100000000L}; /* 100ms */
         while (io_uring_wait_cqe_timeout(&w->uring.ring, &cqe, &drain_ts) == 0) {
             io_uring_cqe_seen(&w->uring.ring, cqe);
         }
@@ -217,8 +222,8 @@ static void *worker_thread(void *arg)
 int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ipv4_only)
 {
     struct sockaddr_storage ss;
-    socklen_t               sslen;
-    int                     domain;
+    socklen_t sslen;
+    int domain;
 
     memset(&ss, 0, sizeof(ss));
 
@@ -227,10 +232,9 @@ int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ip
          * dotted-quad or empty/invalid (falls back to INADDR_ANY). */
         struct sockaddr_in *sa4 = (struct sockaddr_in *)&ss;
         sa4->sin_family = AF_INET;
-        sa4->sin_port   = htons(port);
-        if (inet_pton(AF_INET, addr, &sa4->sin_addr) <= 0)
-            sa4->sin_addr.s_addr = INADDR_ANY;
-        sslen  = sizeof(*sa4);
+        sa4->sin_port = htons(port);
+        if (inet_pton(AF_INET, addr, &sa4->sin_addr) <= 0) sa4->sin_addr.s_addr = INADDR_ANY;
+        sslen = sizeof(*sa4);
         domain = AF_INET;
     } else {
         /* AF_INET6 with IPV6_V6ONLY=0: dual-stack — accepts both IPv4-mapped
@@ -239,10 +243,9 @@ int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ip
          * silently converted to the IPv4-mapped form via inet_pton(AF_INET6). */
         struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&ss;
         sa6->sin6_family = AF_INET6;
-        sa6->sin6_port   = htons(port);
-        if (inet_pton(AF_INET6, addr, &sa6->sin6_addr) <= 0)
-            sa6->sin6_addr = in6addr_any;
-        sslen  = sizeof(*sa6);
+        sa6->sin6_port = htons(port);
+        if (inet_pton(AF_INET6, addr, &sa6->sin6_addr) <= 0) sa6->sin6_addr = in6addr_any;
+        sslen = sizeof(*sa6);
         domain = AF_INET6;
     }
 
@@ -279,8 +282,8 @@ int worker_create_listener(const char *addr, uint16_t port, int backlog, bool ip
         return -1;
     }
 
-    log_info("listener_ready", "addr=%s port=%d fd=%d mode=%s",
-             addr, port, fd, ipv4_only ? "ipv4" : "dual-stack");
+    log_info("listener_ready", "addr=%s port=%d fd=%d mode=%s", addr, port, fd,
+             ipv4_only ? "ipv4" : "dual-stack");
     return fd;
 }
 
@@ -307,32 +310,29 @@ uint32_t worker_pool_capacity(int num_workers, double budget_pct)
 
     /* Budget: budget_pct of available memory across all workers,
      * each connection needs 2 × WORKER_BUF_SIZE bytes of pinned buffers. */
-    long budget_kb     = (long)(avail_kb * budget_pct);
+    long budget_kb = (long)(avail_kb * budget_pct);
     long per_worker_kb = (num_workers > 0) ? budget_kb / num_workers : budget_kb;
-    long capacity      = (per_worker_kb * 1024) / (2 * WORKER_BUF_SIZE);
+    long capacity = (per_worker_kb * 1024) / (2 * WORKER_BUF_SIZE);
 
-    if (capacity < 1)   capacity = 1;
+    if (capacity < 1) capacity = 1;
     if (capacity > WORKER_MAX_CONNS) capacity = WORKER_MAX_CONNS;
 
-    log_info("pool_capacity",
-        "avail=%ldMB budget=%.0f%% workers=%d capacity=%ld per_worker=%ldMB",
-        avail_kb / 1024, budget_pct * 100, num_workers,
-        capacity, per_worker_kb / 1024);
+    log_info("pool_capacity", "avail=%ldMB budget=%.0f%% workers=%d capacity=%ld per_worker=%ldMB",
+             avail_kb / 1024, budget_pct * 100, num_workers, capacity, per_worker_kb / 1024);
 
     return (uint32_t)capacity;
 }
 
 int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
-                struct vortex_config *cfg, struct tls_ctx *tls,
-                struct cache *shared_cache)
+                struct vortex_config *cfg, struct tls_ctx *tls, struct cache *shared_cache)
 {
     memset(w, 0, sizeof(*w));
     w->worker_id = id;
     w->listen_fd = listen_fd;
-    w->cfg       = cfg;
-    w->cache     = shared_cache;
+    w->cfg = cfg;
+    w->cache = shared_cache;
 #ifdef VORTEX_PHASE_TLS
-    w->tls       = tls;
+    w->tls = tls;
     w->backend_tls_client_ctx = tls_create_client_ctx(true);
     if (!w->backend_tls_client_ctx) {
         log_error("worker_init", "tls_create_client_ctx failed");
@@ -344,12 +344,12 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
 
     /* io_uring is initialized inside the worker thread for SINGLE_ISSUER compat */
 
-    for (int i = 0; i < WORKER_TARPIT_MAX; i++) w->tarpit_fds[i] = -1;
+    for (int i = 0; i < WORKER_TARPIT_MAX; i++)
+        w->tarpit_fds[i] = -1;
 
     /* Open /dev/urandom for tarpit noise */
     w->urandom_fd = open("/dev/urandom", O_RDONLY | O_NONBLOCK);
-    if (w->urandom_fd < 0)
-        log_warn("worker_init", "cannot open /dev/urandom: %s", strerror(errno));
+    if (w->urandom_fd < 0) log_warn("worker_init", "cannot open /dev/urandom: %s", strerror(errno));
 
     /* Pipe for receiving TLS handshake results from the pool */
     {
@@ -378,8 +378,7 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
 
     /* Open tarpit log */
     w->tarpit_log = fopen("/var/log/vortex/tarpit.log", "a");
-    if (!w->tarpit_log)
-        log_warn("worker_init", "cannot open tarpit log: %s", strerror(errno));
+    if (!w->tarpit_log) log_warn("worker_init", "cannot open tarpit log: %s", strerror(errno));
 
     if (conn_pool_init(&w->pool, capacity, WORKER_BUF_SIZE, cfg->hugepages) != 0) {
 #ifdef VORTEX_PHASE_TLS
@@ -418,14 +417,14 @@ int worker_start(struct worker *w)
      * silently — the scheduler will place it wherever it fits. */
     if (w->cfg && w->cfg->cpu_affinity) {
         int ncpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
-        int cpu   = w->worker_id % ncpus;
+        int cpu = w->worker_id % ncpus;
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(cpu, &cpuset);
         ret = pthread_setaffinity_np(w->thread, sizeof(cpuset), &cpuset);
         if (ret != 0)
-            log_warn("worker_start", "id=%d cpu_affinity=%d failed: %s",
-                     w->worker_id, cpu, strerror(ret));
+            log_warn("worker_start", "id=%d cpu_affinity=%d failed: %s", w->worker_id, cpu,
+                     strerror(ret));
         else
             log_info("worker_start", "id=%d pinned to CPU %d", w->worker_id, cpu);
     }
@@ -471,12 +470,14 @@ void worker_destroy(struct worker *w)
     /* Close any held tarpit connections */
     for (uint32_t i = 0; i < w->tarpit_count; i++) {
         int idx = (int)((w->tarpit_head + i) % WORKER_TARPIT_MAX);
-        if (w->tarpit_fds[idx] >= 0) { close(w->tarpit_fds[idx]); w->tarpit_fds[idx] = -1; }
+        if (w->tarpit_fds[idx] >= 0) {
+            close(w->tarpit_fds[idx]);
+            w->tarpit_fds[idx] = -1;
+        }
     }
     if (w->tarpit_total)
-        log_info("tarpit_stats", "worker=%d total=%llu active=%u blocked=%u",
-            w->worker_id, (unsigned long long)w->tarpit_total,
-            w->tarpit_count, w->blocked_count);
+        log_info("tarpit_stats", "worker=%d total=%llu active=%u blocked=%u", w->worker_id,
+                 (unsigned long long)w->tarpit_total, w->tarpit_count, w->blocked_count);
 
     /* Remove any still-live blocklist entries so they don't persist across restarts */
     for (uint32_t i = 0; i < w->blocked_count; i++) {
@@ -484,13 +485,34 @@ void worker_destroy(struct worker *w)
         bpf_blocklist_remove_addr(&w->blocked_list[bi].ip);
     }
 
-    if (w->listen_fd >= 0) { close(w->listen_fd); w->listen_fd = -1; }
-    if (w->urandom_fd >= 0) { close(w->urandom_fd); w->urandom_fd = -1; }
-    if (w->tls_done_pipe_rd >= 0) { close(w->tls_done_pipe_rd); w->tls_done_pipe_rd = -1; }
-    if (w->tls_done_pipe_wr >= 0) { close(w->tls_done_pipe_wr); w->tls_done_pipe_wr = -1; }
-    if (w->compress_done_pipe_rd >= 0) { close(w->compress_done_pipe_rd); w->compress_done_pipe_rd = -1; }
-    if (w->compress_done_pipe_wr >= 0) { close(w->compress_done_pipe_wr); w->compress_done_pipe_wr = -1; }
-    if (w->tarpit_log)  { fclose(w->tarpit_log); w->tarpit_log = NULL; }
+    if (w->listen_fd >= 0) {
+        close(w->listen_fd);
+        w->listen_fd = -1;
+    }
+    if (w->urandom_fd >= 0) {
+        close(w->urandom_fd);
+        w->urandom_fd = -1;
+    }
+    if (w->tls_done_pipe_rd >= 0) {
+        close(w->tls_done_pipe_rd);
+        w->tls_done_pipe_rd = -1;
+    }
+    if (w->tls_done_pipe_wr >= 0) {
+        close(w->tls_done_pipe_wr);
+        w->tls_done_pipe_wr = -1;
+    }
+    if (w->compress_done_pipe_rd >= 0) {
+        close(w->compress_done_pipe_rd);
+        w->compress_done_pipe_rd = -1;
+    }
+    if (w->compress_done_pipe_wr >= 0) {
+        close(w->compress_done_pipe_wr);
+        w->compress_done_pipe_wr = -1;
+    }
+    if (w->tarpit_log) {
+        fclose(w->tarpit_log);
+        w->tarpit_log = NULL;
+    }
 #ifdef VORTEX_PHASE_TLS
     if (w->backend_tls_client_ctx) {
         tls_context_free(w->backend_tls_client_ctx);
@@ -510,11 +532,9 @@ void worker_destroy(struct worker *w)
     conn_pool_destroy(&w->pool);
     if (w->cache && w->cache->index && w->worker_id == 0) {
         log_info("cache_stats", "worker=%d hits=%llu misses=%llu stores=%llu evictions=%llu",
-            w->worker_id,
-            (unsigned long long)w->cache->hits,
-            (unsigned long long)w->cache->misses,
-            (unsigned long long)w->cache->stores,
-            (unsigned long long)w->cache->evictions);
+                 w->worker_id, (unsigned long long)w->cache->hits,
+                 (unsigned long long)w->cache->misses, (unsigned long long)w->cache->stores,
+                 (unsigned long long)w->cache->evictions);
     }
     /* uring is destroyed inside the worker thread */
 }

@@ -8,7 +8,6 @@
 #include <errno.h>
 #include <time.h>
 
-
 /* Per-route paths stashed in provider_ctx */
 struct static_ctx {
     char cert_path[4096];
@@ -26,14 +25,20 @@ static char *read_file(const char *path)
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
-    rewind(f);
-    if (sz <= 0 || sz > 2 * 1024 * 1024) {
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    if (sz <= 0 || sz > 2L * 1024 * 1024) {
         log_error("static_file", "file too large or empty: %s", path);
         fclose(f);
         return NULL;
     }
     char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
         free(buf);
         fclose(f);
@@ -72,10 +77,9 @@ static int sf_init(void **ctx_out, const struct vortex_config *cfg)
     /* Find the route whose hostname matches (first route with static cert) */
     for (int i = 0; i < cfg->route_count; i++) {
         const struct route_config *r = &cfg->routes[i];
-        if (r->cert_provider == CERT_PROVIDER_STATIC &&
-            r->cert_path[0] != '\0') {
+        if (r->cert_provider == CERT_PROVIDER_STATIC && r->cert_path[0] != '\0') {
             strncpy(sc->cert_path, r->cert_path, sizeof(sc->cert_path) - 1);
-            strncpy(sc->key_path,  r->key_path,  sizeof(sc->key_path)  - 1);
+            strncpy(sc->key_path, r->key_path, sizeof(sc->key_path) - 1);
             break;
         }
     }
@@ -86,7 +90,7 @@ static int sf_init(void **ctx_out, const struct vortex_config *cfg)
 
 static int sf_obtain(void *ctx, const char *domain, struct cert_result *out)
 {
-    (void)domain;  /* path is in ctx */
+    (void)domain; /* path is in ctx */
     struct static_ctx *sc = ctx;
 
     if (!sc->cert_path[0]) {
@@ -105,13 +109,11 @@ static int sf_obtain(void *ctx, const char *domain, struct cert_result *out)
     }
 
     out->not_after = pem_not_after(out->cert_pem);
-    log_info("static_file", "loaded cert=%s not_after=%ld",
-        sc->cert_path, (long)out->not_after);
+    log_info("static_file", "loaded cert=%s not_after=%ld", sc->cert_path, (long)out->not_after);
     return 0;
 }
 
-static int sf_obtain_for_path(const char *cert_path, const char *key_path,
-                               struct cert_result *out)
+static int sf_obtain_for_path(const char *cert_path, const char *key_path, struct cert_result *out)
 {
     out->cert_pem = read_file(cert_path);
     if (!out->cert_pem) return -1;
@@ -128,8 +130,7 @@ static int sf_obtain_for_path(const char *cert_path, const char *key_path,
 }
 
 /* Public helper for direct use without the provider vtable */
-int static_file_load(const char *cert_path, const char *key_path,
-                     struct cert_result *out)
+int static_file_load(const char *cert_path, const char *key_path, struct cert_result *out)
 {
     return sf_obtain_for_path(cert_path, key_path, out);
 }
@@ -151,10 +152,10 @@ static void sf_destroy(void *ctx)
 }
 
 const struct cert_provider_ops static_file_provider = {
-    .name        = "static_file",
-    .init        = sf_init,
-    .obtain      = sf_obtain,
-    .renew       = sf_renew,
+    .name = "static_file",
+    .init = sf_init,
+    .obtain = sf_obtain,
+    .renew = sf_renew,
     .free_result = sf_free_result,
-    .destroy     = sf_destroy,
+    .destroy = sf_destroy,
 };

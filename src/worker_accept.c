@@ -59,7 +59,7 @@ int peek_client_hello_sni(int fd, char *out, size_t out_max)
 
     while (p + 4 <= ext_end) {
         uint16_t ext_type = ((uint16_t)p[0] << 8) | p[1];
-        uint16_t ext_len  = ((uint16_t)p[2] << 8) | p[3];
+        uint16_t ext_len = ((uint16_t)p[2] << 8) | p[3];
         p += 4;
         if (p + ext_len > ext_end) return 0;
 
@@ -97,35 +97,31 @@ void tarpit_conn(struct worker *w, int fd)
 
     /* Log the offender's IP address */
     {
-        struct sockaddr_storage ss;
+        struct sockaddr_storage ss = {0};
         socklen_t slen = sizeof(ss);
         if (getpeername(fd, (struct sockaddr *)&ss, &slen) == 0) {
             char ipstr[64] = {0};
             if (ss.ss_family == AF_INET) {
                 stored_ip.family = AF_INET;
-                memcpy(stored_ip.addr,
-                       &((struct sockaddr_in *)&ss)->sin_addr.s_addr, 4);
-                inet_ntop(AF_INET,
-                    &((struct sockaddr_in *)&ss)->sin_addr, ipstr, sizeof(ipstr));
-            } else {
+                memcpy(stored_ip.addr, &((struct sockaddr_in *)&ss)->sin_addr.s_addr, 4);
+                inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, ipstr, sizeof(ipstr));
+            } else if (ss.ss_family == AF_INET6) {
                 stored_ip.family = AF_INET6;
-                memcpy(stored_ip.addr,
-                       &((struct sockaddr_in6 *)&ss)->sin6_addr, 16);
-                inet_ntop(AF_INET6,
-                    &((struct sockaddr_in6 *)&ss)->sin6_addr, ipstr, sizeof(ipstr));
+                memcpy(stored_ip.addr, &((struct sockaddr_in6 *)&ss)->sin6_addr, 16);
+                inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, ipstr, sizeof(ipstr));
+            } else {
+                snprintf(ipstr, sizeof(ipstr), "family:%d", ss.ss_family);
             }
 
-            log_info("tarpit", "fd=%d ip=%s total=%llu",
-                fd, ipstr, (unsigned long long)(w->tarpit_total + 1));
+            log_info("tarpit", "fd=%d ip=%s total=%llu", fd, ipstr,
+                     (unsigned long long)(w->tarpit_total + 1));
 
             if (w->tarpit_log) {
                 time_t now = time(NULL);
                 struct tm tm;
                 gmtime_r(&now, &tm);
-                fprintf(w->tarpit_log,
-                    "%04d-%02d-%02dT%02d:%02d:%02dZ %s\n",
-                    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                    tm.tm_hour, tm.tm_min, tm.tm_sec, ipstr);
+                fprintf(w->tarpit_log, "%04d-%02d-%02dT%02d:%02d:%02dZ %s\n", tm.tm_year + 1900,
+                        tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ipstr);
                 fflush(w->tarpit_log);
             }
         }
@@ -147,20 +143,18 @@ void tarpit_conn(struct worker *w, int fd)
             if (evict_ip.family != 0) {
                 if (bpf_blocklist_add_addr(&evict_ip) == 0 &&
                     w->blocked_count < WORKER_BLOCKED_MAX) {
-                    struct blocked_entry *be =
-                        &w->blocked_list[w->blocked_tail];
+                    struct blocked_entry *be = &w->blocked_list[w->blocked_tail];
                     be->ip = evict_ip;
                     be->expire_at = time(NULL) + WORKER_BLOCK_TTL_SECS;
-                    w->blocked_tail =
-                        (w->blocked_tail + 1) % WORKER_BLOCKED_MAX;
+                    w->blocked_tail = (w->blocked_tail + 1) % WORKER_BLOCKED_MAX;
                     w->blocked_count++;
                     char evict_ip_str[INET6_ADDRSTRLEN];
                     if (evict_ip.family == AF_INET)
                         inet_ntop(AF_INET, evict_ip.addr, evict_ip_str, sizeof(evict_ip_str));
                     else
                         inet_ntop(AF_INET6, evict_ip.addr, evict_ip_str, sizeof(evict_ip_str));
-                    log_info("tarpit_block", "ip=%s blocked for %ds",
-                             evict_ip_str, WORKER_BLOCK_TTL_SECS);
+                    log_info("tarpit_block", "ip=%s blocked for %ds", evict_ip_str,
+                             WORKER_BLOCK_TTL_SECS);
                 }
             }
             close(evict_fd);
@@ -186,11 +180,15 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         h->flags &= ~CONN_FLAG_BACKEND_COUNTED;
     }
 #ifdef VORTEX_PHASE_TLS
-    if (h->ssl) { ptls_free((ptls_t *)h->ssl); h->ssl = NULL; }
+    if (h->ssl) {
+        ptls_free((ptls_t *)h->ssl);
+        h->ssl = NULL;
+    }
 #endif
-    if (h->client_fd  >= 0) {
+    if (h->client_fd >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_CLIENT(w, cid));
-        close(h->client_fd);  h->client_fd  = -1;
+        close(h->client_fd);
+        h->client_fd = -1;
     }
     if (h->backend_fd >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
@@ -200,9 +198,9 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
             !(h->flags & CONN_FLAG_BACKEND_TLS_PENDING) &&
             !(h->flags & CONN_FLAG_BACKEND_CONNECTING)) {
             int ri = h->route_idx, bi = h->backend_idx;
-            int ps = (ri < w->cfg->route_count &&
-                      bi < w->cfg->routes[ri].backend_count)
-                     ? w->cfg->routes[ri].backends[bi].pool_size : 0;
+            int ps = (ri < w->cfg->route_count && bi < w->cfg->routes[ri].backend_count)
+                         ? w->cfg->routes[ri].backends[bi].pool_size
+                         : 0;
             if (ps > 0) {
                 struct global_backend_conn pooled = {
                     .fd = h->backend_fd,
@@ -214,15 +212,25 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
             }
         }
         if (h->backend_fd >= 0) {
-            close(h->backend_fd); h->backend_fd = -1;
+            close(h->backend_fd);
+            h->backend_fd = -1;
         }
     }
 #ifdef VORTEX_PHASE_TLS
-    if (cc->backend_ssl) { ptls_free((ptls_t *)cc->backend_ssl); cc->backend_ssl = NULL; }
+    if (cc->backend_ssl) {
+        ptls_free((ptls_t *)cc->backend_ssl);
+        cc->backend_ssl = NULL;
+    }
 #endif
 #ifdef VORTEX_H2
-    if (cc->h2) { h2_session_free(cc->h2); cc->h2 = NULL; }
+    if (cc->h2) {
+        h2_session_free(cc->h2);
+        cc->h2 = NULL;
+    }
 #endif
     conn_free(&w->pool, cid);
-    if (is_error) w->errors++; else w->completed++;
+    if (is_error)
+        w->errors++;
+    else
+        w->completed++;
 }

@@ -5,31 +5,32 @@
 #include <stdbool.h>
 
 /* Operation types — stored in sqe->user_data (upper bits) */
-#define VORTEX_OP_ACCEPT         1
-#define VORTEX_OP_RECV_CLIENT    2   /* recv from client → forward to backend */
-#define VORTEX_OP_SEND_BACKEND   3   /* send to backend (client data) */
-#define VORTEX_OP_RECV_BACKEND   4   /* recv from backend → forward to client */
-#define VORTEX_OP_SEND_CLIENT    5   /* send to client (backend data) */
-#define VORTEX_OP_CONNECT        6
-#define VORTEX_OP_CLOSE          7
-#define VORTEX_OP_TIMEOUT        8
-#define VORTEX_OP_RECV_CLIENT_WS   9   /* websocket passthrough recv from client */
-#define VORTEX_OP_RECV_BACKEND_WS  10  /* websocket passthrough recv from backend */
+#define VORTEX_OP_ACCEPT 1
+#define VORTEX_OP_RECV_CLIENT 2 /* recv from client → forward to backend */
+#define VORTEX_OP_SEND_BACKEND 3 /* send to backend (client data) */
+#define VORTEX_OP_RECV_BACKEND 4 /* recv from backend → forward to client */
+#define VORTEX_OP_SEND_CLIENT 5 /* send to client (backend data) */
+#define VORTEX_OP_CONNECT 6
+#define VORTEX_OP_CLOSE 7
+#define VORTEX_OP_TIMEOUT 8
+#define VORTEX_OP_RECV_CLIENT_WS 9 /* websocket passthrough recv from client */
+#define VORTEX_OP_RECV_BACKEND_WS 10 /* websocket passthrough recv from backend */
 #define VORTEX_OP_SEND_CLIENT_LINKED 11 /* send to client + pre-armed RECV_CLIENT linked */
-#define VORTEX_OP_SPLICE_BACKEND     12 /* splice backend_fd → pipe (zero-copy recv) */
-#define VORTEX_OP_SPLICE_CLIENT      13 /* splice pipe → client_fd (zero-copy send) */
-#define VORTEX_OP_TLS_DONE           14 /* tls_pool result pipe became readable */
-#define VORTEX_OP_SEND_BACKEND_WS    15 /* send client WS frame to backend (after RECV_CLIENT_WS) */
-#define VORTEX_OP_SEND_CLIENT_WS     16 /* send backend WS frame to client (after RECV_BACKEND_WS) */
-#define VORTEX_OP_SEND_CLIENT_ZC     17 /* zero-copy send to client (two-CQE: completion + notification) */
-#define VORTEX_OP_H2_RECV_CLIENT     18 /* recv from H2 client (nghttp2 input) */
-#define VORTEX_OP_H2_SEND_CLIENT     19 /* send nghttp2 output to H2 client */
-#define VORTEX_OP_H2_CONNECT         20 /* async TCP connect to backend for H2 stream */
-#define VORTEX_OP_H2_SEND_BACKEND    21 /* send HTTP/1.1 request to H2 stream backend */
-#define VORTEX_OP_H2_RECV_BACKEND    22 /* recv HTTP/1.1 response from H2 stream backend */
+#define VORTEX_OP_SPLICE_BACKEND 12 /* splice backend_fd → pipe (zero-copy recv) */
+#define VORTEX_OP_SPLICE_CLIENT 13 /* splice pipe → client_fd (zero-copy send) */
+#define VORTEX_OP_TLS_DONE 14 /* tls_pool result pipe became readable */
+#define VORTEX_OP_SEND_BACKEND_WS 15 /* send client WS frame to backend (after RECV_CLIENT_WS) */
+#define VORTEX_OP_SEND_CLIENT_WS 16 /* send backend WS frame to client (after RECV_BACKEND_WS) */
+#define VORTEX_OP_SEND_CLIENT_ZC                                                                   \
+    17 /* zero-copy send to client (two-CQE: completion + notification) */
+#define VORTEX_OP_H2_RECV_CLIENT 18 /* recv from H2 client (nghttp2 input) */
+#define VORTEX_OP_H2_SEND_CLIENT 19 /* send nghttp2 output to H2 client */
+#define VORTEX_OP_H2_CONNECT 20 /* async TCP connect to backend for H2 stream */
+#define VORTEX_OP_H2_SEND_BACKEND 21 /* send HTTP/1.1 request to H2 stream backend */
+#define VORTEX_OP_H2_RECV_BACKEND 22 /* recv HTTP/1.1 response from H2 stream backend */
 #define VORTEX_OP_H2_GRPC_SEND_BACKEND 23 /* send nghttp2-client output to gRPC backend (h2c) */
 #define VORTEX_OP_H2_GRPC_RECV_BACKEND 24 /* recv raw bytes from gRPC backend (h2c) */
-#define VORTEX_OP_COMPRESS_DONE      25 /* compress_pool result pipe became readable */
+#define VORTEX_OP_COMPRESS_DONE 25 /* compress_pool result pipe became readable */
 
 /*
  * H2 user_data encoding — encodes op, stream slot, and connection id.
@@ -39,58 +40,58 @@
  * For H2_RECV_CLIENT and H2_SEND_CLIENT, slot is always 0 so
  * URING_UD_ID() correctly extracts cid via the standard macro.
  */
-#define URING_UD_H2_ENCODE(op, slot, cid) \
+#define URING_UD_H2_ENCODE(op, slot, cid)                                                          \
     (((uint64_t)(op) << 32) | (((uint64_t)((slot) & 0xFFF)) << 12) | ((uint64_t)((cid) & 0xFFF)))
-#define URING_UD_H2_CID(ud)   ((uint32_t)((ud) & 0xFFF))
-#define URING_UD_H2_SLOT(ud)  ((uint32_t)(((ud) >> 12) & 0xFFF))
+#define URING_UD_H2_CID(ud) ((uint32_t)((ud) & 0xFFF))
+#define URING_UD_H2_SLOT(ud) ((uint32_t)(((ud) >> 12) & 0xFFF))
 
 /* Legacy aliases */
-#define VORTEX_OP_RECV  VORTEX_OP_RECV_CLIENT
-#define VORTEX_OP_SEND  VORTEX_OP_SEND_BACKEND
+#define VORTEX_OP_RECV VORTEX_OP_RECV_CLIENT
+#define VORTEX_OP_SEND VORTEX_OP_SEND_BACKEND
 
 /* Encode op + conn_id into user_data */
-#define URING_UD_ENCODE(op, id)   (((uint64_t)(op) << 32) | (uint32_t)(id))
-#define URING_UD_OP(ud)           ((uint32_t)((ud) >> 32))
-#define URING_UD_ID(ud)           ((uint32_t)((ud) & 0xFFFFFFFF))
+#define URING_UD_ENCODE(op, id) (((uint64_t)(op) << 32) | (uint32_t)(id))
+#define URING_UD_OP(ud) ((uint32_t)((ud) >> 32))
+#define URING_UD_ID(ud) ((uint32_t)((ud) & 0xFFFFFFFF))
 
 struct uring_ctx {
-    struct io_uring  ring;
-    unsigned int     sq_entries;
-    unsigned int     cq_entries;
-    bool             sqpoll;          /* SQPOLL mode */
-    bool             bufs_registered; /* io_uring fixed buffers registered */
-    bool             files_registered;/* io_uring fixed files registered */
-    unsigned int     file_slots;      /* total fixed file slots */
-    bool             defer_submit;    /* batch SQEs; flush with uring_flush() */
-    bool             needs_flush;     /* unflushed SQEs are pending */
+    struct io_uring ring;
+    unsigned int sq_entries;
+    unsigned int cq_entries;
+    bool sqpoll; /* SQPOLL mode */
+    bool bufs_registered; /* io_uring fixed buffers registered */
+    bool files_registered; /* io_uring fixed files registered */
+    unsigned int file_slots; /* total fixed file slots */
+    bool defer_submit; /* batch SQEs; flush with uring_flush() */
+    bool needs_flush; /* unflushed SQEs are pending */
 
     /* Multishot recv buf ring — used for H2 client recv.
      * Separate allocation from the fixed-buffer registration; the existing
      * recv/send slabs stay pinned as fixed bufs for H1 and backend I/O.
      * NULL when not set up (falls back to single-shot io_uring_prep_recv). */
-    struct io_uring_buf_ring *recv_ring;       /* ring descriptor (kernel-mapped) */
-    uint8_t                  *recv_ring_mem;   /* backing buffer memory            */
-    uint32_t                  recv_ring_count; /* number of ring entries (pow-of-2) */
-    uint16_t                  recv_ring_bgid;  /* buffer group ID                  */
+    struct io_uring_buf_ring *recv_ring; /* ring descriptor (kernel-mapped) */
+    uint8_t *recv_ring_mem; /* backing buffer memory            */
+    uint32_t recv_ring_count; /* number of ring entries (pow-of-2) */
+    uint16_t recv_ring_bgid; /* buffer group ID                  */
 };
 
-int  uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll);
+int uring_init(struct uring_ctx *ctx, unsigned int entries, bool sqpoll);
 void uring_destroy(struct uring_ctx *ctx);
 
 /* Register fixed buffers for zero-copy pinned I/O.
  * iovecs[0..n-1] describe the buffers; must remain valid for the ring's lifetime.
  * On success, sets ctx->bufs_registered = true and returns 0. */
-int  uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n);
+int uring_register_bufs(struct uring_ctx *ctx, struct iovec *iovecs, uint32_t n);
 
 /* Register a sparse fixed file table of nslots entries.
  * Eliminates fdget/fdput on every SQE that sets IOSQE_FIXED_FILE.
  * On success, sets ctx->files_registered = true and returns 0. */
-int  uring_register_files_sparse(struct uring_ctx *ctx, unsigned int nslots);
+int uring_register_files_sparse(struct uring_ctx *ctx, unsigned int nslots);
 
 /* Install / remove an fd in the fixed file table at the given slot.
  * uring_remove_fd installs -1 (kernel sentinel for "empty slot"). */
-int  uring_install_fd(struct uring_ctx *ctx, unsigned int slot, int fd);
-int  uring_remove_fd(struct uring_ctx *ctx, unsigned int slot);
+int uring_install_fd(struct uring_ctx *ctx, unsigned int slot, int fd);
+int uring_remove_fd(struct uring_ctx *ctx, unsigned int slot);
 
 /* Set up a multishot recv buffer ring.
  * Allocates count (rounded up to next power-of-two) buffers of buf_size bytes
@@ -100,16 +101,14 @@ int  uring_remove_fd(struct uring_ctx *ctx, unsigned int slot);
  * On CQE: buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT; call
  * uring_recv_ring_return() after processing to put the buffer back.
  * Returns 0 on success, negative errno on failure. */
-int  uring_recv_ring_setup(struct uring_ctx *ctx, size_t buf_size,
-                            uint32_t count, uint16_t bgid);
+int uring_recv_ring_setup(struct uring_ctx *ctx, size_t buf_size, uint32_t count, uint16_t bgid);
 
 /* Return buffer buf_id to the ring after the data has been consumed. */
-void uring_recv_ring_return(struct uring_ctx *ctx, uint16_t buf_id,
-                             size_t buf_size);
+void uring_recv_ring_return(struct uring_ctx *ctx, uint16_t buf_id, size_t buf_size);
 
 /* Pointer to the data buffer for a given buf_id (valid until returned). */
-static inline uint8_t *uring_recv_ring_buf(const struct uring_ctx *ctx,
-                                            uint16_t buf_id, size_t buf_size)
+static inline uint8_t *uring_recv_ring_buf(const struct uring_ctx *ctx, uint16_t buf_id,
+                                           size_t buf_size)
 {
     return ctx->recv_ring_mem + (size_t)buf_id * buf_size;
 }
@@ -130,6 +129,7 @@ int uring_wait(struct uring_ctx *ctx, unsigned int min_events);
 int uring_prep_accept(struct uring_ctx *ctx, int server_fd, uint32_t conn_id);
 int uring_prep_recv(struct uring_ctx *ctx, int fd, void *buf, size_t len, uint32_t conn_id);
 int uring_prep_send(struct uring_ctx *ctx, int fd, const void *buf, size_t len, uint32_t conn_id);
-int uring_prep_connect(struct uring_ctx *ctx, int fd, struct sockaddr *addr, socklen_t addrlen, uint32_t conn_id);
+int uring_prep_connect(struct uring_ctx *ctx, int fd, struct sockaddr *addr, socklen_t addrlen,
+                       uint32_t conn_id);
 int uring_prep_close(struct uring_ctx *ctx, int fd, uint32_t conn_id);
 int uring_prep_timeout(struct uring_ctx *ctx, struct __kernel_timespec *ts, uint32_t conn_id);

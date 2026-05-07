@@ -12,9 +12,9 @@
  */
 
 struct acme_http01_server {
-    int      listen_fd;
-    int      port;
-    int      stop_pipe[2];     /* write 1 byte to [1] to stop the thread */
+    int listen_fd;
+    int port;
+    int stop_pipe[2]; /* write 1 byte to [1] to stop the thread */
 
     /* Current challenge (protected by challenge_lock) */
     pthread_mutex_t challenge_lock;
@@ -22,16 +22,15 @@ struct acme_http01_server {
     char challenge_keyauth[512];
 
     pthread_t thread;
-    int       running;
+    int running;
 };
 
 /* Bind + start background accept thread.  Returns 0 on success. */
-int  acme_http01_start(struct acme_http01_server *srv, int port);
+int acme_http01_start(struct acme_http01_server *srv, int port);
 
 /* Set active challenge.  Thread-safe; can be called from any thread. */
-void acme_http01_set_challenge(struct acme_http01_server *srv,
-                                const char *token,
-                                const char *key_auth);
+void acme_http01_set_challenge(struct acme_http01_server *srv, const char *token,
+                               const char *key_auth);
 
 /* Clear active challenge after it has been validated. */
 void acme_http01_clear_challenge(struct acme_http01_server *srv);

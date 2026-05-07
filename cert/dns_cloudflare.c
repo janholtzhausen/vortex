@@ -25,8 +25,8 @@
 #define CF_API_PORT 443
 
 struct cf_ctx {
-    char              api_token[512];
-    ptls_context_t   *tls_ctx;
+    char api_token[512];
+    ptls_context_t *tls_ctx;
 };
 
 /* ══════════════════════════════════════════════════════
@@ -46,12 +46,9 @@ struct cf_ctx {
  *
  * Returns 0 on success, -1 on error.
  */
-static int cf_https_request(struct cf_ctx *ctx,
-                             const char *method,
-                             const char *url,
-                             const char *auth_token,
-                             const char *body, size_t body_len,
-                             char **out_body, int *out_status)
+static int cf_https_request(struct cf_ctx *ctx, const char *method, const char *url,
+                            const char *auth_token, const char *body, size_t body_len,
+                            char **out_body, int *out_status)
 {
     if (strncmp(url, "https://", 8) != 0) {
         log_error("cf_dns", "non-https URL: %s", url);
@@ -78,7 +75,7 @@ static int cf_https_request(struct cf_ctx *ctx,
     /* TCP connect */
     struct addrinfo hints, *res0;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     char portstr[8];
     snprintf(portstr, sizeof(portstr), "%d", CF_API_PORT);
@@ -92,7 +89,8 @@ static int cf_https_request(struct cf_ctx *ctx,
         fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) continue;
         if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
+        close(fd);
+        fd = -1;
     }
     freeaddrinfo(res0);
     if (fd < 0) {
@@ -113,24 +111,24 @@ static int cf_https_request(struct cf_ctx *ctx,
     int hdr_len;
     if (body && body_len > 0) {
         hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-            "%s %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Authorization: Bearer %s\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n"
-            "User-Agent: vortex/0.1\r\n"
-            "\r\n",
-            method, path, host, auth_token, body_len);
+                           "%s %s HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "Authorization: Bearer %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Connection: close\r\n"
+                           "User-Agent: vortex/0.1\r\n"
+                           "\r\n",
+                           method, path, host, auth_token, body_len);
     } else {
         hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-            "%s %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Authorization: Bearer %s\r\n"
-            "Connection: close\r\n"
-            "User-Agent: vortex/0.1\r\n"
-            "\r\n",
-            method, path, host, auth_token);
+                           "%s %s HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "Authorization: Bearer %s\r\n"
+                           "Connection: close\r\n"
+                           "User-Agent: vortex/0.1\r\n"
+                           "\r\n",
+                           method, path, host, auth_token);
     }
 
     /* Send request via picotls */
@@ -139,8 +137,7 @@ static int cf_https_request(struct cf_ctx *ctx,
         ptls_buffer_t wbuf;
         ptls_buffer_init(&wbuf, wbuf_small, sizeof(wbuf_small));
         ptls_send(ptls, &wbuf, req_hdr, (size_t)hdr_len);
-        if (body && body_len > 0)
-            ptls_send(ptls, &wbuf, body, body_len);
+        if (body && body_len > 0) ptls_send(ptls, &wbuf, body, body_len);
         size_t wlen = wbuf.off;
         ssize_t written = write(fd, wbuf.base, wlen);
         ptls_buffer_dispose(&wbuf);
@@ -155,13 +152,22 @@ static int cf_https_request(struct cf_ctx *ctx,
     /* Read full response */
     size_t total = 0, cap = 65536;
     char *rbuf = malloc(cap);
-    if (!rbuf) { ptls_free(ptls); close(fd); return -1; }
+    if (!rbuf) {
+        ptls_free(ptls);
+        close(fd);
+        return -1;
+    }
 
     for (;;) {
         if (total + 1 >= cap) {
             cap *= 2;
             char *tmp = realloc(rbuf, cap);
-            if (!tmp) { free(rbuf); ptls_free(ptls); close(fd); return -1; }
+            if (!tmp) {
+                free(rbuf);
+                ptls_free(ptls);
+                close(fd);
+                return -1;
+            }
             rbuf = tmp;
         }
         uint8_t ibuf[8192];
@@ -183,7 +189,9 @@ static int cf_https_request(struct cf_ctx *ctx,
                 char *tmp = realloc(rbuf, cap);
                 if (!tmp) {
                     ptls_buffer_dispose(&plainbuf);
-                    free(rbuf); ptls_free(ptls); close(fd);
+                    free(rbuf);
+                    ptls_free(ptls);
+                    close(fd);
                     return -1;
                 }
                 rbuf = tmp;
@@ -221,7 +229,10 @@ static int cf_https_request(struct cf_ctx *ctx,
     size_t body_sz = (size_t)(rbuf + total - body_start);
 
     char *copy = malloc(body_sz + 1);
-    if (!copy) { free(rbuf); return -1; }
+    if (!copy) {
+        free(rbuf);
+        return -1;
+    }
     memcpy(copy, body_start, body_sz);
     copy[body_sz] = '\0';
     *out_body = copy;
@@ -234,20 +245,23 @@ static int cf_https_request(struct cf_ctx *ctx,
  *  JSON helpers (minimal, for Cloudflare API responses)
  * ══════════════════════════════════════════════════════ */
 
-static int cf_json_get_str(const char *json, const char *key,
-                            char *out, size_t out_max)
+static int cf_json_get_str(const char *json, const char *key, char *out, size_t out_max)
 {
     char needle[256];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     const char *p = strstr(json, needle);
     if (!p) return -1;
     p += strlen(needle);
-    while (*p == ' ' || *p == ':') p++;
+    while (*p == ' ' || *p == ':')
+        p++;
     if (*p != '"') return -1;
     p++;
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < out_max) {
-        if (*p == '\\') { p++; if (!*p) break; }
+        if (*p == '\\') {
+            p++;
+            if (!*p) break;
+        }
         out[i++] = *p++;
     }
     out[i] = '\0';
@@ -261,8 +275,7 @@ static int cf_json_get_str(const char *json, const char *key,
 static int get_root_domain(const char *name, char *out, size_t out_max)
 {
     const char *p = name;
-    if (strncmp(p, "_acme-challenge.", 16) == 0)
-        p += 16;
+    if (strncmp(p, "_acme-challenge.", 16) == 0) p += 16;
 
     const char *last_dot = strrchr(p, '.');
     if (!last_dot) {
@@ -293,8 +306,7 @@ static int cf_init(void **ctx_out, const char *api_token)
     struct cf_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return -1;
 
-    strncpy(ctx->api_token, api_token ? api_token : "",
-            sizeof(ctx->api_token) - 1);
+    strncpy(ctx->api_token, api_token ? api_token : "", sizeof(ctx->api_token) - 1);
 
     ctx->tls_ctx = tls_create_client_ctx(true);
     if (!ctx->tls_ctx) {
@@ -307,8 +319,8 @@ static int cf_init(void **ctx_out, const char *api_token)
     return 0;
 }
 
-static int cf_create_txt(void *ctx_ptr, const char *name, const char *value,
-                          char *record_id_out, size_t rid_max)
+static int cf_create_txt(void *ctx_ptr, const char *name, const char *value, char *record_id_out,
+                         size_t rid_max)
 {
     struct cf_ctx *ctx = (struct cf_ctx *)ctx_ptr;
 
@@ -319,28 +331,27 @@ static int cf_create_txt(void *ctx_ptr, const char *name, const char *value,
     }
 
     char zone_url[512];
-    snprintf(zone_url, sizeof(zone_url),
-        "https://api.cloudflare.com/client/v4/zones?name=%s", domain_root);
+    snprintf(zone_url, sizeof(zone_url), "https://api.cloudflare.com/client/v4/zones?name=%s",
+             domain_root);
 
     char *resp = NULL;
     int status = 0;
-    if (cf_https_request(ctx, "GET", zone_url, ctx->api_token,
-                         NULL, 0, &resp, &status) < 0) {
+    if (cf_https_request(ctx, "GET", zone_url, ctx->api_token, NULL, 0, &resp, &status) < 0) {
         log_error("cf_dns", "zone lookup request failed for %s", domain_root);
         return -1;
     }
     if (status != 200) {
-        log_error("cf_dns", "zone lookup returned %d for %s: %s",
-                  status, domain_root, resp ? resp : "");
+        log_error("cf_dns", "zone lookup returned %d for %s: %s", status, domain_root,
+                  resp ? resp : "");
         free(resp);
         return -1;
     }
 
     char zone_id[128] = "";
     const char *result_arr = strstr(resp ? resp : "", "\"result\"");
-    if (result_arr)
-        cf_json_get_str(result_arr, "id", zone_id, sizeof(zone_id));
-    free(resp); resp = NULL;
+    if (result_arr) cf_json_get_str(result_arr, "id", zone_id, sizeof(zone_id));
+    free(resp);
+    resp = NULL;
 
     if (zone_id[0] == '\0') {
         log_error("cf_dns", "no zone found for domain %s", domain_root);
@@ -351,30 +362,28 @@ static int cf_create_txt(void *ctx_ptr, const char *name, const char *value,
     /* Create the TXT record */
     char create_url[512];
     snprintf(create_url, sizeof(create_url),
-        "https://api.cloudflare.com/client/v4/zones/%s/dns_records", zone_id);
+             "https://api.cloudflare.com/client/v4/zones/%s/dns_records", zone_id);
 
     char body[1024];
-    snprintf(body, sizeof(body),
-        "{\"type\":\"TXT\",\"name\":\"%s\",\"content\":\"%s\",\"ttl\":60}",
-        name, value);
+    snprintf(body, sizeof(body), "{\"type\":\"TXT\",\"name\":\"%s\",\"content\":\"%s\",\"ttl\":60}",
+             name, value);
 
-    if (cf_https_request(ctx, "POST", create_url, ctx->api_token,
-                         body, strlen(body), &resp, &status) < 0) {
+    if (cf_https_request(ctx, "POST", create_url, ctx->api_token, body, strlen(body), &resp,
+                         &status) < 0) {
         log_error("cf_dns", "create TXT record request failed");
         return -1;
     }
     if (status != 200 && status != 201) {
-        log_error("cf_dns", "create TXT record returned %d: %s",
-                  status, resp ? resp : "");
+        log_error("cf_dns", "create TXT record returned %d: %s", status, resp ? resp : "");
         free(resp);
         return -1;
     }
 
     char record_id[128] = "";
     const char *res_obj = strstr(resp ? resp : "", "\"result\"");
-    if (res_obj)
-        cf_json_get_str(res_obj, "id", record_id, sizeof(record_id));
-    free(resp); resp = NULL;
+    if (res_obj) cf_json_get_str(res_obj, "id", record_id, sizeof(record_id));
+    free(resp);
+    resp = NULL;
 
     if (record_id[0] == '\0') {
         log_error("cf_dns", "no record id in create TXT response");
@@ -387,13 +396,11 @@ static int cf_create_txt(void *ctx_ptr, const char *name, const char *value,
         return -1;
     }
 
-    log_info("cf_dns", "created TXT record %s (zone=%s record=%s)",
-             name, zone_id, record_id);
+    log_info("cf_dns", "created TXT record %s (zone=%s record=%s)", name, zone_id, record_id);
     return 0;
 }
 
-static int cf_delete_txt(void *ctx_ptr, const char *zone_id_param,
-                          const char *record_id_packed)
+static int cf_delete_txt(void *ctx_ptr, const char *zone_id_param, const char *record_id_packed)
 {
     struct cf_ctx *ctx = (struct cf_ctx *)ctx_ptr;
 
@@ -408,8 +415,7 @@ static int cf_delete_txt(void *ctx_ptr, const char *zone_id_param,
         zone_id[zlen] = '\0';
         strncpy(record_id, colon + 1, sizeof(record_id) - 1);
     } else {
-        strncpy(zone_id, zone_id_param ? zone_id_param : "",
-                sizeof(zone_id) - 1);
+        strncpy(zone_id, zone_id_param ? zone_id_param : "", sizeof(zone_id) - 1);
         strncpy(record_id, record_id_packed, sizeof(record_id) - 1);
     }
 
@@ -420,13 +426,11 @@ static int cf_delete_txt(void *ctx_ptr, const char *zone_id_param,
 
     char del_url[512];
     snprintf(del_url, sizeof(del_url),
-        "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s",
-        zone_id, record_id);
+             "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zone_id, record_id);
 
     char *resp = NULL;
     int status = 0;
-    if (cf_https_request(ctx, "DELETE", del_url, ctx->api_token,
-                         NULL, 0, &resp, &status) < 0) {
+    if (cf_https_request(ctx, "DELETE", del_url, ctx->api_token, NULL, 0, &resp, &status) < 0) {
         log_error("cf_dns", "delete TXT record request failed");
         return -1;
     }
@@ -450,34 +454,52 @@ static void cf_destroy(void *ctx_ptr)
 }
 
 const struct dns_provider_ops cloudflare_dns_provider = {
-    .name       = "cloudflare",
-    .init       = cf_init,
+    .name = "cloudflare",
+    .init = cf_init,
     .create_txt = cf_create_txt,
     .delete_txt = cf_delete_txt,
-    .destroy    = cf_destroy,
+    .destroy = cf_destroy,
 };
 
 #else /* !VORTEX_PHASE_TLS */
 
 static int cf_init_stub(void **ctx, const char *api_token)
-{ (void)ctx; (void)api_token; return -1; }
+{
+    (void)ctx;
+    (void)api_token;
+    return -1;
+}
 
-static int cf_create_txt_stub(void *ctx, const char *name, const char *value,
-                               char *rid, size_t rmax)
-{ (void)ctx; (void)name; (void)value; (void)rid; (void)rmax; return -1; }
+static int cf_create_txt_stub(void *ctx, const char *name, const char *value, char *rid,
+                              size_t rmax)
+{
+    (void)ctx;
+    (void)name;
+    (void)value;
+    (void)rid;
+    (void)rmax;
+    return -1;
+}
 
-static int cf_delete_txt_stub(void *ctx, const char *zone_id,
-                               const char *record_id)
-{ (void)ctx; (void)zone_id; (void)record_id; return -1; }
+static int cf_delete_txt_stub(void *ctx, const char *zone_id, const char *record_id)
+{
+    (void)ctx;
+    (void)zone_id;
+    (void)record_id;
+    return -1;
+}
 
-static void cf_destroy_stub(void *ctx) { (void)ctx; }
+static void cf_destroy_stub(void *ctx)
+{
+    (void)ctx;
+}
 
 const struct dns_provider_ops cloudflare_dns_provider = {
-    .name       = "cloudflare",
-    .init       = cf_init_stub,
+    .name = "cloudflare",
+    .init = cf_init_stub,
     .create_txt = cf_create_txt_stub,
     .delete_txt = cf_delete_txt_stub,
-    .destroy    = cf_destroy_stub,
+    .destroy = cf_destroy_stub,
 };
 
 #endif /* VORTEX_PHASE_TLS */

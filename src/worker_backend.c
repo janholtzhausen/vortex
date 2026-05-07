@@ -19,17 +19,15 @@ static uint32_t backend_timeout_ms_for(struct worker *w, uint32_t cid)
     return tmo_ms ? tmo_ms : 30000;
 }
 
-static const char *backend_server_name(const struct backend_config *bcfg,
-                                       char *fallback, size_t fallback_sz)
+static const char *backend_server_name(const struct backend_config *bcfg, char *fallback,
+                                       size_t fallback_sz)
 {
-    if (bcfg->sni[0])
-        return bcfg->sni;
+    if (bcfg->sni[0]) return bcfg->sni;
 
     const char *addr = bcfg->address;
     const char *colon = strrchr(addr, ':');
     size_t host_len = colon ? (size_t)(colon - addr) : strlen(addr);
-    if (host_len >= fallback_sz)
-        host_len = fallback_sz - 1;
+    if (host_len >= fallback_sz) host_len = fallback_sz - 1;
     memcpy(fallback, addr, host_len);
     fallback[host_len] = '\0';
     return fallback;
@@ -42,8 +40,7 @@ bool backend_uses_tls(struct worker *w, uint32_t cid)
     return (h->flags & CONN_FLAG_BACKEND_TLS) != 0;
 }
 
-int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
-                          uint32_t cid)
+int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg, uint32_t cid)
 {
 #ifdef VORTEX_PHASE_TLS
     struct conn_hot *h = conn_hot(&w->pool, cid);
@@ -52,30 +49,22 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
     const char *server_name;
     uint32_t timeout_ms;
 
-    if (!bcfg->tls)
-        return 0;
-    if (!w->backend_tls_client_ctx || h->backend_fd < 0)
-        return -1;
+    if (!bcfg->tls) return 0;
+    if (!w->backend_tls_client_ctx || h->backend_fd < 0) return -1;
 
     server_name = backend_server_name(bcfg, sni_buf, sizeof(sni_buf));
-    timeout_ms  = backend_timeout_ms_for(w, cid);
+    timeout_ms = backend_timeout_ms_for(w, cid);
 
     struct tls_session_ticket *resume = NULL;
     if (h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS)
         resume = w->backend_tls_sessions[h->route_idx][h->backend_idx];
 
     struct tls_session_ticket *new_ticket = NULL;
-    ptls_t *ptls = tls_backend_connect(w->backend_tls_client_ctx,
-                                        h->backend_fd,
-                                        server_name,
-                                        timeout_ms,
-                                        resume,
-                                        &new_ticket);
-    if (!ptls)
-        return -1;
+    ptls_t *ptls = tls_backend_connect(w->backend_tls_client_ctx, h->backend_fd, server_name,
+                                       timeout_ms, resume, &new_ticket);
+    if (!ptls) return -1;
 
-    if (new_ticket && h->route_idx < VORTEX_MAX_ROUTES &&
-        h->backend_idx < VORTEX_MAX_BACKENDS) {
+    if (new_ticket && h->route_idx < VORTEX_MAX_ROUTES && h->backend_idx < VORTEX_MAX_BACKENDS) {
         free(w->backend_tls_sessions[h->route_idx][h->backend_idx]);
         w->backend_tls_sessions[h->route_idx][h->backend_idx] = new_ticket;
     } else {
@@ -87,7 +76,9 @@ int backend_tls_handshake(struct worker *w, const struct backend_config *bcfg,
     h->flags &= ~CONN_FLAG_BACKEND_POOLED;
     return 0;
 #else
-    (void)w; (void)bcfg; (void)cid;
+    (void)w;
+    (void)bcfg;
+    (void)cid;
     return -1;
 #endif
 }
@@ -99,8 +90,7 @@ int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, siz
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
     ptls_t *ptls = (ptls_t *)cold->backend_ssl;
 
-    if (!ptls)
-        return -1;
+    if (!ptls) return -1;
 
     /* ptls_send encrypts and writes to a buffer; we then write to socket */
     uint8_t wbuf_small[16384];
@@ -129,7 +119,10 @@ int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, siz
     ptls_buffer_dispose(&wbuf);
     return (int)len;
 #else
-    (void)w; (void)cid; (void)buf; (void)len;
+    (void)w;
+    (void)cid;
+    (void)buf;
+    (void)len;
     return -1;
 #endif
 }
@@ -141,8 +134,7 @@ int backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t l
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
     ptls_t *ptls = (ptls_t *)cold->backend_ssl;
 
-    if (!ptls)
-        return -1;
+    if (!ptls) return -1;
 
     /* Read encrypted data from the backend socket */
     uint8_t ibuf[16384];
@@ -151,8 +143,7 @@ int backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t l
         if (errno == EINTR || errno == EAGAIN) return 0;
         return -1;
     }
-    if (nr == 0)
-        return 0; /* EOF */
+    if (nr == 0) return 0; /* EOF */
 
     /* Decrypt via picotls */
     ptls_buffer_t plainbuf;
@@ -168,12 +159,14 @@ int backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t l
     }
 
     size_t out_len = plainbuf.off < len ? plainbuf.off : len;
-    if (out_len > 0)
-        memcpy(buf, plainbuf.base, out_len);
+    if (out_len > 0) memcpy(buf, plainbuf.base, out_len);
     ptls_buffer_dispose(&plainbuf);
     return (int)out_len;
 #else
-    (void)w; (void)cid; (void)buf; (void)len;
+    (void)w;
+    (void)cid;
+    (void)buf;
+    (void)len;
     return -1;
 #endif
 }
@@ -188,27 +181,26 @@ bool cb_is_open(struct worker *w, int ri, int bi, uint64_t now_ns)
     return until != 0 && now_ns < until;
 }
 
-void cb_record_failure(struct worker *w, int ri, int bi, uint64_t now_ns,
-                       uint32_t cfg_threshold, uint32_t cfg_open_ms)
+void cb_record_failure(struct worker *w, int ri, int bi, uint64_t now_ns, uint32_t cfg_threshold,
+                       uint32_t cfg_open_ms)
 {
     uint32_t threshold = cfg_threshold ? cfg_threshold : CB_DEFAULT_THRESHOLD;
-    uint64_t open_ms   = cfg_open_ms   ? cfg_open_ms   : CB_DEFAULT_OPEN_MS;
+    uint64_t open_ms = cfg_open_ms ? cfg_open_ms : CB_DEFAULT_OPEN_MS;
     uint32_t count = ++w->backend_cb[ri][bi].fail_count;
     if (count >= threshold) {
         w->backend_cb[ri][bi].open_until_ns = now_ns + open_ms * 1000000ULL;
         log_warn("circuit_breaker",
-            "route=%d backend=%d OPEN after %u consecutive failures (retry in %llums)",
-            ri, bi, count, (unsigned long long)open_ms);
+                 "route=%d backend=%d OPEN after %u consecutive failures (retry in %llums)", ri, bi,
+                 count, (unsigned long long)open_ms);
     }
 }
 
 void cb_record_success(struct worker *w, int ri, int bi)
 {
-    if (w->backend_cb[ri][bi].fail_count > 0 ||
-        w->backend_cb[ri][bi].open_until_ns != 0) {
+    if (w->backend_cb[ri][bi].fail_count > 0 || w->backend_cb[ri][bi].open_until_ns != 0) {
         log_info("circuit_breaker", "route=%d backend=%d CLOSED (probe succeeded)", ri, bi);
     }
-    w->backend_cb[ri][bi].fail_count    = 0;
+    w->backend_cb[ri][bi].fail_count = 0;
     w->backend_cb[ri][bi].open_until_ns = 0;
 }
 
@@ -232,8 +224,7 @@ int select_available_backend(struct worker *w, int ri, uint32_t client_ip)
     int primary = router_select_backend(&w->router, ri, client_ip);
     for (int i = 0; i < n; i++) {
         int bi = (primary + i) % n;
-        if (!cb_is_open(w, ri, bi, now_ns))
-            return bi;
+        if (!cb_is_open(w, ri, bi, now_ns)) return bi;
     }
     return -1; /* all backends open — caller sends 503 */
 }
@@ -260,8 +251,7 @@ void backend_deadline_set(struct worker *w, uint32_t cid, uint32_t timeout_ms)
  * The caller must NOT read from or write to the fd until VORTEX_OP_CONNECT
  * completes on the io_uring ring.
  */
-int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
-                        uint32_t cid)
+int begin_async_connect(struct worker *w, const struct backend_config *bcfg, uint32_t cid)
 {
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
 
@@ -295,8 +285,7 @@ int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
         for (int pass = 0; pass < 2 && !got; pass++) {
             int family = (pass == 0) ? AF_INET : AF_UNSPEC;
             for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
-                if (family != AF_UNSPEC && rp->ai_family != family)
-                    continue;
+                if (family != AF_UNSPEC && rp->ai_family != family) continue;
                 if (rp->ai_addrlen <= sizeof(cold->backend_addr)) {
                     memcpy(&cold->backend_addr, rp->ai_addr, rp->ai_addrlen);
                     cold->backend_addrlen = (socklen_t)rp->ai_addrlen;
@@ -306,7 +295,10 @@ int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
             }
         }
         freeaddrinfo(res);
-        if (!got) { log_error("async_connect", "no usable addr for %s", addr_str); return -1; }
+        if (!got) {
+            log_error("async_connect", "no usable addr for %s", addr_str);
+            return -1;
+        }
     }
 
     int fd = socket(cold->backend_addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -340,23 +332,24 @@ int begin_async_connect(struct worker *w, const struct backend_config *bcfg,
     if (bcfg->pool_size > 0) {
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
         int idle = 5, intvl = 5, cnt = 3;
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
     }
 
     /* TCP congestion control — per-route override, then global, then kernel default */
     const char *cc = w->cfg->routes[ri].congestion_control[0]
-                     ? w->cfg->routes[ri].congestion_control
-                     : w->cfg->congestion_control;
-    if (cc[0])
-        setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, (socklen_t)strlen(cc));
+                         ? w->cfg->routes[ri].congestion_control
+                         : w->cfg->congestion_control;
+    if (cc[0]) setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, cc, (socklen_t)strlen(cc));
 
     /* Issue async CONNECT — returns EINPROGRESS immediately */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
-    if (!sqe) { close(fd); return -1; }
-    io_uring_prep_connect(sqe, fd,
-        (struct sockaddr *)&cold->backend_addr, cold->backend_addrlen);
+    if (!sqe) {
+        close(fd);
+        return -1;
+    }
+    io_uring_prep_connect(sqe, fd, (struct sockaddr *)&cold->backend_addr, cold->backend_addrlen);
     sqe->user_data = URING_UD_ENCODE(VORTEX_OP_CONNECT, cid);
     uring_submit(&w->uring);
 

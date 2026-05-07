@@ -17,8 +17,8 @@
 
 /* Per-IP rate limiting entry — token bucket */
 struct rate_limit_entry {
-    __u64 tokens;           /* Current token count (scaled by RATE_SCALE) */
-    __u64 last_refill_ns;   /* ktime_get_ns() at last refill */
+    __u64 tokens; /* Current token count (scaled by RATE_SCALE) */
+    __u64 last_refill_ns; /* ktime_get_ns() at last refill */
 };
 
 struct ip6_addr {
@@ -33,20 +33,20 @@ struct vortex_metrics {
     __u64 dropped_blocklist;
     __u64 dropped_invalid;
     __u64 passed;
-    __u64 dropped_conntrack;   /* packets dropped due to invalid TCP connection state */
+    __u64 dropped_conntrack; /* packets dropped due to invalid TCP connection state */
 };
 
 /* Rate limit scale factor: tokens stored as (real_tokens * RATE_SCALE) */
-#define RATE_SCALE          1000000ULL
+#define RATE_SCALE 1000000ULL
 /* Default tokens per second per IP (used when rate_config_map not yet set) */
-#define DEFAULT_TOKENS_PER_SEC  1000ULL
+#define DEFAULT_TOKENS_PER_SEC 1000ULL
 /* Default burst (initial bucket fill) */
-#define DEFAULT_BURST_TOKENS    2000ULL
+#define DEFAULT_BURST_TOKENS 2000ULL
 
 /* Global rate limit configuration — written by userspace, read by XDP */
 struct rate_config {
-    __u64 tokens_per_sec;   /* New connections allowed per second per IP (0 = default) */
-    __u64 burst;            /* Max burst size in connections (0 = use default) */
+    __u64 tokens_per_sec; /* New connections allowed per second per IP (0 = default) */
+    __u64 burst; /* Max burst size in connections (0 = use default) */
 };
 
 /* ------------------------------------------------------------------ */
@@ -54,15 +54,15 @@ struct rate_config {
 /* ------------------------------------------------------------------ */
 
 /* TCP connection states tracked in XDP */
-#define CT_SYN_SENT    1   /* SYN seen, awaiting ACK to complete handshake */
-#define CT_ESTABLISHED 2   /* Three-way handshake complete, data flowing */
-#define CT_FIN_WAIT    3   /* FIN seen from one side, waiting for close */
-#define CT_CLOSING     4   /* Both sides have sent FIN */
+#define CT_SYN_SENT 1 /* SYN seen, awaiting ACK to complete handshake */
+#define CT_ESTABLISHED 2 /* Three-way handshake complete, data flowing */
+#define CT_FIN_WAIT 3 /* FIN seen from one side, waiting for close */
+#define CT_CLOSING 4 /* Both sides have sent FIN */
 
 /* Idle timeouts — connections not updated within these limits are expired */
-#define CT_TIMEOUT_SYN_NS  (30ULL  * 1000000000ULL)  /* 30 s: incomplete handshake */
-#define CT_TIMEOUT_EST_NS  (120ULL * 1000000000ULL)  /* 120 s: idle established    */
-#define CT_TIMEOUT_FIN_NS  (30ULL  * 1000000000ULL)  /* 30 s: half-closed          */
+#define CT_TIMEOUT_SYN_NS (30ULL * 1000000000ULL) /* 30 s: incomplete handshake */
+#define CT_TIMEOUT_EST_NS (120ULL * 1000000000ULL) /* 120 s: idle established    */
+#define CT_TIMEOUT_FIN_NS (30ULL * 1000000000ULL) /* 30 s: half-closed          */
 
 /* Maximum number of simultaneously tracked connections */
 #define CT_MAP_MAX_ENTRIES 524288
@@ -73,24 +73,24 @@ struct conn_tuple {
     __be32 dst_ip;
     __be16 src_port;
     __be16 dst_port;
-    __u8   proto;
-    __u8   _pad[3];   /* must be zero — part of the map key */
+    __u8 proto;
+    __u8 _pad[3]; /* must be zero — part of the map key */
 };
 
 struct conn_tuple_v6 {
     struct ip6_addr src_ip;
     struct ip6_addr dst_ip;
-    __be16          src_port;
-    __be16          dst_port;
-    __u8            proto;
-    __u8            _pad[3];
+    __be16 src_port;
+    __be16 dst_port;
+    __u8 proto;
+    __u8 _pad[3];
 };
 
 /* Per-connection tracking state */
 struct conn_state {
-    __u8  tcp_state;     /* CT_SYN_SENT / CT_ESTABLISHED / CT_FIN_WAIT / CT_CLOSING */
-    __u8  _pad[7];
-    __u64 last_seen_ns;  /* bpf_ktime_get_ns() at last matching ingress packet */
+    __u8 tcp_state; /* CT_SYN_SENT / CT_ESTABLISHED / CT_FIN_WAIT / CT_CLOSING */
+    __u8 _pad[7];
+    __u64 last_seen_ns; /* bpf_ktime_get_ns() at last matching ingress packet */
 };
 
 /* ------------------------------------------------------------------ */
@@ -102,7 +102,7 @@ struct conn_state {
 
 /* Port configuration map - stores which ports vortex protects */
 struct port_config {
-    __be16 ports[MAX_PROTECTED_PORTS];  /* Ports in network byte order */
-    __u8   count;                       /* Number of active ports (0-16) */
-    __u8   _pad[7];                     /* Padding for alignment */
+    __be16 ports[MAX_PROTECTED_PORTS]; /* Ports in network byte order */
+    __u8 count; /* Number of active ports (0-16) */
+    __u8 _pad[7]; /* Padding for alignment */
 };

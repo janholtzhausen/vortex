@@ -20,16 +20,11 @@
  * Returns 0 on success, -1 on error.
  * *resp_out is heap-allocated; caller must free.
  */
-int https_request(struct acme_client *cl,
-                  const char *method,
-                  const char *url,
-                  const char *content_type,   /* NULL → "application/jose+json" */
-                  const char *body,
-                  size_t body_len,
-                  int   *status_out,
-                  char  *location_out, size_t loc_max,
-                  char  *nonce_out,    size_t nonce_max,
-                  char **resp_out,     size_t *resp_len_out);
+int https_request(struct acme_client *cl, const char *method, const char *url,
+                  const char *content_type, /* NULL → "application/jose+json" */
+                  const char *body, size_t body_len, int *status_out, char *location_out,
+                  size_t loc_max, char *nonce_out, size_t nonce_max, char **resp_out,
+                  size_t *resp_len_out);
 
 /*
  * Build a JWS-signed request body (RFC 7515 / RFC 8555).
@@ -37,16 +32,11 @@ int https_request(struct acme_client *cl,
  * thumbprint may be NULL (only needed for newAccount JWK).
  * Returns heap-allocated JSON string or NULL on error.  Caller must free.
  */
-char *make_jws(const uint8_t *priv32, const uint8_t *pub64,
-               const char *nonce,
-               const char *url,
-               const char *payload_json,
-               const char *kid,
-               const char *thumbprint);
+char *make_jws(const uint8_t *priv32, const uint8_t *pub64, const char *nonce, const char *url,
+               const char *payload_json, const char *kid, const char *thumbprint);
 
 /*
- * Encode a raw 32-byte P-256 private key as PKCS#8 PEM
- * ("-----BEGIN PRIVATE KEY-----" ... "-----END PRIVATE KEY-----").
+ * Encode a raw 32-byte P-256 private key as PKCS#8 PEM.
  * Returns 0 on success, -1 if out_max is too small.
  */
 int pkcs8_pem_from_priv(const uint8_t priv[32], char *out, size_t out_max);
@@ -59,9 +49,7 @@ int pkcs8_pem_from_priv(const uint8_t priv[32], char *out, size_t out_max);
  *   *csr_len   — length of DER blob
  * Returns 0 on success, -1 on error.
  */
-int make_csr_der(const char *domain,
-                 uint8_t priv_out[32],
-                 uint8_t **csr_out, size_t *csr_len);
+int make_csr_der(const char *domain, uint8_t priv_out[32], uint8_t **csr_out, size_t *csr_len);
 
 /*
  * Decode the first "-----BEGIN CERTIFICATE-----" block from PEM → DER.
