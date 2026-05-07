@@ -280,7 +280,28 @@ Release builds enable `-fstack-protector-strong` and `-D_FORTIFY_SOURCE=2`. `-We
 ### Run tests
 
 ```sh
-ctest --test-dir build-release --output-on-failure
+ctest --test-dir build --output-on-failure --parallel "$(nproc)"
+```
+
+### Code quality
+
+`.clang-format` is checked into the repo (LLVM style, indent=4, column=100). Enforce before
+committing:
+
+```sh
+clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' | grep -v 'bpf/vmlinux.h')
+```
+
+Auto-fix in place:
+
+```sh
+clang-format -i $(git ls-files '*.c' '*.h' | grep -v 'bpf/vmlinux.h')
+```
+
+Use `ccache` for faster iterative builds:
+
+```sh
+cmake -B build -DCMAKE_C_COMPILER_LAUNCHER=ccache
 ```
 
 ### Fuzzer (clang only)
@@ -399,8 +420,20 @@ global:
   run_as_user: ""           # Drop privileges to this user after socket/BPF init.
                             # Empty = run as current user (warn if root).
                             # Example: "vortex"
+  sqpoll: false             # Enable io_uring SQPOLL: kernel thread polls SQ, eliminates
+                            # submit syscall on the data path. Requires CAP_SYS_ADMIN.
+  hugepages: false          # Use 2 MB huge pages for connection buffer slabs.
+                            # Requires vm.nr_hugepages to be set on the host.
+  server_header: ""         # Global Server header sent to clients. Default value is
+                            # a spoofed Apache/OpenVMS string. Set "none" to pass
+                            # backend Server header through.
+  congestion_control: ""    # TCP congestion control for backend connections.
+                            # Empty = kernel default (cubic). e.g. "bbr".
+                            # Check /proc/sys/net/ipv4/tcp_allowed_congestion_control.
   max_request_header_bytes: 32768  # Reject HTTP/1.1 requests whose header block
                                    # exceeds this size (default 32 KB).
+  max_request_body_mb: 8    # Reject buffered request bodies larger than this (MB).
+                            # Also configurable as max_request_body_bytes for byte precision.
 
 tls:
   min_version: "1.2"        # "1.2" or "1.3"
@@ -451,6 +484,11 @@ metrics:
   port: 9090
   path: "/metrics"
 
+dashboard:
+  enabled: false
+  bind_address: "127.0.0.1"
+  port: 9091                # WebSocket-fed live status view at http://<bind>:<port>/
+
 routes:
   # HTTP reverse proxy route
   - hostname: "api.example.com"
@@ -492,8 +530,10 @@ routes:
       - address: "10.0.0.1:8080"
         weight: 3
         pool_size: 0
-      - address: "10.0.0.2:8080"
+      - address: "https://10.0.0.3:8443"   # HTTPS backend — TLS terminated at origin
         weight: 1
+        verify_peer: true                   # Verify origin cert chain and hostname (default: true for https://)
+        insecure_skip_verify: false         # Set true to skip cert verification (not recommended)
     cache:
       enabled: true
       ttl: 60
@@ -616,8 +656,9 @@ All metrics are exposed at `http://127.0.0.1:9090/metrics` (configurable).
 - PID file is created with `O_EXCL|O_NOFOLLOW` — pre-existing symlinks are rejected; a stale regular file owned by root is removed and retried
 
 ### Build Hardening
-- Release builds: `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`
+- Release builds: `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, `-O3 -flto`
 - All build types: `-Werror=format-security` (format-string bugs are hard compile errors)
+- Linker: `-pie -Wl,-z,relro,-z,now` — PIE executable, full RELRO (read-only GOT at startup)
 - Debug builds: AddressSanitizer + UBSan
 - libFuzzer target for HTTP/1.1 parser available via `-DVORTEX_FUZZ=ON`
 
@@ -666,7 +707,7 @@ When kTLS is not available (negotiated cipher not supported, older kernel), the 
 
 - **Load balancer — least_conn** uses process-wide active backend counters and is approximate across workers/threads rather than globally serialized
 - **Backend TLS** (`https://` origins) offloads `SSL_connect` to the shared TLS pool, but `SSL_write`/`SSL_read` still run synchronously in the worker thread after the handshake completes. A slow or unresponsive HTTPS backend during request or response I/O can stall all connections on that worker until the operation completes or times out. Set `backend_timeout_ms` to a low value (e.g. `5000`) for TLS backend routes to limit the blast radius.
-- **Backend TLS verification** is enabled by default. Per backend, set `verify_peer: false` or `insecure_skip_verify: true` to ignore certificate-chain and hostname validity checks for that origin.
+- **Backend TLS verification** is enabled by default for `https://` origins. Per backend, set `verify_peer: false` or `insecure_skip_verify: true` to disable certificate-chain and hostname checks for that origin.
 - **Single-segment caching** — full one-buffer responses are cached immediately; chunked responses use a bounded reassembly path and are cached only after full decode
 - **WebSocket relay** uses one in-flight io_uring recv/send chain per direction and relies on socket backpressure rather than deep proxy-side queues
 - **Config reload** rejects route/backend topology changes on SIGHUP; changing route order, backend order, or backend counts still requires a restart

@@ -1,38 +1,22 @@
-# Dashboard / State Notes
+# Immediate TODO
+
+No blocking issues as of v1.0.13.
 
 ## Current state
-- Dashboard implementation exists and is wired into the build and runtime.
-- Config support for `dashboard.enabled`, `dashboard.bind_address`, and `dashboard.port` is in place.
-- `src/dashboard.c` is built and the dashboard can be served on `http://127.0.0.1:9091/`.
-- Version `0.6.25` was built, deployed, and installed on `debian@10.76.8.2`.
 
-## Completed in 0.6.25
-- Added configurable buffered request-body limits for HTTP/2 and HTTP/3/QUIC:
-  - `global.max_request_body_mb`
-  - `global.max_request_body_bytes`
-- Enforced those limits in the H2 and H3 request buffering paths.
-- Added TLS handshake-pool metrics:
-  - queue depth
-  - active handshakes
-  - submitted / completed / failed / dropped totals
-- Fixed the injected HSTS header length bug that caused `ERR_HTTP2_PROTOCOL_ERROR` on the `*.netwatch.tv` browser checks.
+- All 5 unit tests pass (`ctest --test-dir build`)
+- clang-format enforced across all sources (`.clang-format` in root)
+- Gauntlet quality gates: build, format, cppcheck, clang-tidy, semgrep, gitleaks, trivy — all pass
+- Service running at `debian@10.76.8.2`, v1.0.13
 
-## Verification state
-- The required browser-level `netwatch-browser.spec.js` checks passed after deployment.
-- Authenticated HTTP/2 curl to `https://nzbget.netwatch.tv/` is clean after deployment.
+## Known remaining clang-tidy noise (non-blocking)
 
-## Remaining known issues
-- The broader Playwright suite still has 7 failures outside the required browser gate:
-  - 6 `netwatch-equivalence` failures
-  - 1 `sonarr-console` failure
-- The observed failures are in two buckets:
-  - equivalence tests hitting intermittent `ERR_CONNECTION_REFUSED` / content mismatches
-  - Sonarr WebSocket/auth handling producing console errors
-- Local C test targets are still misconfigured:
-  - `ctest` discovers no tests from the default build
-  - explicit test targets fail because their include paths still reference `../src/*.h` while headers live under `include/`
-
-## Next useful follow-ups
-- Fix the test CMake/include-path setup so `test_config`, `test_log`, and `test_cache` build and run normally.
-- Investigate the remaining equivalence failures separately from the request-limit/TLS-pool work.
-- Investigate Sonarr WebSocket/auth handling behind the proxy.
+- `src/auth.c` — `bugprone-implicit-widening-of-multiplication-result` on uint32_t
+  arithmetic in scrypt BlockMix/ROMix. Malloc overflow risk already fixed with `(size_t)` casts;
+  remaining hits are pointer-arithmetic widens that are safe for normal scrypt parameters (r ≤ 8).
+- `src/conn.c` — `bugprone-multi-level-implicit-pointer-conversion` on `calloc → uint8_t **`.
+  Valid C; clang-tidy being pedantic about `void *` multi-level promotion.
+- `src/config.c` — `bugprone-branch-clone` in YAML state machine. Intentional fall-through
+  shared handler paths.
+- `cert/acme_client.c` — `clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling`
+  on memcpy/memset. `_s`-variants (Annex K) are not available on Linux glibc; false positive.
