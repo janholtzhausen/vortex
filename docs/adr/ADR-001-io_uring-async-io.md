@@ -29,4 +29,4 @@ Use `io_uring` (Linux 5.1+) as sole async I/O mechanism. One ring per worker thr
 
 - Minimum kernel: 5.19 (for full fixed-file + multishot + IORING_OP_CONNECT support used here)
 - Worker thread is a run-to-completion event loop — any blocking call (DNS, TLS handshake for backends) stalls all connections on that worker. Mitigated by offloading TLS to `tls_pool` and DNS resolution at startup.
-- kTLS TX and `send_zc` / `begin_splice` are gated on `!CONN_FLAG_KTLS_TX` — kernel 6.8 incompatibility, tracked in CLAUDE.md Known Constraints.
+- kTLS TX and `send_zc` / `begin_splice` are gated on `!CONN_FLAG_KTLS_TX` — kernel 6.8 incompatibility; do not remove these guards.
