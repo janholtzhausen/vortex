@@ -42,7 +42,7 @@ add_executable(test_cache
     test_cache.c
     ../src/cache.c
     ../src/log.c
-    ../src/worker_cache.c
+    ../src/chunked.c
     ../src/simd.c
 )
 target_include_directories(test_cache PRIVATE

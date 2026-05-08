@@ -1,5 +1,5 @@
 #include "cache.h"
-#include "conn.h"
+#include "chunked.h"
 #include "log.h"
 
 #include <stdio.h>
@@ -7,20 +7,6 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stdbool.h>
-
-/* chunked_decode_append compiled from worker_cache.c — stub unreachable deps */
-bool chunked_decode_append(struct conn_cold *cold, const uint8_t *data, size_t len);
-/* Stubs for worker_cache.c symbols not needed by chunked_decode_append */
-void uring_submit(void *u)
-{
-    (void)u;
-}
-void conn_close(void *w, uint32_t cid, bool e)
-{
-    (void)w;
-    (void)cid;
-    (void)e;
-}
 
 static int g_passed = 0;
 static int g_failed = 0;

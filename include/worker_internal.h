@@ -147,8 +147,7 @@ static inline size_t b64_encode(const char *src, size_t slen, char *dst, size_t 
 #define FIXED_FD_CLIENT(w, cid) ((int)(1 + (cid)))
 #define FIXED_FD_BACKEND(w, cid) ((int)(1 + (w)->pool.capacity + (cid)))
 
-/* Maximum body size to accumulate for chunked TE caching (4 MB) */
-#define CHUNK_MAX_BODY (4u * 1024u * 1024u)
+#include "chunked.h" /* CHUNK_MAX_BODY + chunked_decode_append */
 
 /* Circuit breaker defaults */
 #define CB_DEFAULT_THRESHOLD 3

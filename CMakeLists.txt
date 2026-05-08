@@ -25,7 +25,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(VORTEX_MARCH "native" CACHE STRING "GCC/Clang -march value (native, x86-64-v3, znver3, etc.)")
+set(VORTEX_MARCH "x86-64-v2" CACHE STRING "GCC/Clang -march value (x86-64-v2, x86-64-v3, native, etc.); default is generic baseline")
 set(CMAKE_C_FLAGS_RELEASE        "-O3 -march=${VORTEX_MARCH} -mtune=${VORTEX_MARCH} -DNDEBUG -flto -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE")
 set(CMAKE_C_FLAGS_DEBUG          "-O0 -g3 -fsanitize=address,undefined -DVORTEX_DEBUG -fPIE")
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE")
@@ -67,37 +67,46 @@ else()
     message(STATUS "nghttp2: not found — HTTP/2 disabled (apt-get install libnghttp2-dev)")
 endif()
 
-# ---- picotls (required for TLS phase) ----
+# ---- TLS via picotls ----
+option(VORTEX_TLS "Enable TLS (requires picotls). ON by default; set OFF to build a plain HTTP-only proxy." ON)
 set(PICOTLS_SRC_DIR "/tmp/picotls" CACHE PATH "picotls source dir")
 set(PICOTLS_BUILD_DIR "/tmp/picotls/build" CACHE PATH "picotls build dir")
-if(EXISTS "${PICOTLS_SRC_DIR}/include/picotls.h" AND
-   EXISTS "${PICOTLS_BUILD_DIR}/libpicotls-core.a" AND
-   EXISTS "${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a")
+if(VORTEX_TLS)
+    if(NOT EXISTS "${PICOTLS_SRC_DIR}/include/picotls.h" OR
+       NOT EXISTS "${PICOTLS_BUILD_DIR}/libpicotls-core.a" OR
+       NOT EXISTS "${PICOTLS_BUILD_DIR}/libpicotls-minicrypto.a")
+        message(FATAL_ERROR
+            "VORTEX_TLS=ON but picotls not found.\n"
+            "  Expected: ${PICOTLS_SRC_DIR}/include/picotls.h\n"
+            "            ${PICOTLS_BUILD_DIR}/libpicotls-core.a\n"
+            "  Build picotls: git clone https://github.com/h2o/picotls /tmp/picotls && "
+            "cd /tmp/picotls && git submodule update --init && "
+            "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j\$(nproc)\n"
+            "  Or disable TLS: cmake -DVORTEX_TLS=OFF ...")
+    endif()
     set(PICOTLS_AVAILABLE TRUE)
     message(STATUS "picotls found at ${PICOTLS_SRC_DIR}")
 else()
     set(PICOTLS_AVAILABLE FALSE)
-    message(WARNING "picotls not found at ${PICOTLS_SRC_DIR} — TLS phase will not compile")
+    message(STATUS "VORTEX_TLS=OFF — TLS and ACME disabled (plain HTTP proxy only)")
 endif()
 
 # ---- BPF compilation ----
 find_program(CLANG_BPF clang REQUIRED)
 
-# Generate vmlinux.h from running kernel if not present
+# vmlinux.h must be pre-generated and committed; it is kernel-version-specific and
+# must NOT be auto-generated at configure time (that would silently couple the build
+# to the host kernel). Regenerate manually with:
+#   bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
+#   git add bpf/vmlinux.h && git commit -m "bpf: update vmlinux.h for kernel X.Y"
+# Or use tools/gen_vmlinux.sh which wraps this step.
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/bpf/vmlinux.h")
-    message(STATUS "Generating bpf/vmlinux.h from running kernel...")
-    execute_process(
-        COMMAND bpftool btf dump file /sys/kernel/btf/vmlinux format c
-        OUTPUT_FILE "${CMAKE_SOURCE_DIR}/bpf/vmlinux.h"
-        RESULT_VARIABLE VMLINUX_RESULT
-        ERROR_VARIABLE  VMLINUX_ERROR
-    )
-    if(NOT VMLINUX_RESULT EQUAL 0)
-        message(WARNING "bpftool vmlinux.h generation failed: ${VMLINUX_ERROR}")
-        message(WARNING "BPF compilation may fail without vmlinux.h")
-    else()
-        message(STATUS "Generated bpf/vmlinux.h")
-    endif()
+    message(FATAL_ERROR
+        "bpf/vmlinux.h is missing.\n"
+        "Generate it from the target kernel:\n"
+        "  bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h\n"
+        "Or run:  bash tools/gen_vmlinux.sh\n"
+        "Then commit the result so all CI runners use the same pinned kernel types.")
 endif()
 
 # Detect BPF include path
@@ -165,6 +174,7 @@ set(VORTEX_SRCS
     src/worker.c
     src/worker_accept.c
     src/worker_backend.c
+    src/chunked.c
     src/worker_cache.c
     src/worker_compress.c
     src/compress_pool.c

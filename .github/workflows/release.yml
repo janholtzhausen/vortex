@@ -5,10 +5,6 @@ on:
     tags:
       - 'v*'
 
-env:
-  OPENSSL_TAG: openssl-4.0.0-alpha1
-  OPENSSL_PREFIX: /opt/openssl-4.0
-
 jobs:
   build-deb:
     runs-on: ubuntu-24.04
@@ -22,29 +18,29 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            cmake ninja-build clang llvm \
-            libbpf-dev liburing-dev libyaml-dev libbrotli-dev \
+            cmake ninja-build clang llvm ccache \
+            libbpf-dev liburing-dev libyaml-dev \
+            libbrotli-dev libnghttp2-dev \
             linux-tools-common linux-tools-generic \
-            patchelf \
             pkg-config \
             dpkg-dev debhelper fakeroot
 
-      - name: Cache OpenSSL 4.0
-        id: cache-openssl
+      - name: Cache picotls build
+        id: cache-picotls
         uses: actions/cache@v4
         with:
-          path: ${{ env.OPENSSL_PREFIX }}
-          key: openssl-${{ env.OPENSSL_TAG }}-ubuntu-24.04
+          path: /tmp/picotls
+          key: picotls-${{ runner.os }}-${{ hashFiles('.github/workflows/release.yml') }}
 
-      - name: Build OpenSSL 4.0 (if not cached)
-        if: steps.cache-openssl.outputs.cache-hit != 'true'
+      - name: Build picotls (if not cached)
+        if: steps.cache-picotls.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch $OPENSSL_TAG https://github.com/openssl/openssl.git /tmp/openssl-src
-          cd /tmp/openssl-src
-          ./Configure --prefix=$OPENSSL_PREFIX --openssldir=$OPENSSL_PREFIX/etc/ssl \
-            enable-ktls no-docs no-tests
-          make -j$(nproc)
-          sudo make install_sw
+          git clone --depth 1 https://github.com/h2o/picotls.git /tmp/picotls
+          cd /tmp/picotls
+          git submodule update --init --recursive
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          cmake --build build --parallel "$(nproc)"
 
       - name: Extract version from tag
         id: version
@@ -53,77 +49,23 @@ jobs:
       - name: Configure release build
         run: |
           cmake -B build-release -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_INSTALL_PREFIX=/usr \
-            -DOPENSSL_ROOT_DIR=$OPENSSL_PREFIX
+            -DVORTEX_TLS=ON \
+            -DPICOTLS_SRC_DIR=/tmp/picotls \
+            -DPICOTLS_BUILD_DIR=/tmp/picotls/build \
+            -DVORTEX_MARCH=x86-64-v2 \
+            -DVORTEX_VERSION_OVERRIDE="${{ steps.version.outputs.VERSION }}"
 
       - name: Build
-        run: cmake --build build-release -j$(nproc)
+        run: cmake --build build-release --parallel "$(nproc)"
+
+      - name: Run all tests (release build)
+        run: ctest --test-dir build-release --output-on-failure --parallel "$(nproc)"
 
       - name: Assemble .deb package
-        run: |
-          PKG=vortex_${{ steps.version.outputs.VERSION }}_amd64
-          STAGING="${{ runner.temp }}/${PKG}"
-
-          # Binary
-          install -Dm755 build-release/vortex "${STAGING}/usr/bin/vortex"
-
-          # BPF object
-          install -Dm644 build-release/vortex_xdp.bpf.o \
-            "${STAGING}/usr/share/vortex/vortex_xdp.bpf.o"
-
-          # Example config
-          install -Dm644 config/vortex.example.yaml \
-            "${STAGING}/etc/vortex/vortex.example.yaml"
-
-          # systemd unit
-          install -Dm644 contrib/vortex.service \
-            "${STAGING}/lib/systemd/system/vortex.service" 2>/dev/null || true
-
-          # Bundle OpenSSL 4.0 (not yet in distro repos)
-          install -Dm755 $OPENSSL_PREFIX/lib64/libssl.so.4    "${STAGING}/usr/lib/vortex/libssl.so.4"
-          install -Dm755 $OPENSSL_PREFIX/lib64/libcrypto.so.4 "${STAGING}/usr/lib/vortex/libcrypto.so.4"
-          patchelf --set-rpath /usr/lib/vortex "${STAGING}/usr/bin/vortex"
-
-          # ldconfig drop-in so the system linker finds bundled libs
-          mkdir -p "${STAGING}/etc/ld.so.conf.d"
-          printf '/usr/lib/vortex\n' > "${STAGING}/etc/ld.so.conf.d/vortex.conf"
-
-          # debian control
-          mkdir -p "${STAGING}/DEBIAN"
-          cat > "${STAGING}/DEBIAN/control" <<EOF
-          Package: vortex
-          Version: ${{ steps.version.outputs.VERSION }}
-          Architecture: amd64
-          Maintainer: Jan Holtzhausen <janholtzhausen@users.noreply.github.com>
-          Depends: libc6 (>= 2.38), libbpf1, liburing2, libyaml-0-2
-          Section: net
-          Priority: optional
-          Description: High-performance kernel-assisted reverse proxy
-           Vortex is a TLS-terminating reverse proxy using XDP/eBPF for sub-microsecond
-           packet filtering, io_uring for async I/O, kTLS for kernel-offloaded TLS
-           crypto, and HTTP/3 via QUIC. Includes stateful L4 connection tracking,
-           per-IP rate limiting, automatic ACME certificate management, response
-           caching, and WebSocket passthrough.
-          EOF
-
-          # post-install script
-          cat > "${STAGING}/DEBIAN/postinst" <<'EOF'
-          #!/bin/sh
-          set -e
-          mkdir -p /var/log/vortex
-          mkdir -p /etc/vortex
-          if [ ! -f /etc/vortex/vortex.yaml ]; then
-              cp /etc/vortex/vortex.example.yaml /etc/vortex/vortex.yaml
-          fi
-          ldconfig || true
-          if command -v systemctl >/dev/null 2>&1; then
-              systemctl daemon-reload || true
-          fi
-          EOF
-          chmod 755 "${STAGING}/DEBIAN/postinst"
-
-          fakeroot dpkg-deb --build "${STAGING}" "${PKG}.deb"
+        run: bash tools/build_deb.sh "${{ steps.version.outputs.VERSION }}"
 
       - name: Upload .deb as release artifact
         uses: softprops/action-gh-release@v2
@@ -134,19 +76,9 @@ jobs:
             ## Installation
 
             ```sh
-            # Install dependencies
-            sudo apt-get install -y libbpf1 liburing2 libyaml-0-2
-
-            # Install vortex
+            sudo apt-get install -y libbpf1 liburing2 libyaml-0-2 libbrotli1
             sudo dpkg -i vortex_${{ steps.version.outputs.VERSION }}_amd64.deb
-
-            # Edit config, then run
-            sudo vortex -f -c /etc/vortex/vortex.yaml \
-              -b /usr/share/vortex/vortex_xdp.bpf.o
+            sudo systemctl enable --now vortex
             ```
 
             See [README.md](README.md) for full documentation.
-
-            > **Note:** XDP attachment requires root and a kernel with eBPF support
-            > (Linux 5.10+). TLS requires OpenSSL 4.0 built separately (see README).
-            > The .deb links against the distro OpenSSL for everything else.
