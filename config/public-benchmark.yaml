@@ -1,0 +1,44 @@
+global:
+  workers: 2
+  sqpoll: false
+  hugepages: false
+  cpu_affinity: false
+  bind_address: "127.0.0.1"
+  bind_port: 18080
+  http_port: 0
+  interface: ""
+  log_level: "info"
+  log_format: "text"
+  pid_file: "/tmp/vortex-public-benchmark.pid"
+  max_request_body_mb: 8
+
+cache:
+  enabled: false
+  index_entries: 1024
+  slab_size_mb: 16
+  default_ttl: 60
+  use_hugepages: false
+
+metrics:
+  enabled: false
+  bind_address: "127.0.0.1"
+  port: 19090
+  path: "/metrics"
+
+dashboard:
+  enabled: false
+  bind_address: "127.0.0.1"
+  port: 19091
+
+routes:
+  - hostname: "httpbingo.bench.local"
+    backends:
+      - address: "https://httpbingo.org:443"
+
+  - hostname: "wikipedia.bench.local"
+    backends:
+      - address: "https://www.wikipedia.org:443"
+
+  - hostname: "hetzner-speed.bench.local"
+    backends:
+      - address: "https://speed.hetzner.de:443"

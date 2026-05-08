@@ -12,3 +12,4 @@ vortex
 *.buildinfo
 .DS_Store
 compile_commands.json
+.claire/
