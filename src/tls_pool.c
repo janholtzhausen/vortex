@@ -43,34 +43,26 @@ static void *tls_pool_worker_thread(void *arg)
         };
 
         if (job.kind == TLS_HANDSHAKE_FRONTEND) {
-            char sni[256] = {0};
-            int route_idx = 0;
-            bool ktls_tx = false, ktls_rx = false, h2 = false;
-            uint8_t *pending_data = NULL;
-            size_t pending_data_len = 0;
+            struct tls_accept_result ar = tls_accept(job.tls, job.client_fd);
 
-            ptls_t *ptls = tls_accept(job.tls, job.client_fd, &route_idx, sni, sizeof(sni),
-                                      &ktls_tx, &ktls_rx, &h2, &pending_data, &pending_data_len);
-
-            if (!ptls && !ktls_tx) {
+            if (ar.status == TLS_ACCEPT_FAIL) {
                 log_debug("tls_pool", "frontend handshake failed cid=%u fd=%d", job.cid,
                           job.client_fd);
-                free(pending_data);
+                free(ar.pending_data);
             } else {
                 res.ok = true;
-                res.tls_route_idx = route_idx;
+                res.tls_route_idx = ar.route_idx;
                 res.tls_version = PTLS_PROTOCOL_VERSION_TLS13;
-                res.h2_negotiated = h2;
-                res.ktls_tx = ktls_tx;
-                res.ktls_rx = ktls_rx;
-                res.ssl = ptls; /* NULL if kTLS took over */
-                res.pending_data = pending_data;
-                res.pending_data_len = (uint32_t)pending_data_len;
+                res.h2_negotiated = ar.h2;
+                res.ktls_status = ar.status;
+                res.ssl = ar.ptls;
+                res.pending_data = ar.pending_data;
+                res.pending_data_len = (uint32_t)ar.pending_data_len;
 
-                if (!ktls_tx) {
-                    /* Restore blocking mode for non-kTLS path */
-                    int flags = fcntl(job.client_fd, F_GETFL);
-                    fcntl(job.client_fd, F_SETFL, flags & ~O_NONBLOCK);
+                if (ar.status == TLS_ACCEPT_USERSPACE) {
+                    /* Restore blocking mode — tls_accept left it non-blocking */
+                    int fl = fcntl(job.client_fd, F_GETFL);
+                    fcntl(job.client_fd, F_SETFL, fl & ~O_NONBLOCK);
                 }
             }
         } else {
@@ -136,7 +128,7 @@ static void *tls_pool_worker_thread(void *arg)
             ssize_t wr = write(job.result_pipe_wr, &res, sizeof(res));
             if (wr != (ssize_t)sizeof(res)) {
                 log_error("tls_pool", "result pipe write failed cid=%u", job.cid);
-                if (res.ssl && !res.ktls_tx) ptls_free(res.ssl);
+                if (res.ssl && res.ktls_status == TLS_ACCEPT_USERSPACE) ptls_free(res.ssl);
                 free(res.backend_session);
             }
         }

@@ -33,6 +33,28 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <linux/tls.h>
+#include <stdatomic.h>
+
+/* ------------------------------------------------------------------ */
+/* kTLS install counters                                                */
+/* ------------------------------------------------------------------ */
+
+static _Atomic uint64_t g_ktls_attempts;
+static _Atomic uint64_t g_ktls_tx_ok;
+static _Atomic uint64_t g_ktls_rx_ok;
+static _Atomic uint64_t g_ktls_full_ok;
+static _Atomic uint64_t g_ktls_fallback;
+static _Atomic uint64_t g_ktls_fail_close;
+
+void tls_ktls_snapshot(struct tls_ktls_counters *out)
+{
+    out->attempts = atomic_load_explicit(&g_ktls_attempts, memory_order_relaxed);
+    out->tx_ok = atomic_load_explicit(&g_ktls_tx_ok, memory_order_relaxed);
+    out->rx_ok = atomic_load_explicit(&g_ktls_rx_ok, memory_order_relaxed);
+    out->full_ok = atomic_load_explicit(&g_ktls_full_ok, memory_order_relaxed);
+    out->fallback = atomic_load_explicit(&g_ktls_fallback, memory_order_relaxed);
+    out->fail_close = atomic_load_explicit(&g_ktls_fail_close, memory_order_relaxed);
+}
 
 /* ------------------------------------------------------------------ */
 /* kTLS installation                                                    */
@@ -524,19 +546,19 @@ static int write_all(int fd, const uint8_t *buf, size_t len)
     return 0;
 }
 
-ptls_t *tls_accept(struct tls_ctx *tls, int fd, int *route_idx_out, char *sni_out, size_t sni_max,
-                   bool *ktls_tx_out, bool *ktls_rx_out, bool *h2_out, uint8_t **pending_data_out,
-                   size_t *pending_data_len_out)
+/* True if the cipher is supported by the Linux kTLS path (AES-128-GCM,
+ * AES-256-GCM, ChaCha20-Poly1305).  Check BEFORE setting TCP_ULP — once
+ * the ULP is installed the socket cannot revert to userspace TLS. */
+static bool cipher_is_ktls_supported(const ptls_aead_algorithm_t *aead)
 {
-    if (route_idx_out) *route_idx_out = 0;
-    if (ktls_tx_out) *ktls_tx_out = false;
-    if (ktls_rx_out) *ktls_rx_out = false;
-    if (h2_out) *h2_out = false;
-    if (pending_data_out) *pending_data_out = NULL;
-    if (pending_data_len_out) *pending_data_len_out = 0;
-    if (sni_out && sni_max > 0) sni_out[0] = '\0';
+    return aead == &ptls_minicrypto_aes256gcm || aead == &ptls_minicrypto_aes128gcm ||
+           aead == &ptls_minicrypto_chacha20poly1305;
+}
 
-    /* Use first available route context as the starting context */
+struct tls_accept_result tls_accept(struct tls_ctx *tls, int fd)
+{
+    struct tls_accept_result out = {.status = TLS_ACCEPT_FAIL};
+
     ptls_context_t *base_ctx = NULL;
     for (int i = 0; i < tls->route_count; i++) {
         if (tls->routes[i].ctx) {
@@ -546,10 +568,9 @@ ptls_t *tls_accept(struct tls_ctx *tls, int fd, int *route_idx_out, char *sni_ou
     }
     if (!base_ctx) {
         log_error("tls_accept", "no ptls_context_t available");
-        return NULL;
+        return out;
     }
 
-    /* Per-connection state */
     struct conn_tls_state state;
     memset(&state, 0, sizeof(state));
     state.fd = fd;
@@ -558,175 +579,182 @@ ptls_t *tls_accept(struct tls_ctx *tls, int fd, int *route_idx_out, char *sni_ou
     ptls_t *ptls = ptls_server_new(base_ctx);
     if (!ptls) {
         log_error("tls_accept", "ptls_server_new failed");
-        return NULL;
+        return out;
     }
-
-    /* Store state pointer in ptls user-data */
     *ptls_get_data_ptr(ptls) = &state;
 
-    /* Set fd non-blocking for the handshake loop */
     int flags = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     uint8_t ibuf[8192];
     int ret = PTLS_ERROR_IN_PROGRESS;
-
-    /* Track the last recv's count and consumed for leftover-byte detection */
     ssize_t last_nr = 0;
     size_t last_consumed = 0;
 
     /* picotls server returns 0 after sending its own Finished (TLS 1.3 allows
-     * the server to send application data before receiving the client's
-     * Finished).  Continue looping until ptls_handshake_is_complete() returns
-     * true so that server_handle_finished() is called and dec.secret is
-     * updated to CLIENT_TRAFFIC_SECRET_0 before we install kTLS RX keys. */
+     * the server to send application data before the client's Finished).
+     * Loop until ptls_handshake_is_complete() so dec.secret is updated to
+     * CLIENT_TRAFFIC_SECRET_0 before we read kTLS RX keys. */
     while (ret == PTLS_ERROR_IN_PROGRESS || (ret == 0 && !ptls_handshake_is_complete(ptls))) {
-        /* Wait for data */
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int pret = poll(&pfd, 1, 5000); /* 5-second handshake timeout */
-        if (pret <= 0) {
+        if (poll(&pfd, 1, 5000) <= 0) {
             log_debug("tls_accept", "handshake timeout fd=%d", fd);
             ptls_free(ptls);
-            return NULL;
+            return out;
         }
-
         ssize_t nr = recv(fd, ibuf, sizeof(ibuf), 0);
         if (nr <= 0) {
             if (nr < 0 && errno == EAGAIN) continue;
             ptls_free(ptls);
-            return NULL;
+            return out;
         }
-
         size_t consumed = (size_t)nr;
         ptls_buffer_t wbuf;
         uint8_t wbuf_smallbuf[4096];
         ptls_buffer_init(&wbuf, wbuf_smallbuf, sizeof(wbuf_smallbuf));
-
         ret = ptls_handshake(ptls, &wbuf, ibuf, &consumed, NULL);
-
-        /* Send any output (server handshake records) */
-        if (wbuf.off > 0) {
-            if (write_all(fd, wbuf.base, wbuf.off) < 0) {
-                ptls_buffer_dispose(&wbuf);
-                ptls_free(ptls);
-                return NULL;
-            }
+        if (wbuf.off > 0 && write_all(fd, wbuf.base, wbuf.off) < 0) {
+            ptls_buffer_dispose(&wbuf);
+            ptls_free(ptls);
+            return out;
         }
         ptls_buffer_dispose(&wbuf);
-
         if (ret != 0 && ret != PTLS_ERROR_IN_PROGRESS) {
             log_debug("tls_accept", "handshake failed fd=%d ret=%d", fd, ret);
             ptls_free(ptls);
-            return NULL;
+            return out;
         }
-
         last_nr = nr;
         last_consumed = consumed;
     }
 
-    /*
-     * If the client sent application data (e.g. H2 connection preface) bundled
-     * with its TLS Finished in the same TCP segment, those bytes ended up in
-     * ibuf[] past `last_consumed` but were never processed by ptls_handshake.
-     * Once kTLS is installed the kernel's TCP receive buffer has already been
-     * drained of those bytes — they must be decrypted now via ptls_receive and
-     * returned to the caller as pending_data so they can be injected into the
-     * application layer before any io_uring recv fires.
-     */
+    /* Decrypt any application data that arrived bundled with the TLS Finished
+     * (H2 preface, first HTTP/1.1 request).  Once kTLS is installed the kernel
+     * owns the socket — those bytes are already drained from the TCP buffer. */
     if (last_consumed < (size_t)last_nr) {
         size_t extra = (size_t)last_nr - last_consumed;
         size_t extra_in = extra;
         ptls_buffer_t pbuf;
         uint8_t pbuf_small[4096];
         ptls_buffer_init(&pbuf, pbuf_small, sizeof(pbuf_small));
-
         int r = ptls_receive(ptls, &pbuf, ibuf + last_consumed, &extra_in);
-        if (r == 0 && pbuf.off > 0 && pending_data_out) {
+        if (r == 0 && pbuf.off > 0) {
             uint8_t *pd = malloc(pbuf.off);
             if (pd) {
                 memcpy(pd, pbuf.base, pbuf.off);
-                *pending_data_out = pd;
-                if (pending_data_len_out) *pending_data_len_out = pbuf.off;
+                out.pending_data = pd;
+                out.pending_data_len = pbuf.off;
             }
         } else if (r != 0) {
-            log_debug("tls_accept", "fd=%d ptls_receive on leftover %zu bytes failed: %d", fd,
-                      extra, r);
+            log_debug("tls_accept", "fd=%d ptls_receive leftover %zu bytes failed: %d", fd, extra,
+                      r);
         }
         ptls_buffer_dispose(&pbuf);
     }
 
-    /* Handshake complete. Get SNI and ALPN. */
     const char *sni = ptls_get_server_name(ptls);
-    if (sni && sni_out && sni_max > 0) {
-        snprintf(sni_out, sni_max, "%s", sni);
-        sni_out[sni_max - 1] = '\0';
-    }
-
     const char *alpn = ptls_get_negotiated_protocol(ptls);
-    bool h2 = (alpn && strcmp(alpn, "h2") == 0);
-    if (h2_out) *h2_out = h2;
-
-    if (route_idx_out) *route_idx_out = state.matched_route;
+    out.h2 = (alpn && strcmp(alpn, "h2") == 0);
+    out.route_idx = state.matched_route;
 
     log_info("tls_accept", "fd=%d sni=%s route=%d h2=%d ktls_available=%d", fd,
-             sni ? sni : "(none)", state.matched_route, (int)h2, (int)tls->ktls_available);
+             sni ? sni : "(none)", out.route_idx, (int)out.h2, (int)tls->ktls_available);
 
-    /* Attempt kTLS installation.
-     * picotls handled the full handshake internally (including AEAD for epochs 2/3).
-     * Now extract the application-data traffic keys via ptls_get_traffic_keys and
-     * install them into the kernel TLS ULP.  ptls must be freed afterwards since
-     * kTLS takes over all record-layer crypto.
-     */
-    if (tls->ktls_available) {
-        ptls_cipher_suite_t *cipher = ptls_get_cipher(ptls);
-        if (cipher) {
-            uint8_t tx_key[PTLS_MAX_SECRET_SIZE];
-            uint8_t tx_iv[PTLS_MAX_IV_SIZE];
-            uint8_t rx_key[PTLS_MAX_SECRET_SIZE];
-            uint8_t rx_iv[PTLS_MAX_IV_SIZE];
-            uint64_t tx_seq = 0, rx_seq = 0;
-
-            if (ptls_get_traffic_keys(ptls, 1, tx_key, tx_iv, &tx_seq) == 0 &&
-                ptls_get_traffic_keys(ptls, 0, rx_key, rx_iv, &rx_seq) == 0) {
-
-                if (setsockopt(fd, SOL_TCP, TCP_ULP, "tls", strlen("tls")) == 0) {
-                    int tx_ok =
-                        (install_ktls_direction(fd, tx_key, tx_iv, tx_seq, cipher->aead, 1) == 0);
-                    int rx_ok =
-                        (install_ktls_direction(fd, rx_key, rx_iv, rx_seq, cipher->aead, 0) == 0);
-                    /* Wipe key material immediately */
-                    memset(tx_key, 0, sizeof(tx_key));
-                    memset(rx_key, 0, sizeof(rx_key));
-                    memset(tx_iv, 0, sizeof(tx_iv));
-                    memset(rx_iv, 0, sizeof(rx_iv));
-
-                    if (tx_ok && rx_ok) {
-                        if (ktls_tx_out) *ktls_tx_out = true;
-                        if (ktls_rx_out) *ktls_rx_out = true;
-                        log_info("tls_accept",
-                                 "fd=%d kTLS installed cipher=%s tx_seq=%llu rx_seq=%llu", fd,
-                                 cipher->aead->name, (unsigned long long)tx_seq,
-                                 (unsigned long long)rx_seq);
-                        fcntl(fd, F_SETFL, flags);
-                        ptls_free(ptls);
-                        /* SUCCESS with kTLS: return NULL (no ptls_t needed; kernel handles
-                         * crypto). Caller distinguishes success from failure via *ktls_tx_out.
-                         * See tls.h: "NULL if kTLS took over, i.e. *ktls_tx_out = true". */
-                        return NULL;
-                    }
-                    log_warn("tls_accept", "fd=%d kTLS setsockopt failed: %s", fd, strerror(errno));
-                } else {
-                    memset(tx_key, 0, sizeof(tx_key));
-                    memset(rx_key, 0, sizeof(rx_key));
-                    log_warn("tls_accept", "fd=%d TCP_ULP 'tls' failed: %s", fd, strerror(errno));
-                }
-            }
-        }
+    if (!tls->ktls_available) {
+        /* Userspace TLS: restore blocking mode and hand ptls to caller */
+        fcntl(fd, F_SETFL, flags);
+        out.status = TLS_ACCEPT_USERSPACE;
+        out.ptls = ptls;
+        return out;
     }
 
-    /* Non-kTLS fallback: restore blocking mode, return ptls_t* */
+    ptls_cipher_suite_t *cipher = ptls_get_cipher(ptls);
+    if (!cipher || !cipher_is_ktls_supported(cipher->aead)) {
+        log_warn("tls_accept", "fd=%d cipher %s not supported by kTLS — userspace fallback", fd,
+                 cipher ? cipher->aead->name : "(null)");
+        atomic_fetch_add_explicit(&g_ktls_fallback, 1, memory_order_relaxed);
+        fcntl(fd, F_SETFL, flags);
+        out.status = TLS_ACCEPT_USERSPACE;
+        out.ptls = ptls;
+        return out;
+    }
+
+    uint8_t tx_key[PTLS_MAX_SECRET_SIZE];
+    uint8_t tx_iv[PTLS_MAX_IV_SIZE];
+    uint8_t rx_key[PTLS_MAX_SECRET_SIZE];
+    uint8_t rx_iv[PTLS_MAX_IV_SIZE];
+    uint64_t tx_seq = 0, rx_seq = 0;
+
+    int keys_ok = (ptls_get_traffic_keys(ptls, 1, tx_key, tx_iv, &tx_seq) == 0 &&
+                   ptls_get_traffic_keys(ptls, 0, rx_key, rx_iv, &rx_seq) == 0);
+    if (!keys_ok) {
+        explicit_bzero(tx_key, sizeof(tx_key));
+        explicit_bzero(rx_key, sizeof(rx_key));
+        explicit_bzero(tx_iv, sizeof(tx_iv));
+        explicit_bzero(rx_iv, sizeof(rx_iv));
+        log_warn("tls_accept", "fd=%d ptls_get_traffic_keys failed — userspace fallback", fd);
+        atomic_fetch_add_explicit(&g_ktls_fallback, 1, memory_order_relaxed);
+        fcntl(fd, F_SETFL, flags);
+        out.status = TLS_ACCEPT_USERSPACE;
+        out.ptls = ptls;
+        return out;
+    }
+
+    log_debug("tls_accept", "fd=%d cipher=%s tx_seq=%llu rx_seq=%llu — attempting kTLS install", fd,
+              cipher->aead->name, (unsigned long long)tx_seq, (unsigned long long)rx_seq);
+    atomic_fetch_add_explicit(&g_ktls_attempts, 1, memory_order_relaxed);
+
+    if (setsockopt(fd, SOL_TCP, TCP_ULP, "tls", strlen("tls")) != 0) {
+        /* TCP_ULP failed — socket still clean; fall back to userspace */
+        explicit_bzero(tx_key, sizeof(tx_key));
+        explicit_bzero(rx_key, sizeof(rx_key));
+        explicit_bzero(tx_iv, sizeof(tx_iv));
+        explicit_bzero(rx_iv, sizeof(rx_iv));
+        log_warn("tls_accept", "fd=%d TCP_ULP 'tls' failed: %s — userspace fallback", fd,
+                 strerror(errno));
+        atomic_fetch_add_explicit(&g_ktls_fallback, 1, memory_order_relaxed);
+        fcntl(fd, F_SETFL, flags);
+        out.status = TLS_ACCEPT_USERSPACE;
+        out.ptls = ptls;
+        return out;
+    }
+
+    /* TCP_ULP installed.  From here, the socket cannot revert to userspace TLS.
+     * If either direction setsockopt fails, close the fd (returning FAIL) rather
+     * than running with partial kTLS — an unconfigured kTLS direction produces
+     * corrupt or plaintext traffic.  Key material is always wiped. */
+    int tx_ok = (install_ktls_direction(fd, tx_key, tx_iv, tx_seq, cipher->aead, 1) == 0);
+    if (tx_ok) atomic_fetch_add_explicit(&g_ktls_tx_ok, 1, memory_order_relaxed);
+
+    int rx_ok = (install_ktls_direction(fd, rx_key, rx_iv, rx_seq, cipher->aead, 0) == 0);
+    if (rx_ok) atomic_fetch_add_explicit(&g_ktls_rx_ok, 1, memory_order_relaxed);
+
+    explicit_bzero(tx_key, sizeof(tx_key));
+    explicit_bzero(rx_key, sizeof(rx_key));
+    explicit_bzero(tx_iv, sizeof(tx_iv));
+    explicit_bzero(rx_iv, sizeof(rx_iv));
+
+    if (!tx_ok || !rx_ok) {
+        /* Partial install — socket is broken; must close.  ptls is freed here
+         * to avoid a dangling handle; pending_data is freed by caller on FAIL. */
+        log_warn("tls_accept", "fd=%d partial kTLS install (tx=%d rx=%d) — closing, FAIL returned",
+                 fd, tx_ok, rx_ok);
+        atomic_fetch_add_explicit(&g_ktls_fail_close, 1, memory_order_relaxed);
+        ptls_free(ptls);
+        /* Do NOT restore flags or return ptls — fd is unusable */
+        return out; /* status == TLS_ACCEPT_FAIL */
+    }
+
+    atomic_fetch_add_explicit(&g_ktls_full_ok, 1, memory_order_relaxed);
+    log_info("tls_accept", "fd=%d kTLS installed cipher=%s tx_seq=%llu rx_seq=%llu", fd,
+             cipher->aead->name, (unsigned long long)tx_seq, (unsigned long long)rx_seq);
+
     fcntl(fd, F_SETFL, flags);
-    return ptls;
+    ptls_free(ptls);
+    out.status = TLS_ACCEPT_KTLS_FULL;
+    out.ktls_tx = true;
+    out.ktls_rx = true;
+    return out;
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,6 +1,7 @@
 #include "metrics.h"
 #include "log.h"
 #include "bpf_loader.h"
+#include "tls.h"
 #include "tls_pool.h"
 #include "compress_pool.h"
 #include "router.h"
@@ -80,6 +81,26 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
         write_metric_gauge(buf, &pos, bufsz, "vortex_ktls_connections_total",
                            "Connections using kernel TLS", total_ktls);
     }
+#ifdef VORTEX_PHASE_TLS
+    {
+        struct tls_ktls_counters kc;
+        tls_ktls_snapshot(&kc);
+        if (kc.attempts > 0) {
+            write_metric_counter(buf, &pos, bufsz, "vortex_ktls_install_attempts_total",
+                                 "kTLS install attempts (after successful handshake)", kc.attempts);
+            write_metric_counter(buf, &pos, bufsz, "vortex_ktls_install_tx_ok_total",
+                                 "kTLS TX setsockopt succeeded", kc.tx_ok);
+            write_metric_counter(buf, &pos, bufsz, "vortex_ktls_install_rx_ok_total",
+                                 "kTLS RX setsockopt succeeded", kc.rx_ok);
+            write_metric_counter(buf, &pos, bufsz, "vortex_ktls_install_full_ok_total",
+                                 "kTLS TX+RX both installed", kc.full_ok);
+            write_metric_counter(buf, &pos, bufsz, "vortex_ktls_fallback_total",
+                                 "Connections that fell back to userspace TLS", kc.fallback);
+            write_metric_counter(buf, &pos, bufsz, "vortex_ktls_fail_close_total",
+                                 "Connections closed due to partial kTLS install", kc.fail_close);
+        }
+    }
+#endif
 
     {
         struct tls_pool_stats tls_stats = {0};

@@ -42,10 +42,9 @@ struct tls_handshake_result {
     uint32_t cid; /* connection id to resume */
     int client_fd; /* original fd (frontend) */
     int tls_route_idx; /* SNI-matched route (-1 on error) */
-    ptls_t *ssl; /* NULL if kTLS took over or on error */
+    ptls_t *ssl; /* non-NULL only for TLS_ACCEPT_USERSPACE */
     bool ok; /* false = handshake failed, close and free conn */
-    bool ktls_tx;
-    bool ktls_rx;
+    tls_accept_status_t ktls_status; /* kTLS install result */
     bool h2_negotiated; /* ALPN selected "h2" */
     int tls_version; /* PTLS_PROTOCOL_VERSION_TLS13 etc. */
     struct tls_session_ticket *backend_session; /* heap-alloc'd ticket, or NULL */

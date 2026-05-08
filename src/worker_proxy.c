@@ -977,7 +977,7 @@ static void process_tls_result(struct worker *w, const struct tls_handshake_resu
         atomic_fetch_add_explicit(&w->tls13_count, 1, memory_order_relaxed);
     else
         atomic_fetch_add_explicit(&w->tls12_count, 1, memory_order_relaxed);
-    if (res->ktls_tx && res->ktls_rx) {
+    if (res->ktls_status == TLS_ACCEPT_KTLS_FULL) {
         th->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
         th->ssl = NULL;
         atomic_fetch_add_explicit(&w->ktls_count, 1, memory_order_relaxed);
@@ -1179,26 +1179,23 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
             return;
         }
         /* Fallback (no pipe): blocking path — should not normally happen */
-        char sni_fb[256] = {0};
-        bool ktls_tx_fb = false, ktls_rx_fb = false, h2_fb = false;
-        ptls_t *ssl_fb = tls_accept(w->tls, client_fd, &tls_route_idx, sni_fb, sizeof(sni_fb),
-                                    &ktls_tx_fb, &ktls_rx_fb, &h2_fb, NULL, NULL);
-        if (!ssl_fb && !ktls_tx_fb) {
+        struct tls_accept_result ar_fb = tls_accept(w->tls, client_fd);
+        if (ar_fb.status == TLS_ACCEPT_FAIL) {
+            free(ar_fb.pending_data);
             close(client_fd);
             conn_free(&w->pool, new_cid);
             return;
         }
+        tls_route_idx = ar_fb.route_idx;
         atomic_fetch_add_explicit(&w->tls13_count, 1, memory_order_relaxed);
-        if (ktls_tx_fb && ktls_rx_fb) {
+        if (ar_fb.status == TLS_ACCEPT_KTLS_FULL) {
             nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
-            tls_ssl_free(ssl_fb);
             nh->ssl = NULL;
             atomic_fetch_add_explicit(&w->ktls_count, 1, memory_order_relaxed);
         } else {
-            nh->ssl = ssl_fb;
+            nh->ssl = ar_fb.ptls;
         }
-        int fl = fcntl(client_fd, F_GETFL);
-        fcntl(client_fd, F_SETFL, fl & ~O_NONBLOCK);
+        free(ar_fb.pending_data);
     }
 #endif
 

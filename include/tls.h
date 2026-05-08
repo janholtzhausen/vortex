@@ -54,20 +54,58 @@ struct tls_session_ticket {
 int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg);
 void tls_destroy(struct tls_ctx *tls);
 
-/* Perform blocking TLS handshake on accepted fd (server mode).
- * On success: returns ptls_t* (NULL if kTLS took over, i.e. *ktls_tx_out = true).
- *   *route_idx_out is set from SNI lookup (or 0 for default).
- *   sni_out filled with negotiated hostname (may be empty).
- *   *ktls_tx_out and *ktls_rx_out set to true if kTLS is installed.
- *   *h2_out is set to true if h2 was ALPN-negotiated.
- *   If the client sent application data bundled with its TLS Finished in the
- *   same recv() call, those bytes are decrypted and returned in *pending_data_out
- *   (heap-alloc'd, caller must free) with *pending_data_len_out set accordingly.
- *   pending_data_out / pending_data_len_out may be NULL (ignored).
- * On failure: returns NULL, *ktls_tx_out = false. Caller must close fd. */
-ptls_t *tls_accept(struct tls_ctx *tls, int fd, int *route_idx_out, char *sni_out, size_t sni_max,
-                   bool *ktls_tx_out, bool *ktls_rx_out, bool *h2_out, uint8_t **pending_data_out,
-                   size_t *pending_data_len_out);
+/*
+ * kTLS install result.
+ *
+ * FAIL        — handshake failed, or TCP_ULP succeeded but TX/RX setsockopt
+ *               failed (socket in broken state).  ptls is NULL.  Caller must
+ *               close fd — it may no longer support plain ptls_send/recv.
+ * USERSPACE   — handshake ok; TCP_ULP not installed; caller does crypto via ptls.
+ * KTLS_FULL   — TX+RX both installed; ptls freed; kernel handles all crypto.
+ * KTLS_TX_ONLY / KTLS_RX_ONLY — reserved; not produced by the current
+ *               implementation (non-negotiable: no half-kTLS by accident).
+ */
+typedef enum {
+    TLS_ACCEPT_FAIL = 0,
+    TLS_ACCEPT_USERSPACE,
+    TLS_ACCEPT_KTLS_FULL,
+    TLS_ACCEPT_KTLS_TX_ONLY,
+    TLS_ACCEPT_KTLS_RX_ONLY,
+} tls_accept_status_t;
+
+struct tls_accept_result {
+    tls_accept_status_t status;
+    ptls_t *ptls; /* non-NULL only when status == TLS_ACCEPT_USERSPACE */
+    int route_idx; /* SNI-matched route index (0 = default) */
+    bool h2; /* ALPN selected "h2" */
+    bool ktls_tx; /* kernel TX installed */
+    bool ktls_rx; /* kernel RX installed */
+    uint8_t *pending_data; /* pre-decrypted bytes from same segment as Finished */
+    size_t pending_data_len; /* (heap-alloc'd; caller must free) */
+};
+
+/* Snapshot of per-call kTLS install counters (monotonically increasing) */
+struct tls_ktls_counters {
+    uint64_t attempts; /* kTLS install attempted */
+    uint64_t tx_ok; /* TX setsockopt succeeded */
+    uint64_t rx_ok; /* RX setsockopt succeeded */
+    uint64_t full_ok; /* both TX+RX installed (KTLS_FULL) */
+    uint64_t fallback; /* fell back to userspace (TCP_ULP failed) */
+    uint64_t fail_close; /* partial install: socket unusable, FAIL returned */
+};
+void tls_ktls_snapshot(struct tls_ktls_counters *out);
+
+/* Perform blocking TLS 1.3 handshake on an accepted fd (server mode).
+ *
+ * Returns a tls_accept_result by value.  Check .status first:
+ *   FAIL       → handshake or kTLS install failed; close fd, discard conn.
+ *   USERSPACE  → .ptls is live; caller does crypto; restore fd blocking mode.
+ *   KTLS_FULL  → kernel handles crypto; .ptls is NULL (already freed).
+ *
+ * .pending_data (if non-NULL) holds pre-decrypted bytes that arrived in the
+ * same recv() as the TLS Finished — inject before arming the first io_uring recv.
+ * Caller owns the heap allocation and must free it. */
+struct tls_accept_result tls_accept(struct tls_ctx *tls, int fd);
 
 /* Free a ptls_t handle safely (no-op if NULL) */
 static inline void tls_ssl_free(ptls_t *ssl)
@@ -125,20 +163,39 @@ static inline void tls_destroy(struct tls_ctx *t)
 {
     (void)t;
 }
-static inline void *tls_accept(struct tls_ctx *t, int fd, int *ri, char *s, size_t n, bool *tx,
-                               bool *rx, bool *h2, uint8_t **pd, size_t *pdl)
+typedef enum {
+    TLS_ACCEPT_FAIL = 0,
+    TLS_ACCEPT_USERSPACE,
+    TLS_ACCEPT_KTLS_FULL,
+    TLS_ACCEPT_KTLS_TX_ONLY,
+    TLS_ACCEPT_KTLS_RX_ONLY,
+} tls_accept_status_t;
+
+struct tls_accept_result {
+    tls_accept_status_t status;
+    void *ptls;
+    int route_idx;
+    bool h2;
+    bool ktls_tx;
+    bool ktls_rx;
+    uint8_t *pending_data;
+    size_t pending_data_len;
+};
+
+struct tls_ktls_counters {
+    uint64_t attempts, tx_ok, rx_ok, full_ok, fallback, fail_close;
+};
+
+static inline void tls_ktls_snapshot(struct tls_ktls_counters *out)
+{
+    (void)out;
+}
+
+static inline struct tls_accept_result tls_accept(struct tls_ctx *t, int fd)
 {
     (void)t;
     (void)fd;
-    (void)ri;
-    (void)s;
-    (void)n;
-    (void)tx;
-    (void)rx;
-    (void)h2;
-    (void)pd;
-    (void)pdl;
-    return NULL;
+    return (struct tls_accept_result){.status = TLS_ACCEPT_FAIL};
 }
 static inline void tls_ssl_free(void *ssl)
 {
