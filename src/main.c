@@ -693,7 +693,7 @@ int main(int argc, char *argv[])
 
     if (g_cfg->dashboard.enabled) {
         if (dashboard_init(&g_dashboard, g_cfg->dashboard.bind_address, g_cfg->dashboard.port,
-                           worker_ptrs, num_workers, &g_cfg) == 0) {
+                           worker_ptrs, num_workers, g_cfg) == 0) {
             if (dashboard_start(&g_dashboard) != 0) {
                 log_warn("main", "dashboard thread start failed");
                 if (g_dashboard.listen_fd >= 0) {
@@ -710,7 +710,7 @@ int main(int argc, char *argv[])
 #ifdef VORTEX_QUIC
     /* Start QUIC/HTTP3 server (needs TLS to have been set up) */
     if (tls_ptr && tls_ptr->route_count > 0) {
-        if (quic_server_init(&g_quic, tls_ptr, NULL, &g_cfg, g_cfg->bind_address,
+        if (quic_server_init(&g_quic, tls_ptr, NULL, g_cfg, g_cfg->bind_address,
                              g_cfg->bind_port) == 0) {
             if (quic_server_start(g_quic) != 0) {
                 log_warn("main", "QUIC thread start failed");
