@@ -22,15 +22,20 @@ bool global_rate_limit_check(int ri, const struct route_rate_limit_config *rl)
     clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
     uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
+    /* Replenishment: CAS on last_ns so exactly one worker updates tokens per interval.
+     * Plain store would let N workers all read the same old_ns, each computing +add
+     * tokens, and all storing — crediting N×add instead of add (double-credit bug). */
     uint64_t old_ns = atomic_load_explicit(&g_route_rl[ri].last_ns, memory_order_relaxed);
     if (now_ns > old_ns) {
         uint64_t elapsed = now_ns - old_ns;
         uint32_t add = (uint32_t)(elapsed / (1000000000ULL / rl->rps));
-        if (add > 0) {
+        if (add > 0 &&
+            atomic_compare_exchange_strong_explicit(&g_route_rl[ri].last_ns, &old_ns, now_ns,
+                                                    memory_order_relaxed, memory_order_relaxed)) {
+            /* CAS won — we are the sole replenisher for this interval */
             uint32_t cur = atomic_load_explicit(&g_route_rl[ri].tokens, memory_order_relaxed);
             uint32_t next = cur + add > max_tokens ? max_tokens : cur + add;
             atomic_store_explicit(&g_route_rl[ri].tokens, next, memory_order_relaxed);
-            atomic_store_explicit(&g_route_rl[ri].last_ns, now_ns, memory_order_relaxed);
         }
     }
 
@@ -49,8 +54,20 @@ global_cb_t g_backend_cb[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
 bool cb_is_open_global(int ri, int bi, uint64_t now_ns)
 {
     uint64_t until =
-        atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_relaxed);
-    return until != 0 && now_ns < until;
+        atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_acquire);
+    if (until == 0 || now_ns >= until) return false; /* closed or timeout elapsed */
+
+    /* Half-open: timeout elapsed but circuit hasn't been reset yet.
+     * Allow exactly ONE worker to probe by CAS-claiming the probing slot.
+     * All other workers see the circuit as still open until the probe result. */
+    if (now_ns >= until) {
+        uint8_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&g_backend_cb[ri][bi].probing, &expected, 1,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+            return false; /* this worker won the probe slot — let it through */
+        return true; /* another worker already probing — keep open */
+    }
+    return true; /* still within open window */
 }
 
 void cb_record_failure_global(int ri, int bi, uint64_t now_ns, uint32_t threshold, uint32_t open_ms)
@@ -62,6 +79,8 @@ void cb_record_failure_global(int ri, int bi, uint64_t now_ns, uint32_t threshol
     if (count >= threshold) {
         atomic_store_explicit(&g_backend_cb[ri][bi].open_until_ns,
                               now_ns + (uint64_t)open_ms * 1000000ULL, memory_order_release);
+        atomic_store_explicit(&g_backend_cb[ri][bi].probing, 0,
+                              memory_order_relaxed); /* reset probe slot on re-open */
         log_warn("circuit_breaker", "route=%d backend=%d OPEN after %u failures", ri, bi, count);
     }
 }
@@ -70,9 +89,10 @@ void cb_record_success_global(int ri, int bi)
 {
     if (atomic_load_explicit(&g_backend_cb[ri][bi].fail_count, memory_order_relaxed) > 0 ||
         atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_relaxed) != 0)
-        log_info("circuit_breaker", "route=%d backend=%d CLOSED", ri, bi);
+        log_info("circuit_breaker", "route=%d backend=%d CLOSED (probe succeeded)", ri, bi);
     atomic_store_explicit(&g_backend_cb[ri][bi].fail_count, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_backend_cb[ri][bi].open_until_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_backend_cb[ri][bi].open_until_ns, 0, memory_order_release);
+    atomic_store_explicit(&g_backend_cb[ri][bi].probing, 0, memory_order_relaxed);
 }
 
 static uint32_t backend_effective_weight(const struct backend_config *backend)

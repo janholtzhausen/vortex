@@ -130,6 +130,25 @@ static void *worker_thread(void *arg)
                     w->blocked_count--;
                 }
             }
+            /* Periodic: reap idle keep-alive connections (no backend request in flight).
+             * Uses last_active_tsc — set on every RECV_CLIENT and SEND_CLIENT completion.
+             * TSC frequency approximated at 3 GHz; over-estimates idle time on slower
+             * CPUs, which just means slightly more aggressive reaping (safe). */
+            {
+                uint64_t tsc_now = __builtin_ia32_rdtsc();
+                uint32_t idle_s =
+                    w->cfg->client_idle_timeout_s ? w->cfg->client_idle_timeout_s : 60;
+                uint64_t idle_tsc = (uint64_t)idle_s * 3000000000ULL;
+                for (uint32_t _i = 0; _i < w->pool.capacity; _i++) {
+                    struct conn_hot *_h = &w->pool.hot[_i];
+                    if (_h->state != CONN_STATE_PROXYING) continue;
+                    if (_h->backend_fd >= 0) continue; /* active request — skip */
+                    if (_h->last_active_tsc == 0) continue;
+                    if (tsc_now - _h->last_active_tsc < idle_tsc) continue;
+                    log_debug("idle_close", "conn=%u idle >%us — closing", _i, idle_s);
+                    conn_close(w, _i, false);
+                }
+            }
             /* Periodic: abort connections whose backend response deadline elapsed */
             {
                 struct timespec _bt;

@@ -737,11 +737,13 @@ int main(int argc, char *argv[])
             if (new_cfg && config_reload(g_config_path, new_cfg) == 0) {
                 config_resolve_backends(new_cfg);
                 /* Atomic swap: workers see new_cfg on their next event loop iteration.
-                 * Grace period: 200 ms > any single request's read window. */
+                 * Grace period must exceed the CQE wait timeout (1 s) so no worker
+                 * can still be blocked in io_uring_wait_cqe_timeout holding a stale
+                 * pointer when we free old_cfg. 2 s gives 1 s headroom. */
                 struct vortex_config *old_cfg =
                     atomic_exchange_explicit(&g_live_cfg, new_cfg, memory_order_seq_cst);
                 g_cfg = new_cfg;
-                usleep(200000);
+                usleep(2000000); /* 2 s — must be > worker CQE timeout (1 s) */
                 config_free(old_cfg);
                 if (xdp_loaded) {
                     bpf_loader_apply_config(&g_cfg->xdp);

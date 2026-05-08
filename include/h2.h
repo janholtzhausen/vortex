@@ -85,8 +85,11 @@ struct h2_grpc_backend {
 
 /* Maximum accumulated backend response for the *buffered* path
  * (Transfer-Encoding: chunked responses that cannot be streamed).
- * Non-chunked responses are streamed and have no fixed size cap. */
-#define H2_RESP_MAX (64 * 1024 * 1024)
+ * Non-chunked responses are streamed and have no fixed size cap.
+ * Also caps the send_buf growth per session to prevent a single slow H2
+ * client from exhausting server memory by holding a large flow-control window. */
+#define H2_RESP_MAX (8 * 1024 * 1024) /* 8 MB: down from 64 MB */
+#define H2_SEND_BUF_MAX (4 * 1024 * 1024) /* per-session send buffer hard cap */
 
 /* Streaming backpressure: stop reading from backend when this many body bytes
  * are pending in resp_buf but not yet consumed by the nghttp2 data provider.

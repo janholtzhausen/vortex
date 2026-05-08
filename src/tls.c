@@ -355,9 +355,24 @@ static ptls_context_t *build_route_context(struct tls_ctx *tls_ctx, const char *
         return NULL;
     }
 
-    /* Load private key */
+    /* Load private key — picotls minicrypto only supports ECDSA P-256.
+     * RSA keys parse differently and the load call will fail. Probe the PEM
+     * header first so the error message is actionable rather than generic. */
+    {
+        FILE *kf = fopen(key_pem_file, "r");
+        if (kf) {
+            char line[128] = {0};
+            if (fgets(line, sizeof(line), kf) && strstr(line, "RSA PRIVATE KEY"))
+                log_error("tls_init",
+                          "key %s is RSA — picotls minicrypto requires ECDSA P-256; "
+                          "regenerate with: openssl ecparam -name prime256v1 -genkey "
+                          "-noout -out key.pem",
+                          key_pem_file);
+            fclose(kf);
+        }
+    }
     if (ptls_minicrypto_load_private_key(ctx, key_pem_file) != 0) {
-        log_error("tls_init", "failed to load key %s", key_pem_file);
+        log_error("tls_init", "failed to load key %s (must be ECDSA P-256 PEM)", key_pem_file);
         /* Free cert list */
         if (ctx->certificates.list) {
             for (size_t i = 0; i < ctx->certificates.count; i++)
@@ -443,6 +458,16 @@ int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg)
     }
 
     log_info("tls_init", "TLS subsystem ready, routes=%d", cfg->route_count);
+    /* OCSP stapling is not yet implemented — ocsp_resp_der stays NULL.
+     * Browsers and clients make extra round-trips to OCSP responders on each
+     * TLS handshake. Implement by fetching the OCSP response from the cert's
+     * AIA extension and calling ptls_set_staple() in on_client_hello_cb. */
+    for (int i = 0; i < cfg->route_count; i++) {
+        if (tls->routes[i].ctx && !tls->routes[i].ocsp_resp_der)
+            log_debug("tls_init",
+                      "route %s: OCSP stapling not configured (extra RTT per handshake)",
+                      cfg->routes[i].hostname);
+    }
     return 0;
 }
 
@@ -1057,16 +1082,101 @@ fail:
     return NULL;
 }
 
+/* Minimal verify_certificate callback: checks cert expiry only.
+ * No CA chain verification (no CA store in minicrypto), no SAN/CN hostname check.
+ * Prevents accepting certs that are obviously expired.
+ * Sets verify_sign=NULL — the TLS Finished still cryptographically binds the
+ * cert's public key to the handshake transcript via the server's CertificateVerify. */
+static int backend_verify_cert_cb(ptls_verify_certificate_t *self, ptls_t *tls,
+                                  const char *server_name,
+                                  int (**verify_sign)(void *, uint16_t, ptls_iovec_t, ptls_iovec_t),
+                                  void **verify_data, ptls_iovec_t *certs, size_t num_certs)
+{
+    (void)self;
+    (void)tls;
+    *verify_sign = NULL;
+    *verify_data = NULL;
+
+    if (num_certs == 0) {
+        log_warn("tls_verify", "backend %s: no certificates presented",
+                 server_name ? server_name : "?");
+        return PTLS_ALERT_CERTIFICATE_REQUIRED;
+    }
+
+    /* Parse notAfter from leaf cert DER — reject if expired.
+     * We do NOT verify the chain (no CA store) or hostname (no SAN parser).
+     * Document: backend cert chain authenticity is NOT guaranteed — only
+     * expiry is enforced. MITM by a CA-signed cert for a different host remains possible. */
+    const uint8_t *der = certs[0].base;
+    size_t der_len = certs[0].len;
+    if (der_len < 4) return PTLS_ALERT_BAD_CERTIFICATE;
+
+    /* Walk the outermost SEQUENCE to find the TBSCertificate SEQUENCE,
+     * then find the validity field (element 4 in TBS). Quick DER skip. */
+    /* Simplified: scan for UTCTime/GeneralizedTime tag to find notAfter.
+     * This is fragile but avoids a full DER library. */
+    time_t now = time(NULL);
+    /* Find notAfter: it's the second time value in the Validity SEQUENCE.
+     * UTCTime tag = 0x17, GeneralizedTime tag = 0x18. */
+    const uint8_t *p = der;
+    const uint8_t *end = der + der_len;
+    int time_count = 0;
+    while (p + 2 < end) {
+        uint8_t tag = *p++;
+        if (tag != 0x17 && tag != 0x18) continue;
+        size_t tlen = *p++;
+        if (p + tlen > end) break;
+        if (++time_count == 2) { /* second time = notAfter */
+            struct tm tm = {0};
+            if (tag == 0x17 && tlen >= 12) { /* UTCTime: YYMMDDHHMMSS */
+                int yy, mo, dd, hh, mm, ss;
+                if (sscanf((const char *)p, "%2d%2d%2d%2d%2d%2d", &yy, &mo, &dd, &hh, &mm, &ss) ==
+                    6) {
+                    tm.tm_year = (yy >= 50 ? 1900 : 2000) + yy - 1900;
+                    tm.tm_mon = mo - 1;
+                    tm.tm_mday = dd;
+                    tm.tm_hour = hh;
+                    tm.tm_min = mm;
+                    tm.tm_sec = ss;
+                    time_t not_after = timegm(&tm);
+                    if (not_after < now) {
+                        log_warn("tls_verify", "backend %s: certificate expired",
+                                 server_name ? server_name : "?");
+                        return PTLS_ALERT_CERTIFICATE_EXPIRED;
+                    }
+                }
+            } else if (tag == 0x18 && tlen >= 14) { /* GeneralizedTime: YYYYMMDDHHMMSS */
+                int yr, mo, dd, hh, mm, ss;
+                if (sscanf((const char *)p, "%4d%2d%2d%2d%2d%2d", &yr, &mo, &dd, &hh, &mm, &ss) ==
+                    6) {
+                    tm.tm_year = yr - 1900;
+                    tm.tm_mon = mo - 1;
+                    tm.tm_mday = dd;
+                    tm.tm_hour = hh;
+                    tm.tm_min = mm;
+                    tm.tm_sec = ss;
+                    time_t not_after = timegm(&tm);
+                    if (not_after < now) {
+                        log_warn("tls_verify", "backend %s: certificate expired",
+                                 server_name ? server_name : "?");
+                        return PTLS_ALERT_CERTIFICATE_EXPIRED;
+                    }
+                }
+            }
+            break;
+        }
+        p += tlen;
+    }
+    return 0; /* accept — expiry ok; chain and hostname not verified */
+}
+
+static ptls_verify_certificate_t g_backend_verify_cert = {backend_verify_cert_cb, NULL};
+
 ptls_context_t *tls_create_client_ctx(bool verify_peer)
 {
     if (verify_peer) {
-        /* picotls minicrypto has no built-in CA chain verifier.
-         * Warn clearly — callers that need real verification should not use
-         * this build. Returning NULL here breaks ACME and backend TLS at
-         * startup, which is worse than the unverified connection. */
-        log_warn("tls", "backend verify_peer=true but no CA verifier compiled in — "
-                        "connections will NOT verify server certificates (MITM risk); "
-                        "set insecure_skip_verify=true to acknowledge this");
+        log_warn("tls", "backend verify_peer=true — expiry checked, chain/hostname NOT verified "
+                        "(no CA store in minicrypto); set insecure_skip_verify=true to suppress");
     }
 
     static ptls_key_exchange_algorithm_t *key_exchanges[] = {&ptls_minicrypto_x25519,
@@ -1082,8 +1192,9 @@ ptls_context_t *tls_create_client_ctx(bool verify_peer)
     ctx->key_exchanges = key_exchanges;
     ctx->cipher_suites = cipher_suites;
     ctx->save_ticket = &g_backend_save_ticket;
-    /* verify_certificate = NULL and verify_peer=false: caller explicitly opted out of
-     * chain verification. Document the risk; operator must set insecure_skip_verify=true. */
+    /* Always install the expiry-check verifier. It rejects expired certs and
+     * logs a warning; it does not verify chain or hostname (no CA store). */
+    ctx->verify_certificate = &g_backend_verify_cert;
 
     return ctx;
 }

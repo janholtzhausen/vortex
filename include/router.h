@@ -45,6 +45,7 @@ bool global_rate_limit_check(int ri, const struct route_rate_limit_config *rl);
 typedef struct {
     _Atomic uint32_t fail_count;
     _Atomic uint64_t open_until_ns;
+    _Atomic uint8_t probing; /* CAS 0→1 to claim the half-open probe slot */
 } global_cb_t;
 
 extern global_cb_t g_backend_cb[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];

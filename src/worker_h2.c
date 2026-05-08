@@ -115,6 +115,7 @@ static bool h2_send_buf_reserve(struct h2_session *sess, uint32_t need)
 {
     uint32_t required = sess->send_buf_len + need;
     if (required <= sess->send_buf_cap) return true;
+    if (required > H2_SEND_BUF_MAX) return false; /* hard cap — reject growth */
 
     uint32_t newcap = sess->send_buf_cap ? sess->send_buf_cap : H2_SEND_BUF_SIZE;
     while (newcap < required) {
@@ -124,6 +125,7 @@ static bool h2_send_buf_reserve(struct h2_session *sess, uint32_t need)
         }
         newcap *= 2;
     }
+    if (newcap > H2_SEND_BUF_MAX) newcap = H2_SEND_BUF_MAX;
 
     uint8_t *p = realloc(sess->send_buf, newcap);
     if (!p) return false;

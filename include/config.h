@@ -257,6 +257,7 @@ struct vortex_config {
     /* Maximum buffered client request body size for HTTP/2 and HTTP/3/QUIC.
      * 0 disables the limit. */
     uint32_t max_request_body_bytes;
+    uint32_t client_idle_timeout_s; /* close idle keep-alive connections; 0 = default 60 s */
 
     /* Maximum HTTP/1.1 request header block size (request line + all headers
      * up to and including \r\n\r\n).  Requests exceeding this are rejected

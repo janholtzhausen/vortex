@@ -15,6 +15,9 @@
 #include "quic.h"
 #include "log.h"
 #include "router.h"
+#include "simd.h"
+/* Route all memmem calls through the AVX2-accelerated vx_memmem */
+#define memmem(h, hl, n, nl) vx_memmem((h), (hl), (n), (nl))
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,8 +153,21 @@ struct quic_server {
 
 /* ---- Stream helpers ---- */
 
+/* QUIC client-initiated bidirectional stream IDs are 0, 4, 8, ... (step 4).
+ * Map stream_id → slot index: slot = (stream_id / 4) % QUIC_MAX_STREAMS.
+ * This gives O(1) lookup and O(1) alloc instead of O(n) linear scan. */
+static inline int stream_slot(int64_t sid)
+{
+    return (int)((sid >> 2) % QUIC_MAX_STREAMS);
+}
+
 static struct quic_stream *stream_find(struct quic_conn *c, int64_t sid)
 {
+    int slot = stream_slot(sid);
+    struct quic_stream *s = c->streams[slot];
+    /* Verify the slot actually holds this stream_id (collision guard). */
+    if (s && s->stream_id == sid) return s;
+    /* Fallback linear scan for server-initiated or colliding IDs */
     for (int i = 0; i < QUIC_MAX_STREAMS; i++)
         if (c->streams[i] && c->streams[i]->stream_id == sid) return c->streams[i];
     return NULL;
@@ -166,6 +182,13 @@ static struct quic_stream *stream_get_or_alloc(struct quic_conn *c, int64_t sid)
     if (!s) return NULL;
     s->stream_id = sid;
     s->conn = c;
+    /* Try direct slot first, then fall back to first free slot. */
+    int preferred = stream_slot(sid);
+    if (!c->streams[preferred]) {
+        c->streams[preferred] = s;
+        c->stream_count++;
+        return s;
+    }
     for (int i = 0; i < QUIC_MAX_STREAMS; i++) {
         if (!c->streams[i]) {
             c->streams[i] = s;
@@ -1059,12 +1082,25 @@ static void conn_free(struct quic_server *qs, struct quic_conn *c)
     free(c);
 }
 
+/* Simple hash of peer address for O(1) amortised lookup — FNV-1a over addr bytes. */
+static int conn_slot(const struct sockaddr *peer, socklen_t peer_len)
+{
+    const uint8_t *p = (const uint8_t *)peer;
+    uint32_t h = 2166136261u;
+    for (socklen_t i = 0; i < peer_len; i++)
+        h = (h ^ p[i]) * 16777619u;
+    return (int)(h % QUIC_MAX_CONNS);
+}
+
 static struct quic_conn *conn_find(struct quic_server *qs, const struct sockaddr *peer,
                                    socklen_t peer_len)
 {
-    for (int i = 0; i < QUIC_MAX_CONNS; i++) {
+    int start = conn_slot(peer, peer_len);
+    /* Linear probing for collision resolution */
+    for (int probe = 0; probe < QUIC_MAX_CONNS; probe++) {
+        int i = (start + probe) % QUIC_MAX_CONNS;
         struct quic_conn *c = qs->conns[i];
-        if (!c) continue;
+        if (!c) break; /* empty slot — not found */
         if (c->peer_addrlen == peer_len && memcmp(&c->peer_addr, peer, peer_len) == 0) return c;
     }
     return NULL;

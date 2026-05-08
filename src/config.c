@@ -254,6 +254,8 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
             c->max_request_body_bytes = (uint32_t)cfg_strtoul(val) * 1024U * 1024U;
         else if (!strcmp(k, "max_request_body_bytes"))
             c->max_request_body_bytes = (uint32_t)cfg_strtoul(val);
+        else if (!strcmp(k, "client_idle_timeout_s"))
+            c->client_idle_timeout_s = (uint32_t)cfg_strtoul(val);
         else if (!strcmp(k, "max_request_header_bytes"))
             c->max_request_header_bytes = (uint32_t)cfg_strtoul(val);
         else if (!strcmp(k, "run_as_user"))
@@ -808,6 +810,15 @@ int config_load(const char *path, struct vortex_config *cfg)
 
 void config_free(struct vortex_config *cfg)
 {
+    if (!cfg) return;
+    /* Scrub credential fields before returning memory to the allocator.
+     * Prevents sensitive data lingering in freed heap if a core dump is taken. */
+    for (int ri = 0; ri < cfg->route_count; ri++) {
+        struct route_config *r = &cfg->routes[ri];
+        explicit_bzero(r->backend_credentials, sizeof(r->backend_credentials));
+        explicit_bzero(r->x_api_key, sizeof(r->x_api_key));
+    }
+    explicit_bzero(cfg->acme.dns_api_token, sizeof(cfg->acme.dns_api_token));
     free(cfg);
 }
 

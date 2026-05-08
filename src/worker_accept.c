@@ -220,6 +220,21 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         cc->h2 = NULL;
     }
 #endif
+    /* Emit structured access log before freeing connection state. */
+    if (h->bytes_out > 0 || h->bytes_in > 0) {
+        char client_ip[64] = "-";
+        const struct sockaddr *sa = (const struct sockaddr *)&cc->client_addr;
+        if (sa->sa_family == AF_INET)
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)sa)->sin_addr, client_ip,
+                      sizeof(client_ip));
+        else if (sa->sa_family == AF_INET6)
+            inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, client_ip,
+                      sizeof(client_ip));
+        const char *route =
+            (h->route_idx < w->cfg->route_count) ? w->cfg->routes[h->route_idx].hostname : "-";
+        log_info("access", "client=%s route=%s bytes_in=%u bytes_out=%u %s", client_ip, route,
+                 h->bytes_in, h->bytes_out, is_error ? "error" : "ok");
+    }
     conn_free(&w->pool, cid);
     if (is_error)
         atomic_fetch_add_explicit(&w->errors, 1, memory_order_relaxed);
