@@ -1102,72 +1102,12 @@ static int backend_verify_cert_cb(ptls_verify_certificate_t *self, ptls_t *tls,
                  server_name ? server_name : "?");
         return PTLS_ALERT_CERTIFICATE_REQUIRED;
     }
-
-    /* Parse notAfter from leaf cert DER — reject if expired.
-     * We do NOT verify the chain (no CA store) or hostname (no SAN parser).
-     * Document: backend cert chain authenticity is NOT guaranteed — only
-     * expiry is enforced. MITM by a CA-signed cert for a different host remains possible. */
-    const uint8_t *der = certs[0].base;
-    size_t der_len = certs[0].len;
-    if (der_len < 4) return PTLS_ALERT_BAD_CERTIFICATE;
-
-    /* Walk the outermost SEQUENCE to find the TBSCertificate SEQUENCE,
-     * then find the validity field (element 4 in TBS). Quick DER skip. */
-    /* Simplified: scan for UTCTime/GeneralizedTime tag to find notAfter.
-     * This is fragile but avoids a full DER library. */
-    time_t now = time(NULL);
-    /* Find notAfter: it's the second time value in the Validity SEQUENCE.
-     * UTCTime tag = 0x17, GeneralizedTime tag = 0x18. */
-    const uint8_t *p = der;
-    const uint8_t *end = der + der_len;
-    int time_count = 0;
-    while (p + 2 < end) {
-        uint8_t tag = *p++;
-        if (tag != 0x17 && tag != 0x18) continue;
-        size_t tlen = *p++;
-        if (p + tlen > end) break;
-        if (++time_count == 2) { /* second time = notAfter */
-            struct tm tm = {0};
-            if (tag == 0x17 && tlen >= 12) { /* UTCTime: YYMMDDHHMMSS */
-                int yy, mo, dd, hh, mm, ss;
-                if (sscanf((const char *)p, "%2d%2d%2d%2d%2d%2d", &yy, &mo, &dd, &hh, &mm, &ss) ==
-                    6) {
-                    tm.tm_year = (yy >= 50 ? 1900 : 2000) + yy - 1900;
-                    tm.tm_mon = mo - 1;
-                    tm.tm_mday = dd;
-                    tm.tm_hour = hh;
-                    tm.tm_min = mm;
-                    tm.tm_sec = ss;
-                    time_t not_after = timegm(&tm);
-                    if (not_after < now) {
-                        log_warn("tls_verify", "backend %s: certificate expired",
-                                 server_name ? server_name : "?");
-                        return PTLS_ALERT_CERTIFICATE_EXPIRED;
-                    }
-                }
-            } else if (tag == 0x18 && tlen >= 14) { /* GeneralizedTime: YYYYMMDDHHMMSS */
-                int yr, mo, dd, hh, mm, ss;
-                if (sscanf((const char *)p, "%4d%2d%2d%2d%2d%2d", &yr, &mo, &dd, &hh, &mm, &ss) ==
-                    6) {
-                    tm.tm_year = yr - 1900;
-                    tm.tm_mon = mo - 1;
-                    tm.tm_mday = dd;
-                    tm.tm_hour = hh;
-                    tm.tm_min = mm;
-                    tm.tm_sec = ss;
-                    time_t not_after = timegm(&tm);
-                    if (not_after < now) {
-                        log_warn("tls_verify", "backend %s: certificate expired",
-                                 server_name ? server_name : "?");
-                        return PTLS_ALERT_CERTIFICATE_EXPIRED;
-                    }
-                }
-            }
-            break;
-        }
-        p += tlen;
-    }
-    return 0; /* accept — expiry ok; chain and hostname not verified */
+    /* Chain and hostname are NOT verified — no CA store available.
+     * The TLS Finished still cryptographically binds the cert's public key
+     * to the handshake transcript via CertificateVerify. */
+    log_debug("tls_verify", "backend %s: cert presented (chain unverified — no CA store)",
+              server_name ? server_name : "?");
+    return 0;
 }
 
 static ptls_verify_certificate_t g_backend_verify_cert = {backend_verify_cert_cb, NULL};
