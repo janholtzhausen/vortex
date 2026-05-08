@@ -5,6 +5,9 @@
 #include "../include/config.h"
 #include "../include/router.h"
 
+/* 3 MB struct — BSS, not stack */
+static struct vortex_config g_test_cfg;
+
 #define ASSERT(cond, msg)                                                                          \
     do {                                                                                           \
         if (!(cond)) {                                                                             \
@@ -45,12 +48,12 @@ int main(void)
     printf("=== test_router ===\n");
 
     {
-        struct vortex_config cfg;
+        struct vortex_config *cfg = &g_test_cfg;
         struct router r;
         int counts[2] = {0, 0};
 
-        init_weighted_route(&cfg);
-        ASSERT(router_init(&r, &cfg) == 0, "router_init weighted route");
+        init_weighted_route(cfg);
+        ASSERT(router_init(&r, cfg) == 0, "router_init weighted route");
         for (int i = 0; i < 8; i++) {
             int bi = router_select_backend(&r, 0, 0);
             ASSERT(bi >= 0 && bi < 2, "weighted RR selected valid backend");
@@ -62,11 +65,11 @@ int main(void)
     }
 
     {
-        struct vortex_config cfg;
+        struct vortex_config *cfg = &g_test_cfg;
         struct router r;
 
-        init_least_conn_route(&cfg);
-        ASSERT(router_init(&r, &cfg) == 0, "router_init least_conn route");
+        init_least_conn_route(cfg);
+        ASSERT(router_init(&r, cfg) == 0, "router_init least_conn route");
         ASSERT(router_select_backend(&r, 0, 0) == 0, "least_conn tie breaks to backend 0 first");
         router_backend_active_inc(0, 0);
         ASSERT(router_select_backend(&r, 0, 0) == 1, "least_conn prefers less-loaded backend");

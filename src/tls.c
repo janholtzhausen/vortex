@@ -846,10 +846,34 @@ int tls_gen_self_signed(const char *cert_path, const char *key_path, const char 
     (void)priv;
     (void)pub65;
 
+    /* Sanitize CN: allow only hostname chars to prevent -subj injection */
+    for (const char *p = cn; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '.' || c == '_' || c == '*')) {
+            log_error("gen_cert", "invalid char in CN '%s'", cn);
+            return -1;
+        }
+    }
+
     char subj[256];
     char san[256];
     snprintf(subj, sizeof(subj), "/CN=%s", cn);
     snprintf(san, sizeof(san), "subjectAltName=DNS:%s,IP:127.0.0.1", cn);
+
+    /* Use absolute path — avoids CWE-426 (untrusted search path via PATH env var) */
+    static const char *openssl_paths[] = {"/usr/bin/openssl", "/usr/local/bin/openssl", NULL};
+    const char *openssl_bin = NULL;
+    for (int i = 0; openssl_paths[i]; i++) {
+        if (access(openssl_paths[i], X_OK) == 0) {
+            openssl_bin = openssl_paths[i];
+            break;
+        }
+    }
+    if (!openssl_bin) {
+        log_error("gen_cert", "openssl not found at known paths");
+        return -1;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -862,10 +886,10 @@ int tls_gen_self_signed(const char *cert_path, const char *key_path, const char 
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        execvp("openssl", (char *const[]){"openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
-                                          "ec_paramgen_curve:P-256", "-keyout", (char *)key_path,
-                                          "-out", (char *)cert_path, "-days", "365", "-nodes",
-                                          "-subj", subj, "-addext", san, NULL});
+        execv(openssl_bin, (char *const[]){"openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
+                                           "ec_paramgen_curve:P-256", "-keyout", (char *)key_path,
+                                           "-out", (char *)cert_path, "-days", "365", "-nodes",
+                                           "-subj", subj, "-addext", san, NULL});
         _exit(127);
     }
 

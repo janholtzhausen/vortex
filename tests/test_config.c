@@ -7,6 +7,10 @@
 #include "../include/config.h"
 #include "../include/log.h"
 
+/* 3 MB struct — keep in BSS (file-scope static), not on the stack.
+ * Stack-allocating vortex_config causes stack overflow under ASan/UBSan. */
+static struct vortex_config g_test_cfg;
+
 #define ASSERT(cond, msg)                                                                          \
     do {                                                                                           \
         if (!(cond)) {                                                                             \
@@ -92,16 +96,17 @@ int main(void)
 
     /* Test 1: defaults */
     {
-        struct vortex_config cfg;
-        config_set_defaults(&cfg);
-        ASSERT(cfg.bind_port == 443, "default bind_port=443");
-        ASSERT(cfg.http_port == 80, "default http_port=80");
-        ASSERT(cfg.max_request_body_bytes == 8U * 1024U * 1024U,
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        config_set_defaults(cfg);
+        ASSERT(cfg->bind_port == 443, "default bind_port=443");
+        ASSERT(cfg->http_port == 80, "default http_port=80");
+        ASSERT(cfg->max_request_body_bytes == 8U * 1024U * 1024U,
                "default max_request_body_bytes=8MB");
-        ASSERT(cfg.tls.ktls == true, "default ktls=true");
-        ASSERT(cfg.cache.enabled == true, "default cache.enabled=true");
-        ASSERT(cfg.cache.index_entries == 16384, "default index_entries=16384");
-        ASSERT(cfg.metrics.port == 9090, "default metrics.port=9090");
+        ASSERT(cfg->tls.ktls == true, "default ktls=true");
+        ASSERT(cfg->cache.enabled == true, "default cache.enabled=true");
+        ASSERT(cfg->cache.index_entries == 16384, "default index_entries=16384");
+        ASSERT(cfg->metrics.port == 9090, "default metrics.port=9090");
     }
 
     /* Test 2: load from file */
@@ -109,33 +114,34 @@ int main(void)
         const char *tmpfile = "/tmp/vortex_test.yaml";
         write_test_yaml(tmpfile);
 
-        struct vortex_config cfg;
-        int ret = config_load(tmpfile, &cfg);
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        int ret = config_load(tmpfile, cfg);
         ASSERT(ret == 0, "config_load returns 0");
-        ASSERT(cfg.workers == 4, "workers=4");
-        ASSERT(cfg.bind_port == 8443, "bind_port=8443");
-        ASSERT(cfg.max_request_body_bytes == 4U * 1024U * 1024U, "max_request_body_mb=4");
-        ASSERT(!strcmp(cfg.interface, "lo"), "interface=lo");
-        ASSERT(!strcmp(cfg.log_level, "debug"), "log_level=debug");
-        ASSERT(cfg.tls.ktls == false, "tls.ktls=false");
-        ASSERT(cfg.tls.session_timeout == 1800, "session_timeout=1800");
-        ASSERT(cfg.xdp.mode == XDP_MODE_SKB, "xdp.mode=skb");
-        ASSERT(cfg.xdp.rate_limit_rps == 500, "rate_limit_rps=500");
-        ASSERT(cfg.xdp.rate_limit_burst == 1000, "rate_limit_burst=1000");
-        ASSERT(cfg.cache.index_entries == 2048, "cache.index_entries=2048");
-        ASSERT(cfg.cache.slab_size_bytes == 32ULL * 1024 * 1024, "slab_size_mb=32");
-        ASSERT(cfg.cache.default_ttl == 120, "cache.default_ttl=120");
-        ASSERT(cfg.metrics.port == 9091, "metrics.port=9091");
-        ASSERT(cfg.route_count == 1, "route_count=1");
-        ASSERT(!strcmp(cfg.routes[0].hostname, "test.example.com"), "route hostname");
-        ASSERT(cfg.routes[0].backend_count == 1, "backend_count=1");
-        ASSERT(!strcmp(cfg.routes[0].backends[0].address, "10.0.0.1:8080"), "backend address");
-        ASSERT(cfg.routes[0].cert_provider == CERT_PROVIDER_STATIC, "cert_provider=static");
-        ASSERT(cfg.routes[0].auth.enabled == true, "route auth.enabled");
-        ASSERT(cfg.routes[0].auth.credential_count == 1, "route auth verifier count=1");
-        ASSERT(!strcmp(cfg.routes[0].auth.verifiers[0].username, "admin"), "route auth username");
-        ASSERT(cfg.routes[0].cache.enabled == true, "route cache.enabled");
-        ASSERT(cfg.routes[0].cache.ttl == 60, "route cache.ttl=60");
+        ASSERT(cfg->workers == 4, "workers=4");
+        ASSERT(cfg->bind_port == 8443, "bind_port=8443");
+        ASSERT(cfg->max_request_body_bytes == 4U * 1024U * 1024U, "max_request_body_mb=4");
+        ASSERT(!strcmp(cfg->interface, "lo"), "interface=lo");
+        ASSERT(!strcmp(cfg->log_level, "debug"), "log_level=debug");
+        ASSERT(cfg->tls.ktls == false, "tls.ktls=false");
+        ASSERT(cfg->tls.session_timeout == 1800, "session_timeout=1800");
+        ASSERT(cfg->xdp.mode == XDP_MODE_SKB, "xdp.mode=skb");
+        ASSERT(cfg->xdp.rate_limit_rps == 500, "rate_limit_rps=500");
+        ASSERT(cfg->xdp.rate_limit_burst == 1000, "rate_limit_burst=1000");
+        ASSERT(cfg->cache.index_entries == 2048, "cache.index_entries=2048");
+        ASSERT(cfg->cache.slab_size_bytes == 32ULL * 1024 * 1024, "slab_size_mb=32");
+        ASSERT(cfg->cache.default_ttl == 120, "cache.default_ttl=120");
+        ASSERT(cfg->metrics.port == 9091, "metrics.port=9091");
+        ASSERT(cfg->route_count == 1, "route_count=1");
+        ASSERT(!strcmp(cfg->routes[0].hostname, "test.example.com"), "route hostname");
+        ASSERT(cfg->routes[0].backend_count == 1, "backend_count=1");
+        ASSERT(!strcmp(cfg->routes[0].backends[0].address, "10.0.0.1:8080"), "backend address");
+        ASSERT(cfg->routes[0].cert_provider == CERT_PROVIDER_STATIC, "cert_provider=static");
+        ASSERT(cfg->routes[0].auth.enabled == true, "route auth.enabled");
+        ASSERT(cfg->routes[0].auth.credential_count == 1, "route auth verifier count=1");
+        ASSERT(!strcmp(cfg->routes[0].auth.verifiers[0].username, "admin"), "route auth username");
+        ASSERT(cfg->routes[0].cache.enabled == true, "route cache.enabled");
+        ASSERT(cfg->routes[0].cache.ttl == 60, "route cache.ttl=60");
 
         unlink(tmpfile);
     }
@@ -151,19 +157,21 @@ int main(void)
                    "    api_token: \"${TEST_API_TOKEN}\"\n");
         fclose(f);
 
-        struct vortex_config cfg;
-        config_set_defaults(&cfg);
-        int ret = config_load(tmpfile, &cfg);
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        config_set_defaults(cfg);
+        int ret = config_load(tmpfile, cfg);
         ASSERT(ret == 0, "env var config loads");
-        ASSERT(!strcmp(cfg.acme.dns_api_token, "mysecrettoken"),
+        ASSERT(!strcmp(cfg->acme.dns_api_token, "mysecrettoken"),
                "env var ${TEST_API_TOKEN} expanded");
         unlink(tmpfile);
     }
 
     /* Test 4: nonexistent file */
     {
-        struct vortex_config cfg;
-        int ret = config_load("/nonexistent/path/vortex.yaml", &cfg);
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        int ret = config_load("/nonexistent/path/vortex.yaml", cfg);
         ASSERT(ret == -1, "nonexistent config returns -1");
     }
 
@@ -179,8 +187,9 @@ int main(void)
                    "      enabled: true\n");
         fclose(f);
 
-        struct vortex_config cfg;
-        int ret = config_load(tmpfile, &cfg);
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        int ret = config_load(tmpfile, cfg);
         ASSERT(ret == -1, "enabled auth without verifiers returns -1");
         unlink(tmpfile);
     }
@@ -199,8 +208,9 @@ int main(void)
                    "        - \"admin:plaintext\"\n");
         fclose(f);
 
-        struct vortex_config cfg;
-        int ret = config_load(tmpfile, &cfg);
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        int ret = config_load(tmpfile, cfg);
         ASSERT(ret == -1, "invalid auth verifier returns -1");
         unlink(tmpfile);
     }
@@ -222,11 +232,12 @@ int main(void)
                 authfile);
         fclose(f);
 
-        struct vortex_config cfg;
-        int ret = config_load(cfgfile, &cfg);
+        struct vortex_config *cfg = &g_test_cfg;
+        memset(cfg, 0, sizeof(*cfg));
+        int ret = config_load(cfgfile, cfg);
         ASSERT(ret == 0, "auth.file config loads");
-        ASSERT(cfg.routes[0].auth.credential_count == 1, "auth.file verifier count=1");
-        ASSERT(!strcmp(cfg.routes[0].auth.verifiers[0].username, "admin"), "auth.file username");
+        ASSERT(cfg->routes[0].auth.credential_count == 1, "auth.file verifier count=1");
+        ASSERT(!strcmp(cfg->routes[0].auth.verifiers[0].username, "admin"), "auth.file username");
         unlink(cfgfile);
         unlink(authfile);
     }
