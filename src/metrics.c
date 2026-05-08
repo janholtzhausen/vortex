@@ -3,6 +3,8 @@
 #include "bpf_loader.h"
 #include "tls_pool.h"
 #include "compress_pool.h"
+#include "router.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,6 +140,29 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
                          "# TYPE vortex_cert_expiry_seconds gauge\n"
                          "vortex_cert_expiry_seconds{hostname=\"%s\"} %lld\n",
                          ms->cert_info[i].hostname, (long long)(ms->cert_info[i].not_after - now));
+        }
+    }
+
+    /* Circuit breaker state per (route, backend) — 1=open, 0=closed */
+    {
+        const struct vortex_config *_cfg = config_live();
+        if (_cfg) {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &_ts);
+            uint64_t now_cb_ns = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+            pos += snprintf(buf + pos, bufsz - pos,
+                            "# HELP vortex_circuit_breaker_open Circuit breaker state (1=open, "
+                            "0=closed)\n"
+                            "# TYPE vortex_circuit_breaker_open gauge\n");
+            for (int ri = 0; ri < _cfg->route_count; ri++) {
+                const struct route_config *rc = &_cfg->routes[ri];
+                for (int bi = 0; bi < rc->backend_count; bi++) {
+                    pos += snprintf(buf + pos, bufsz - pos,
+                                    "vortex_circuit_breaker_open{route=\"%s\",backend=\"%s\"} %d\n",
+                                    rc->hostname, rc->backends[bi].address,
+                                    cb_is_open_global(ri, bi, now_cb_ns) ? 1 : 0);
+                }
+            }
         }
     }
 

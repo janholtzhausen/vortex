@@ -1266,8 +1266,27 @@ static int ensure_dir(const char *path)
     return mkdir(path, 0700);
 }
 
+/* Validate domain is safe for use as a filesystem path component.
+ * Rejects anything containing '/', '\', or "..". Only hostname chars allowed.
+ * Prevents path traversal when constructing cert storage paths. */
+static int domain_is_safe(const char *domain)
+{
+    if (!domain || !domain[0]) return 0;
+    for (const char *p = domain; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '.' || c == '_' || c == '*'))
+            return 0;
+    }
+    /* Reject pure dot sequences: ".", ".." */
+    if (domain[0] == '.' && (domain[1] == '\0' || (domain[1] == '.' && domain[2] == '\0')))
+        return 0;
+    return 1;
+}
+
 static char *cert_path_for(const char *storage, const char *domain, const char *suffix)
 {
+    if (!domain_is_safe(domain)) return NULL;
     static char buf[4096];
     snprintf(buf, sizeof(buf), "%s/%s/%s", storage, domain, suffix);
     return buf;
@@ -1609,6 +1628,10 @@ int acme_obtain_http01(struct acme_client *cl, const char *domain,
 
     /* 10. Save to storage_path/domain/ */
     {
+        if (!domain_is_safe(domain)) {
+            log_error("acme", "unsafe domain name rejected: %s", domain);
+            goto done;
+        }
         char dom_dir[4096];
         snprintf(dom_dir, sizeof(dom_dir), "%s/%s", cl->storage_path, domain);
         ensure_dir(cl->storage_path);
@@ -1650,12 +1673,14 @@ int acme_obtain_http01(struct acme_client *cl, const char *domain,
     rc = 0;
 
 done:
+    explicit_bzero(domain_priv, sizeof(domain_priv));
     free(resp);
     return rc;
 }
 
 int acme_needs_renewal(const char *storage_path, const char *domain, int renewal_days)
 {
+    if (!domain_is_safe(domain)) return 0; /* treat unsafe domain as no-renewal-needed */
     char path[4096];
     snprintf(path, sizeof(path), "%s/%s/cert.pem", storage_path, domain);
 

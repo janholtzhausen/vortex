@@ -1453,8 +1453,11 @@ static int grpc_be_on_header_cb(nghttp2_session *ngh2, const nghttp2_frame *fram
 
     if (!is_trailer) {
         /* :status pseudo-header */
-        if (namelen == 7 && memcmp(name, ":status", 7) == 0)
-            grpc->resp_status = atoi((const char *)value);
+        if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
+            char *_ep;
+            long _s = strtol((const char *)value, &_ep, 10);
+            grpc->resp_status = (_ep != (const char *)value && _s > 0 && _s < 1000) ? (int)_s : 0;
+        }
         /* Store header for forwarding */
         if (grpc->resp_nhdrs < H2_GRPC_MAX_HDRS) {
             struct h2_grpc_hdr *h = &grpc->resp_hdrs[grpc->resp_nhdrs++];

@@ -449,6 +449,9 @@ static void handle_scalar(parser_ctx_t *ctx, const char *val_raw)
             bool insecure = !strcmp(val, "true") || !strcmp(val, "yes");
             b->verify_peer = !insecure;
             b->verify_peer_set = true;
+            if (insecure)
+                log_warn("config", "backend TLS: insecure_skip_verify=true disables cert "
+                                   "verification — MITM risk");
         }
         break;
     }

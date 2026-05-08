@@ -77,6 +77,7 @@ static void pbkdf2_sha256(const uint8_t *pass, size_t pass_len, const uint8_t *s
         uint8_t blk_be[4] = {(uint8_t)(block_num >> 24), (uint8_t)(block_num >> 16),
                              (uint8_t)(block_num >> 8), (uint8_t)(block_num)};
         ptls_hash_context_t *hmac = ptls_hmac_create(&ptls_minicrypto_sha256, pass, pass_len);
+        if (!hmac) return;
         hmac->update(hmac, salt, salt_len);
         hmac->update(hmac, blk_be, 4);
         hmac->final(hmac, u, PTLS_HASH_FINAL_MODE_FREE);
@@ -84,6 +85,7 @@ static void pbkdf2_sha256(const uint8_t *pass, size_t pass_len, const uint8_t *s
 
         for (uint32_t i = 1; i < c; i++) {
             ptls_hash_context_t *h2 = ptls_hmac_create(&ptls_minicrypto_sha256, pass, pass_len);
+            if (!h2) return;
             h2->update(h2, u, HLEN);
             h2->final(h2, u, PTLS_HASH_FINAL_MODE_FREE);
             for (int j = 0; j < HLEN; j++)

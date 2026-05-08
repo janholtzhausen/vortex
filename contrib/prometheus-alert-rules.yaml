@@ -1,0 +1,82 @@
+groups:
+  - name: vortex
+    rules:
+
+      # Certificate expiry — warn 7 days out, critical 24 hours out
+      - alert: VortexCertExpiringWarning
+        expr: vortex_cert_expiry_seconds < 604800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vortex cert expiring in <7d: {{ $labels.hostname }}"
+          description: "Certificate for {{ $labels.hostname }} expires in {{ $value | humanizeDuration }}. Trigger ACME renewal."
+
+      - alert: VortexCertExpiringCritical
+        expr: vortex_cert_expiry_seconds < 86400
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Vortex cert expires in <24h: {{ $labels.hostname }}"
+          description: "Certificate for {{ $labels.hostname }} is about to expire. Immediate action required."
+
+      # Service restart detection
+      - alert: VortexRestarted
+        expr: vortex_uptime_seconds < 60
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vortex restarted (uptime < 60s)"
+          description: "Vortex process restarted. Check systemd logs: journalctl -u vortex -n 50"
+
+      # TLS handshake pool saturation
+      - alert: VortexTLSPoolDropping
+        expr: increase(vortex_tls_pool_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vortex TLS pool dropping handshakes"
+          description: "{{ $value }} TLS handshakes dropped in last 5 minutes. Increase tls_pool_threads."
+
+      # Backend circuit breaker open
+      - alert: VortexCircuitBreakerOpen
+        expr: vortex_circuit_breaker_open == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend circuit breaker OPEN: {{ $labels.route }} -> {{ $labels.backend }}"
+          description: "Backend {{ $labels.backend }} for route {{ $labels.route }} is failing. Check backend health."
+
+      # Worker pool exhaustion
+      - alert: VortexWorkerPoolExhausted
+        expr: increase(vortex_worker_pool_exhausted[1m]) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Vortex worker connection pool exhausted (returning 503)"
+          description: "Vortex is rejecting connections due to pool exhaustion. Scale workers or reduce connection count."
+
+      # Cache nearly full (evictions outpacing stores)
+      - alert: VortexCacheHighEvictionRate
+        expr: rate(vortex_cache_evictions_total[5m]) > rate(vortex_cache_stores_total[5m]) * 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vortex cache eviction rate is high"
+          description: "Cache eviction rate exceeds 50% of store rate. Consider increasing slab_size_mb."
+
+      # XDP rate limiting firing — potential DDoS
+      - alert: VortexXDPRateLimitActive
+        expr: rate(vortex_xdp_dropped_ratelimit_total[1m]) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vortex XDP rate limiter active (>100 drops/s)"
+          description: "High rate of SYN packets being rate-limited. Potential DDoS or misconfigured client."

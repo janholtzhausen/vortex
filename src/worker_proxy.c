@@ -1696,7 +1696,20 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
         if (eol) {
             size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
 
-            /* Build inject block */
+            /* Build inject block.
+             * INJ_ADD: accumulate snprintf bytes; clamp on truncation so
+             * subsequent calls never receive a wrapped-negative size_t. */
+#define INJ_ADD(fmt, ...)                                                                          \
+    do {                                                                                           \
+        int _rem = (int)sizeof(inj) - inj_len;                                                     \
+        if (_rem > 1) {                                                                            \
+            int _w = snprintf(inj + inj_len, (size_t)_rem, fmt, ##__VA_ARGS__);                    \
+            if (_w >= _rem)                                                                        \
+                inj_len = (int)sizeof(inj) - 1; /* truncated: stop adding */                       \
+            else if (_w > 0)                                                                       \
+                inj_len += _w;                                                                     \
+        }                                                                                          \
+    } while (0)
             char inj[HEADER_INJ_BUF_SIZE];
             int inj_len = 0;
 
@@ -1719,36 +1732,28 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
                     inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, ipstr,
                               sizeof(ipstr));
                 if (ipstr[0]) {
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                        "X-Real-IP: %s\r\nX-Forwarded-For: %s\r\n", ipstr, ipstr);
+                    INJ_ADD("X-Real-IP: %s\r\nX-Forwarded-For: %s\r\n", ipstr, ipstr);
                 }
             }
 
             /* Accept-Encoding: identity — only when not already rewritten above */
-            if (!ae_present)
-                inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                    "Accept-Encoding: identity\r\n");
+            if (!ae_present) INJ_ADD("Accept-Encoding: identity\r\n");
 
             /* X-Api-Key if configured */
-            if (rc_fwd->x_api_key[0])
-                inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                    "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
+            if (rc_fwd->x_api_key[0]) INJ_ADD("X-Api-Key: %s\r\n", rc_fwd->x_api_key);
 
             /* Backend Basic Auth credentials — injected when in REWRITE mode. */
             if (ba_mode == BACKEND_AUTH_REWRITE && rc_fwd->backend_credentials[0]) {
                 char b64[512];
                 b64_encode(rc_fwd->backend_credentials, strlen(rc_fwd->backend_credentials), b64,
                            sizeof(b64));
-                inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                    "Authorization: Basic %s\r\n", b64);
+                INJ_ADD("Authorization: Basic %s\r\n", b64);
             }
 
             /* Custom SET rules (backend_headers) */
             for (int _ri = 0; _ri < rc_fwd->backend_header_count; _ri++) {
                 const struct backend_header_rule *hr = &rc_fwd->backend_headers[_ri];
-                if (hr->action == HEADER_ACTION_SET)
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len, "%s: %s\r\n",
-                                        hr->name, hr->value);
+                if (hr->action == HEADER_ACTION_SET) INJ_ADD("%s: %s\r\n", hr->name, hr->value);
             }
 
             if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
@@ -2135,24 +2140,17 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
                 size_t line_end = (size_t)(eol - (const char *)rbuf) + 2;
                 char inj[HEADER_INJ_BUF_SIZE];
                 int inj_len = 0;
-                if (!ae_present)
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                        "Accept-Encoding: identity\r\n");
-                if (rc_fwd->x_api_key[0])
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                        "X-Api-Key: %s\r\n", rc_fwd->x_api_key);
+                if (!ae_present) INJ_ADD("Accept-Encoding: identity\r\n");
+                if (rc_fwd->x_api_key[0]) INJ_ADD("X-Api-Key: %s\r\n", rc_fwd->x_api_key);
                 if (ba_mode == BACKEND_AUTH_REWRITE && rc_fwd->backend_credentials[0]) {
                     char b64[512];
                     b64_encode(rc_fwd->backend_credentials, strlen(rc_fwd->backend_credentials),
                                b64, sizeof(b64));
-                    inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                        "Authorization: Basic %s\r\n", b64);
+                    INJ_ADD("Authorization: Basic %s\r\n", b64);
                 }
                 for (int _ri = 0; _ri < rc_fwd->backend_header_count; _ri++) {
                     const struct backend_header_rule *hr = &rc_fwd->backend_headers[_ri];
-                    if (hr->action == HEADER_ACTION_SET)
-                        inj_len += snprintf(inj + inj_len, sizeof(inj) - (size_t)inj_len,
-                                            "%s: %s\r\n", hr->name, hr->value);
+                    if (hr->action == HEADER_ACTION_SET) INJ_ADD("%s: %s\r\n", hr->name, hr->value);
                 }
                 if (inj_len > 0 && fwd_n + inj_len <= (int)w->pool.buf_size) {
                     memmove(rbuf + line_end + inj_len, rbuf + line_end, (size_t)fwd_n - line_end);

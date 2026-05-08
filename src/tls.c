@@ -107,6 +107,17 @@ static int install_ktls_direction(int fd, const uint8_t *key, const uint8_t *iv,
     return 0;
 }
 
+/* Constant-time byte comparison — prevents timing side-channel on key IDs. */
+static int tls_ct_memcmp(const void *a, const void *b, size_t n)
+{
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    unsigned int diff = 0;
+    for (size_t i = 0; i < n; i++)
+        diff |= pa[i] ^ pb[i];
+    return diff != 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Per-connection state (stored in ptls user-data pointer)             */
 /* ------------------------------------------------------------------ */
@@ -163,7 +174,7 @@ static int ticket_encrypt_decrypt(ptls_encrypt_ticket_t *self, ptls_t *tls, int 
             ptls_aead_encrypt(aead, dst->base + dst->off, src.base, src.len, 0, NULL, 0);
         ptls_aead_free(aead);
         dst->off += enc_len;
-        memset(key, 0, 32);
+        explicit_bzero(key, 32);
         return 0;
     } else {
         /* Decrypt: src = key_id(8) | nonce(12) | ciphertext+tag */
@@ -178,11 +189,11 @@ static int ticket_encrypt_decrypt(ptls_encrypt_ticket_t *self, ptls_t *tls, int 
 
         pthread_mutex_lock(&tctx->ticket_lock);
         if (tctx->have_current_ticket_key &&
-            memcmp(key_id, tctx->current_ticket_key.key_id, 8) == 0) {
+            tls_ct_memcmp(key_id, tctx->current_ticket_key.key_id, 8) == 0) {
             memcpy(key, tctx->current_ticket_key.key, 32);
             found = true;
         } else if (tctx->have_previous_ticket_key &&
-                   memcmp(key_id, tctx->previous_ticket_key.key_id, 8) == 0) {
+                   tls_ct_memcmp(key_id, tctx->previous_ticket_key.key_id, 8) == 0) {
             memcpy(key, tctx->previous_ticket_key.key, 32);
             found = true;
         }
@@ -191,12 +202,12 @@ static int ticket_encrypt_decrypt(ptls_encrypt_ticket_t *self, ptls_t *tls, int 
         if (!found) return PTLS_ERROR_SESSION_NOT_FOUND;
 
         if (ptls_buffer_reserve(dst, cipher_len) != 0) {
-            memset(key, 0, 32);
+            explicit_bzero(key, 32);
             return PTLS_ERROR_NO_MEMORY;
         }
 
         ptls_aead_context_t *aead = ptls_aead_new_direct(&ptls_minicrypto_aes256gcm, 0, key, nonce);
-        memset(key, 0, 32);
+        explicit_bzero(key, 32);
         if (!aead) return PTLS_ERROR_LIBRARY;
 
         size_t plain_len =
