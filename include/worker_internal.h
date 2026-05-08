@@ -172,11 +172,8 @@ void tarpit_conn(struct worker *w, int fd);
 void conn_close(struct worker *w, uint32_t cid, bool is_error);
 
 /* worker_backend.c */
-bool cb_is_open(struct worker *w, int ri, int bi, uint64_t now_ns);
-void cb_record_failure(struct worker *w, int ri, int bi, uint64_t now_ns, uint32_t cfg_threshold,
-                       uint32_t cfg_open_ms);
-void cb_record_success(struct worker *w, int ri, int bi);
 int select_available_backend(struct worker *w, int ri, uint32_t client_ip);
+/* CB/RL globals — see router.h */
 void backend_deadline_set(struct worker *w, uint32_t cid, uint32_t timeout_ms);
 int begin_async_connect(struct worker *w, const struct backend_config *bcfg, uint32_t cid);
 bool backend_uses_tls(struct worker *w, uint32_t cid);

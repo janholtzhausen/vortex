@@ -42,11 +42,16 @@ struct {
     __type(value, struct port_config);
 } port_config_map SEC(".maps");
 
-// Helper to clamp TCP window to 1 byte
-static __always_inline void clamp_tcp_window(struct tcphdr *tcp)
+/* Clamp TCP window to 1 byte and fix the TCP checksum incrementally (RFC 1624).
+ * Without the checksum update, clamped packets are dropped by many client stacks. */
+static __always_inline void clamp_tcp_window(struct __sk_buff *skb, struct tcphdr *tcp,
+                                             __u32 tcp_off)
 {
-    // Set window size to 1 byte (in network byte order)
-    tcp->window = bpf_htons(1);
+    __u16 old_win = tcp->window;
+    __u16 new_win = bpf_htons(1);
+    tcp->window = new_win;
+    bpf_l4_csum_replace(skb, tcp_off + offsetof(struct tcphdr, check), old_win, new_win,
+                        sizeof(__u16));
 }
 
 /* Check if a port is in the protected ports list */
@@ -106,8 +111,8 @@ int tc_egress_tarpit(struct __sk_buff *skb)
         if (blocked && *blocked) {
             // Only tarpit egress to protected ports
             if (is_protected_port(tcp->dest)) {
-                // TARPIT: Clamp TCP window to 1 byte in egress packets
-                clamp_tcp_window(tcp);
+                __u32 tcp_off = (__u32)((void *)tcp - data);
+                clamp_tcp_window(skb, tcp, tcp_off);
             }
         }
         return 0;
@@ -135,8 +140,8 @@ int tc_egress_tarpit(struct __sk_buff *skb)
         if (blocked && *blocked) {
             // Only tarpit egress to protected ports
             if (is_protected_port(tcp6->dest)) {
-                // TARPIT: Clamp TCP window to 1 byte in egress packets
-                clamp_tcp_window(tcp6);
+                __u32 tcp_off6 = (__u32)((void *)tcp6 - data);
+                clamp_tcp_window(skb, tcp6, tcp_off6);
             }
         }
         return 0;

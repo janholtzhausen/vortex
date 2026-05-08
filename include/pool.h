@@ -33,6 +33,7 @@
 struct global_backend_conn {
     int fd;
     void *ssl;
+    uint32_t pooled_at_s; /* coarse CLOCK_MONOTONIC seconds at put time */
 };
 
 struct global_fd_pool {
@@ -46,23 +47,45 @@ extern struct global_fd_pool g_backend_pools[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKE
 void global_pool_init(void);
 void global_pool_destroy(void);
 
-/* Returns a pooled backend connection or false if the pool is empty. */
+/* Default idle TTL: 55 s (just under nginx's 60 s keepalive_timeout default). */
+#define POOL_IDLE_TTL_S 55
+
+static inline uint32_t pool_coarse_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return (uint32_t)ts.tv_sec;
+}
+
+/* Returns a fresh pooled backend connection or false if pool is empty/stale. */
 static inline bool global_pool_get(int ri, int bi, struct global_backend_conn *out)
 {
     struct global_fd_pool *p = &g_backend_pools[ri][bi];
+    uint32_t now_s = pool_coarse_s();
     pthread_spin_lock(&p->spin);
-    bool ok = p->count > 0;
-    if (ok && out) {
-        *out = p->conns[--p->count];
-        p->conns[p->count] = (struct global_backend_conn){.fd = -1, .ssl = NULL};
+    while (p->count > 0) {
+        struct global_backend_conn c = p->conns[--p->count];
+        p->conns[p->count] = (struct global_backend_conn){.fd = -1};
+        pthread_spin_unlock(&p->spin);
+        if (now_s - c.pooled_at_s <= POOL_IDLE_TTL_S) {
+            if (out) *out = c;
+            return true;
+        }
+        /* Stale — discard */
+        close(c.fd);
+#ifdef VORTEX_PHASE_TLS
+        if (c.ssl) ptls_free((ptls_t *)c.ssl);
+#endif
+        pthread_spin_lock(&p->spin);
     }
     pthread_spin_unlock(&p->spin);
-    return ok;
+    return false;
 }
 
-/* Returns a backend connection to the pool. */
+/* Returns a backend connection to the pool, stamping idle timestamp. */
 static inline void global_pool_put(int ri, int bi, struct global_backend_conn conn, int cap)
 {
+    conn.pooled_at_s = pool_coarse_s();
     struct global_fd_pool *p = &g_backend_pools[ri][bi];
     int slots = (cap < GLOBAL_POOL_SLOTS) ? cap : GLOBAL_POOL_SLOTS;
     pthread_spin_lock(&p->spin);

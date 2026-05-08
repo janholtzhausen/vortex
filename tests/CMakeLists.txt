@@ -42,6 +42,8 @@ add_executable(test_cache
     test_cache.c
     ../src/cache.c
     ../src/log.c
+    ../src/worker_cache.c
+    ../src/simd.c
 )
 target_include_directories(test_cache PRIVATE
     ../include
@@ -97,8 +99,28 @@ target_include_directories(test_router PRIVATE
 target_link_libraries(test_router ${YAML_LIBRARIES} pthread)
 target_link_directories(test_router PRIVATE ${YAML_LIBRARY_DIRS})
 
-add_test(NAME test_config COMMAND $<TARGET_FILE:test_config>)
-add_test(NAME test_log    COMMAND $<TARGET_FILE:test_log>)
-add_test(NAME test_cache  COMMAND $<TARGET_FILE:test_cache>)
-add_test(NAME test_auth   COMMAND $<TARGET_FILE:test_auth>)
-add_test(NAME test_router COMMAND $<TARGET_FILE:test_router>)
+add_executable(test_circuit_breaker
+    test_circuit_breaker.c
+    ../src/router.c
+    ../src/log.c
+)
+target_include_directories(test_circuit_breaker PRIVATE ../include ../src)
+target_link_libraries(test_circuit_breaker pthread)
+
+add_executable(test_config_reload
+    test_config_reload.c
+    ../src/config.c
+    ../src/auth.c
+    ../src/log.c
+)
+target_include_directories(test_config_reload PRIVATE ../include ../src ../bpf ${YAML_INCLUDE_DIRS})
+target_link_libraries(test_config_reload ${YAML_LIBRARIES} pthread)
+target_link_directories(test_config_reload PRIVATE ${YAML_LIBRARY_DIRS})
+
+add_test(NAME test_config         COMMAND $<TARGET_FILE:test_config>)
+add_test(NAME test_log            COMMAND $<TARGET_FILE:test_log>)
+add_test(NAME test_cache          COMMAND $<TARGET_FILE:test_cache>)
+add_test(NAME test_auth           COMMAND $<TARGET_FILE:test_auth>)
+add_test(NAME test_router         COMMAND $<TARGET_FILE:test_router>)
+add_test(NAME test_circuit_breaker COMMAND $<TARGET_FILE:test_circuit_breaker>)
+add_test(NAME test_config_reload  COMMAND $<TARGET_FILE:test_config_reload>)

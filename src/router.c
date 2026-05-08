@@ -1,13 +1,79 @@
+#define _GNU_SOURCE
 #include "router.h"
 #include "log.h"
 #include "util.h"
 
 #include <string.h>
 #include <stdlib.h>
-#define _GNU_SOURCE
+#include <time.h>
 #include <fnmatch.h>
 
 static uint32_t g_backend_active[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
+
+/* ---- Global rate limiter ---- */
+global_rate_bucket_t g_route_rl[VORTEX_MAX_ROUTES];
+
+bool global_rate_limit_check(int ri, const struct route_rate_limit_config *rl)
+{
+    if (!rl->enabled || rl->rps == 0) return true;
+    uint32_t max_tokens = rl->burst ? rl->burst : rl->rps;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    uint64_t old_ns = atomic_load_explicit(&g_route_rl[ri].last_ns, memory_order_relaxed);
+    if (now_ns > old_ns) {
+        uint64_t elapsed = now_ns - old_ns;
+        uint32_t add = (uint32_t)(elapsed / (1000000000ULL / rl->rps));
+        if (add > 0) {
+            uint32_t cur = atomic_load_explicit(&g_route_rl[ri].tokens, memory_order_relaxed);
+            uint32_t next = cur + add > max_tokens ? max_tokens : cur + add;
+            atomic_store_explicit(&g_route_rl[ri].tokens, next, memory_order_relaxed);
+            atomic_store_explicit(&g_route_rl[ri].last_ns, now_ns, memory_order_relaxed);
+        }
+    }
+
+    uint32_t cur;
+    do {
+        cur = atomic_load_explicit(&g_route_rl[ri].tokens, memory_order_relaxed);
+        if (cur == 0) return false;
+    } while (!atomic_compare_exchange_weak_explicit(&g_route_rl[ri].tokens, &cur, cur - 1,
+                                                    memory_order_relaxed, memory_order_relaxed));
+    return true;
+}
+
+/* ---- Global circuit breaker ---- */
+global_cb_t g_backend_cb[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
+
+bool cb_is_open_global(int ri, int bi, uint64_t now_ns)
+{
+    uint64_t until =
+        atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_relaxed);
+    return until != 0 && now_ns < until;
+}
+
+void cb_record_failure_global(int ri, int bi, uint64_t now_ns, uint32_t threshold, uint32_t open_ms)
+{
+    if (!threshold) threshold = 3;
+    if (!open_ms) open_ms = 10000;
+    uint32_t count =
+        atomic_fetch_add_explicit(&g_backend_cb[ri][bi].fail_count, 1, memory_order_relaxed) + 1;
+    if (count >= threshold) {
+        atomic_store_explicit(&g_backend_cb[ri][bi].open_until_ns,
+                              now_ns + (uint64_t)open_ms * 1000000ULL, memory_order_release);
+        log_warn("circuit_breaker", "route=%d backend=%d OPEN after %u failures", ri, bi, count);
+    }
+}
+
+void cb_record_success_global(int ri, int bi)
+{
+    if (atomic_load_explicit(&g_backend_cb[ri][bi].fail_count, memory_order_relaxed) > 0 ||
+        atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_relaxed) != 0)
+        log_info("circuit_breaker", "route=%d backend=%d CLOSED", ri, bi);
+    atomic_store_explicit(&g_backend_cb[ri][bi].fail_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_backend_cb[ri][bi].open_until_ns, 0, memory_order_relaxed);
+}
 
 static uint32_t backend_effective_weight(const struct backend_config *backend)
 {

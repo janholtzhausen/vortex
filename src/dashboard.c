@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "router.h"
 #include "dashboard.h"
 #include "bpf_loader.h"
 #include "log.h"
@@ -528,8 +529,10 @@ static int build_snapshot_json(struct dashboard_server *ds, struct route_sample 
             bool seen_half_open = false;
             for (int wi = 0; wi < ds->num_workers; wi++) {
                 struct worker *w = ds->workers[wi];
-                uint32_t fail_count = w->backend_cb[ri][bi].fail_count;
-                uint64_t open_until = w->backend_cb[ri][bi].open_until_ns;
+                uint32_t fail_count =
+                    atomic_load_explicit(&g_backend_cb[ri][bi].fail_count, memory_order_relaxed);
+                uint64_t open_until =
+                    atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_relaxed);
                 if (fail_count > max_fail_count) max_fail_count = fail_count;
                 if (open_until > max_open_until) max_open_until = open_until;
                 if (open_until != 0 && open_until <= now_ns) seen_half_open = true;

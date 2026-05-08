@@ -113,17 +113,9 @@ void tarpit_conn(struct worker *w, int fd)
                 snprintf(ipstr, sizeof(ipstr), "family:%d", ss.ss_family);
             }
 
-            log_info("tarpit", "fd=%d ip=%s total=%llu", fd, ipstr,
+            /* Route through log.c — uses its internal mutex, safe for N workers. */
+            log_info("tarpit", "ip=%s worker=%d total=%llu", ipstr, w->worker_id,
                      (unsigned long long)(w->tarpit_total + 1));
-
-            if (w->tarpit_log) {
-                time_t now = time(NULL);
-                struct tm tm;
-                gmtime_r(&now, &tm);
-                fprintf(w->tarpit_log, "%04d-%02d-%02dT%02d:%02d:%02dZ %s\n", tm.tm_year + 1900,
-                        tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ipstr);
-                fflush(w->tarpit_log);
-            }
         }
     }
 
@@ -230,7 +222,7 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
 #endif
     conn_free(&w->pool, cid);
     if (is_error)
-        w->errors++;
+        atomic_fetch_add_explicit(&w->errors, 1, memory_order_relaxed);
     else
-        w->completed++;
+        atomic_fetch_add_explicit(&w->completed, 1, memory_order_relaxed);
 }

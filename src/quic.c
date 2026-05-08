@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
+#include <semaphore.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -376,6 +377,7 @@ push:;
     free(resp_buf); /* NULL if transferred, else discard */
     free(pa->req_body);
     free(pa);
+    sem_post(&g_quic_backend_sem); /* release backend thread slot */
     return NULL;
 }
 
@@ -444,6 +446,13 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
 
         pthread_t t;
         pthread_attr_t attr;
+        if (sem_trywait(&g_quic_backend_sem) != 0) {
+            log_warn("quic", "backend thread pool full (%d) — dropping stream",
+                     QUIC_BACKEND_MAX_THREADS);
+            free(pa->req_body);
+            free(pa);
+            goto err_503;
+        }
         router_backend_active_inc(route_idx, backend_idx);
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -452,11 +461,18 @@ static void dispatch_request(struct quic_conn *c, struct quic_stream *s)
             return; /* proxy thread will push completion via eventfd */
         }
         pthread_attr_destroy(&attr);
+        sem_post(&g_quic_backend_sem);
         router_backend_active_dec(route_idx, backend_idx);
         free(pa->req_body);
         free(pa);
     }
 
+err_503:;
+    {
+        static const char r503[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        s->resp_buf = dup_http_response(r503, &s->resp_len);
+        return;
+    }
 err_502:;
     static const char r502[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
     s->resp_buf = dup_http_response(r502, &s->resp_len);
@@ -551,6 +567,10 @@ static int cb_get_path_challenge_data(ngtcp2_conn *conn, uint8_t *data, void *us
     ptls_minicrypto_random_bytes(data, NGTCP2_PATH_CHALLENGE_DATALEN);
     return 0;
 }
+
+/* Semaphore bounding concurrent QUIC backend proxy threads. */
+#define QUIC_BACKEND_MAX_THREADS 256
+static sem_t g_quic_backend_sem;
 
 static const ngtcp2_callbacks g_quic_cbs = {
     .recv_client_initial = cb_recv_client_initial,
@@ -1320,6 +1340,7 @@ int quic_server_init(struct quic_server **out, struct tls_ctx *tls, struct cache
 
 int quic_server_start(struct quic_server *qs)
 {
+    sem_init(&g_quic_backend_sem, 0, QUIC_BACKEND_MAX_THREADS);
     return pthread_create(&qs->thread, NULL, quic_thread, qs);
 }
 

@@ -279,7 +279,17 @@ struct vortex_config {
 };
 
 int config_load(const char *path, struct vortex_config *cfg);
+struct vortex_config *config_alloc(void); /* calloc + defaults */
 void config_free(struct vortex_config *cfg);
 int config_reload(const char *path, struct vortex_config *cfg);
 void config_set_defaults(struct vortex_config *cfg);
 void config_resolve_backends(struct vortex_config *cfg);
+
+/* Global live config pointer — atomically swapped on reload.
+ * Workers call config_live() once per event-loop batch to refresh w->cfg. */
+#include <stdatomic.h>
+extern _Atomic(struct vortex_config *) g_live_cfg;
+static inline struct vortex_config *config_live(void)
+{
+    return atomic_load_explicit(&g_live_cfg, memory_order_acquire);
+}

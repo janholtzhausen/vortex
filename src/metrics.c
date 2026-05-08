@@ -55,13 +55,13 @@ static void generate_metrics(struct metrics_server *ms, char *buf, size_t bufsz,
     uint64_t total_active = 0;
     uint64_t total_tls12 = 0, total_tls13 = 0, total_ktls = 0;
     for (int i = 0; i < ms->num_workers; i++) {
-        total_accepted += ms->workers[i]->accepted;
-        total_completed += ms->workers[i]->completed;
-        total_errors += ms->workers[i]->errors;
+        total_accepted += atomic_load_explicit(&ms->workers[i]->accepted, memory_order_relaxed);
+        total_completed += atomic_load_explicit(&ms->workers[i]->completed, memory_order_relaxed);
+        total_errors += atomic_load_explicit(&ms->workers[i]->errors, memory_order_relaxed);
         total_active += ms->workers[i]->pool.active;
-        total_tls12 += ms->workers[i]->tls12_count;
-        total_tls13 += ms->workers[i]->tls13_count;
-        total_ktls += ms->workers[i]->ktls_count;
+        total_tls12 += atomic_load_explicit(&ms->workers[i]->tls12_count, memory_order_relaxed);
+        total_tls13 += atomic_load_explicit(&ms->workers[i]->tls13_count, memory_order_relaxed);
+        total_ktls += atomic_load_explicit(&ms->workers[i]->ktls_count, memory_order_relaxed);
     }
 
     write_metric_gauge(buf, &pos, bufsz, "vortex_connections_active",

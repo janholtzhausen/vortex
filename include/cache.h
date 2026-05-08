@@ -56,6 +56,7 @@ struct cache {
     struct cache_index_entry *index; /* mmap'd, hugepage-backed if available */
     size_t index_capacity; /* Power of 2 */
     size_t index_mask;
+    size_t clock_hand; /* CLOCK eviction hand — advances each eviction call */
 
     uint8_t *slab; /* RAM slab (anonymous mmap) */
     size_t slab_size;

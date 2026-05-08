@@ -92,6 +92,10 @@ static void *worker_thread(void *arg)
     w->uring.defer_submit = true;
 
     while (!atomic_load_explicit(&w->stop, memory_order_relaxed)) {
+        /* Refresh config pointer: atomic load picks up any SIGHUP reload. */
+        struct vortex_config *_live = config_live();
+        if (_live) w->cfg = _live;
+
         struct io_uring_cqe *cqe;
         unsigned head;
         unsigned count = 0;
@@ -139,9 +143,9 @@ static void *worker_thread(void *arg)
                     if (now_ns < _cold->backend_deadline_ns) continue;
                     /* Deadline breached — record CB failure, send 504, close */
                     int _ri = _h->route_idx, _bi = _h->backend_idx;
-                    cb_record_failure(w, _ri, _bi, now_ns,
-                                      w->cfg->routes[_ri].health.fail_threshold,
-                                      w->cfg->routes[_ri].health.open_ms);
+                    cb_record_failure_global(_ri, _bi, now_ns,
+                                             w->cfg->routes[_ri].health.fail_threshold,
+                                             w->cfg->routes[_ri].health.open_ms);
                     log_warn("backend_timeout", "conn=%u route=%d backend=%d timed out", _i, _ri,
                              _bi);
                     _cold->backend_deadline_ns = 0;
@@ -173,8 +177,9 @@ static void *worker_thread(void *arg)
     }
 
     log_info("worker_stop", "id=%d accepted=%llu completed=%llu errors=%llu", w->worker_id,
-             (unsigned long long)w->accepted, (unsigned long long)w->completed,
-             (unsigned long long)w->errors);
+             (unsigned long long)atomic_load_explicit(&w->accepted, memory_order_relaxed),
+             (unsigned long long)atomic_load_explicit(&w->completed, memory_order_relaxed),
+             (unsigned long long)atomic_load_explicit(&w->errors, memory_order_relaxed));
 
     /* ---- Graceful ring drain ----
      * io_uring_unregister_buffers() (inside uring_destroy) blocks until all
@@ -377,8 +382,6 @@ int worker_init(struct worker *w, int id, int listen_fd, uint32_t capacity,
     }
 
     /* Open tarpit log */
-    w->tarpit_log = fopen("/var/log/vortex/tarpit.log", "a");
-    if (!w->tarpit_log) log_warn("worker_init", "cannot open tarpit log: %s", strerror(errno));
 
     if (conn_pool_init(&w->pool, capacity, WORKER_BUF_SIZE, cfg->hugepages) != 0) {
 #ifdef VORTEX_PHASE_TLS
@@ -508,10 +511,6 @@ void worker_destroy(struct worker *w)
     if (w->compress_done_pipe_wr >= 0) {
         close(w->compress_done_pipe_wr);
         w->compress_done_pipe_wr = -1;
-    }
-    if (w->tarpit_log) {
-        fclose(w->tarpit_log);
-        w->tarpit_log = NULL;
     }
 #ifdef VORTEX_PHASE_TLS
     if (w->backend_tls_client_ctx) {

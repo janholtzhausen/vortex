@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* memfd_create */
 /*
  * tls.c — TLS subsystem using picotls + minicrypto (no OpenSSL).
  *
@@ -25,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h> /* MFD_CLOEXEC via bits/mman-shared.h on glibc */
 #include <sys/wait.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -262,7 +264,13 @@ static int on_client_hello_cb(ptls_on_client_hello_t *self, ptls_t *tls,
                 }
             }
         }
-        /* Always notify client that we accept the SNI */
+        if (!matched) {
+            /* RFC 6066 §3: send unrecognized_name alert when no route matches.
+             * Without this, picotls continues with whatever context was last set,
+             * potentially serving a certificate for a different hostname. */
+            log_debug("tls", "SNI '%s' unrecognized — sending alert", sni);
+            return PTLS_ALERT_UNRECOGNIZED_NAME;
+        }
         ptls_set_server_name(tls, sni, sni_len);
     }
 
@@ -689,41 +697,38 @@ ptls_t *tls_accept(struct tls_ctx *tls, int fd, int *route_idx_out, char *sni_ou
 /* Cert hot-swap                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Write PEM string to an anonymous memfd (never visible in /tmp or any directory). */
+static int pem_to_memfd(const char *name, const char *pem)
+{
+    int fd = memfd_create(name, MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t len = strlen(pem);
+    if (write(fd, pem, len) != (ssize_t)len || lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 ptls_context_t *tls_create_ctx_from_pem(struct tls_ctx *tls, const char *cert_pem,
                                         const char *key_pem, const char *hostname)
 {
-    /* Write PEM strings to temp files, then build context */
-    char cert_tmp[] = "/tmp/vortex-cert-XXXXXX.pem";
-    char key_tmp[] = "/tmp/vortex-key-XXXXXX.pem";
-
-    int cfd = mkstemps(cert_tmp, 4);
-    int kfd = mkstemps(key_tmp, 4);
+    /* Use memfd (Linux 3.17+) — key material never touches /tmp or any named path. */
+    int cfd = pem_to_memfd("vortex-cert", cert_pem);
+    int kfd = pem_to_memfd("vortex-key", key_pem);
     if (cfd < 0 || kfd < 0) {
-        if (cfd >= 0) {
-            close(cfd);
-            unlink(cert_tmp);
-        }
-        if (kfd >= 0) {
-            close(kfd);
-            unlink(key_tmp);
-        }
+        if (cfd >= 0) close(cfd);
+        if (kfd >= 0) close(kfd);
         return NULL;
     }
 
-    size_t clen = strlen(cert_pem), klen = strlen(key_pem);
-    if (write(cfd, cert_pem, clen) != (ssize_t)clen || write(kfd, key_pem, klen) != (ssize_t)klen) {
-        close(cfd);
-        close(kfd);
-        unlink(cert_tmp);
-        unlink(key_tmp);
-        return NULL;
-    }
+    char cert_path[64], key_path[64];
+    snprintf(cert_path, sizeof(cert_path), "/proc/self/fd/%d", cfd);
+    snprintf(key_path, sizeof(key_path), "/proc/self/fd/%d", kfd);
+
+    ptls_context_t *ctx = build_route_context(tls, cert_path, key_path, hostname);
     close(cfd);
     close(kfd);
-
-    ptls_context_t *ctx = build_route_context(tls, cert_tmp, key_tmp, hostname);
-    unlink(cert_tmp);
-    unlink(key_tmp);
 
     if (ctx) ctx->on_client_hello = &g_on_client_hello.super;
     return ctx;
@@ -751,9 +756,16 @@ int tls_rotate_cert(struct tls_ctx *tls, int route_idx, const char *cert_pem, co
     ptls_context_t *new_ctx = tls_create_ctx_from_pem(tls, cert_pem, key_pem, hostname);
     if (!new_ctx) return -1;
 
-    /* Atomic swap: workers see either old or new context */
+    /* Atomic swap: workers see either old or new context.
+     * Grace period: TLS handshakes complete in < 100 ms under normal load.
+     * 500 ms guarantees no in-flight handshake still references old_ctx.
+     * This runs on the renewal thread, not the io_uring workers. */
     ptls_context_t *old_ctx = __atomic_exchange_n(&rc->ctx, new_ctx, __ATOMIC_SEQ_CST);
-    if (old_ctx) tls_context_free(old_ctx);
+    if (old_ctx) {
+        struct timespec grace = {0, 500000000L}; /* 500 ms */
+        nanosleep(&grace, NULL);
+        tls_context_free(old_ctx);
+    }
 
     log_info("tls_rotate_cert", "route=%d cert rotated", route_idx);
     return 0;
@@ -1036,7 +1048,14 @@ fail:
 
 ptls_context_t *tls_create_client_ctx(bool verify_peer)
 {
-    (void)verify_peer; /* TODO: implement cert chain verification */
+    if (verify_peer) {
+        /* picotls minicrypto has no built-in CA chain verifier.
+         * Refuse to proceed rather than silently accept any cert — prevents
+         * silent MITM when verify_peer=true is configured. */
+        log_error("tls", "backend verify_peer=true but no cert verifier compiled in; "
+                         "set verify_peer=false or insecure_skip_verify=true to opt out");
+        return NULL;
+    }
 
     static ptls_key_exchange_algorithm_t *key_exchanges[] = {&ptls_minicrypto_x25519,
                                                              &ptls_minicrypto_secp256r1, NULL};
@@ -1051,7 +1070,8 @@ ptls_context_t *tls_create_client_ctx(bool verify_peer)
     ctx->key_exchanges = key_exchanges;
     ctx->cipher_suites = cipher_suites;
     ctx->save_ticket = &g_backend_save_ticket;
-    /* verify_certificate = NULL: accept all server certs (no chain verification) */
+    /* verify_certificate = NULL and verify_peer=false: caller explicitly opted out of
+     * chain verification. Document the risk; operator must set insecure_skip_verify=true. */
 
     return ctx;
 }

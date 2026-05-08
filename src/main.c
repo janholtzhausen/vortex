@@ -42,7 +42,7 @@
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload = 0;
 static const char *g_config_path = NULL;
-static struct vortex_config g_cfg;
+static struct vortex_config *g_cfg; /* heap-allocated; swapped atomically on reload */
 static int g_pid_file_written = 0;
 
 static void sig_handler(int sig)
@@ -175,14 +175,14 @@ static void *renewal_thread_fn(void *arg)
 #ifdef VORTEX_ACME
         if (!g_acme_inited) continue;
 
-        for (int i = 0; i < g_cfg.route_count; i++) {
-            const struct route_config *r = &g_cfg.routes[i];
+        for (int i = 0; i < g_cfg->route_count; i++) {
+            const struct route_config *r = &g_cfg->routes[i];
             if (r->cert_provider != CERT_PROVIDER_ACME_HTTP01 &&
                 r->cert_provider != CERT_PROVIDER_ACME_DNS01)
                 continue;
 
-            int days = g_cfg.acme.renewal_days > 0 ? g_cfg.acme.renewal_days : 30;
-            if (!acme_needs_renewal(g_cfg.acme.storage_path, r->hostname, days)) continue;
+            int days = g_cfg->acme.renewal_days > 0 ? g_cfg->acme.renewal_days : 30;
+            if (!acme_needs_renewal(g_cfg->acme.storage_path, r->hostname, days)) continue;
 
             log_info("renewal", "renewing cert for %s", r->hostname);
             struct cert_result res;
@@ -325,16 +325,16 @@ static void cert_manager_reload_static(void)
      * the new route_count.  Workers read route_count atomically; if we bumped
      * it first, a worker could attempt a handshake for a route whose ssl_ctx
      * is still NULL, falling back to route 0 and presenting the wrong cert. */
-    if (g_cfg.route_count > g_tls.route_count) {
-        for (int i = g_tls.route_count; i < g_cfg.route_count; i++)
+    if (g_cfg->route_count > g_tls.route_count) {
+        for (int i = g_tls.route_count; i < g_cfg->route_count; i++)
             memset(&g_tls.routes[i], 0, sizeof(g_tls.routes[i]));
         /* ssl_ctx for new routes will be set in the loop below;
          * route_count is updated at the end of this function after the loop. */
     }
 
     /* On SIGHUP: re-read static certs from disk */
-    for (int i = 0; i < g_cfg.route_count; i++) {
-        struct route_config *r = &g_cfg.routes[i];
+    for (int i = 0; i < g_cfg->route_count; i++) {
+        struct route_config *r = &g_cfg->routes[i];
         if (r->cert_provider != CERT_PROVIDER_STATIC) continue;
         if (!r->cert_path[0]) continue;
 
@@ -374,9 +374,9 @@ static void cert_manager_reload_static(void)
      * stop before that index so workers never see a NULL ctx slot.
      * A full sequential barrier ensures workers that load the new route_count
      * will also see all the ctx writes that precede it. */
-    if (g_cfg.route_count > g_tls.route_count) {
+    if (g_cfg->route_count > g_tls.route_count) {
         int new_route_count = g_tls.route_count;
-        for (int i = g_tls.route_count; i < g_cfg.route_count; i++) {
+        for (int i = g_tls.route_count; i < g_cfg->route_count; i++) {
             if (!g_tls.routes[i].ctx) break;
             new_route_count = i + 1;
         }
@@ -435,27 +435,33 @@ int main(int argc, char *argv[])
     /* Early log init — will be re-inited after config load */
     log_init(verbose ? LOG_DEBUG : LOG_INFO, LOG_FMT_TEXT, NULL);
 
-    if (config_load(config_path, &g_cfg) != 0) {
+    g_cfg = config_alloc();
+    if (!g_cfg) {
+        fprintf(stderr, "OOM\n");
+        return 1;
+    }
+    if (config_load(config_path, g_cfg) != 0) {
         fprintf(stderr, "Failed to load config: %s\n", config_path);
         return 1;
     }
-    config_resolve_backends(&g_cfg);
+    atomic_store_explicit(&g_live_cfg, g_cfg, memory_order_release);
+    config_resolve_backends(g_cfg);
 
     if (test_config) {
-        printf("Config OK: %d routes\n", g_cfg.route_count);
+        printf("Config OK: %d routes\n", g_cfg->route_count);
         return 0;
     }
 
     /* Re-init logging with config settings */
     log_level_t lvl = LOG_INFO;
     log_format_t fmt = LOG_FMT_JSON;
-    if (!strcmp(g_cfg.log_level, "debug"))
+    if (!strcmp(g_cfg->log_level, "debug"))
         lvl = LOG_DEBUG;
-    else if (!strcmp(g_cfg.log_level, "warn"))
+    else if (!strcmp(g_cfg->log_level, "warn"))
         lvl = LOG_WARN;
-    else if (!strcmp(g_cfg.log_level, "error"))
+    else if (!strcmp(g_cfg->log_level, "error"))
         lvl = LOG_ERROR;
-    if (!strcmp(g_cfg.log_format, "text")) fmt = LOG_FMT_TEXT;
+    if (!strcmp(g_cfg->log_format, "text")) fmt = LOG_FMT_TEXT;
     if (verbose) lvl = LOG_DEBUG;
     log_init(lvl, fmt, NULL);
 
@@ -485,17 +491,17 @@ int main(int argc, char *argv[])
     }
 
     if (!foreground) {
-        if (write_pid_file(g_cfg.pid_file) == 0) g_pid_file_written = 1;
+        if (write_pid_file(g_cfg->pid_file) == 0) g_pid_file_written = 1;
     }
 
     /* Phase 1: Load XDP program if interface and BPF obj are configured */
     int xdp_loaded = 0;
-    if (!g_no_xdp && g_bpf_obj_path[0] != '\0' && g_cfg.interface[0] != '\0') {
-        if (bpf_loader_init(g_bpf_obj_path, g_cfg.interface) == 0) {
+    if (!g_no_xdp && g_bpf_obj_path[0] != '\0' && g_cfg->interface[0] != '\0') {
+        if (bpf_loader_init(g_bpf_obj_path, g_cfg->interface) == 0) {
             xdp_loaded = 1;
-            log_info("xdp_loaded", "interface=%s", g_cfg.interface);
+            log_info("xdp_loaded", "interface=%s", g_cfg->interface);
             /* Phase 5: apply rate limit config and load blocklist */
-            bpf_loader_apply_config(&g_cfg.xdp);
+            bpf_loader_apply_config(&g_cfg->xdp);
         } else {
             log_warn("xdp_load_failed", "continuing without XDP");
         }
@@ -509,8 +515,8 @@ int main(int argc, char *argv[])
      * Runs before tls_init so that ACME routes have certs available. */
     int tls_needed = 0;
     if (!g_no_tls) {
-        for (int i = 0; i < g_cfg.route_count; i++) {
-            struct route_config *r = &g_cfg.routes[i];
+        for (int i = 0; i < g_cfg->route_count; i++) {
+            struct route_config *r = &g_cfg->routes[i];
             if (r->cert_path[0] != '\0' || r->cert_provider == CERT_PROVIDER_ACME_HTTP01) {
                 tls_needed = 1;
                 break;
@@ -520,16 +526,16 @@ int main(int argc, char *argv[])
     struct tls_ctx *tls_ptr = NULL;
     if (tls_needed) {
         /* Init TLS providers first so cert_manager can use libctx for ACME HTTPS */
-        if (tls_init(&g_tls, &g_cfg) != 0) {
+        if (tls_init(&g_tls, g_cfg) != 0) {
             log_error("main", "TLS init failed");
             if (xdp_loaded) bpf_loader_detach();
             return 1;
         }
         /* Now run cert manager (needs g_tls.libctx for outbound HTTPS) */
-        cert_manager_init(&g_cfg);
+        cert_manager_init(g_cfg);
         /* Re-init TLS contexts with any newly obtained certs */
         tls_destroy(&g_tls);
-        if (tls_init(&g_tls, &g_cfg) != 0) {
+        if (tls_init(&g_tls, g_cfg) != 0) {
             log_error("main", "TLS re-init after cert obtain failed");
             if (xdp_loaded) bpf_loader_detach();
             return 1;
@@ -544,7 +550,7 @@ int main(int argc, char *argv[])
 #endif
 
     /* Determine worker count */
-    int num_workers = g_cfg.workers;
+    int num_workers = g_cfg->workers;
     if (num_workers <= 0) {
         num_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (num_workers <= 0) num_workers = 1;
@@ -557,14 +563,16 @@ int main(int argc, char *argv[])
     /* Shared backend connection pool — must be initialised before workers start */
     global_pool_init();
 
-    bool cache_enabled = g_cfg.cache.enabled;
+    bool cache_enabled = g_cfg->cache.enabled;
     if (cache_enabled) {
-        uint32_t total_entries = g_cfg.cache.index_entries > 0 ? g_cfg.cache.index_entries : 16384;
+        uint32_t total_entries =
+            g_cfg->cache.index_entries > 0 ? g_cfg->cache.index_entries : 16384;
         size_t total_slab =
-            g_cfg.cache.slab_size_bytes > 0 ? g_cfg.cache.slab_size_bytes : (64ULL * 1024 * 1024);
+            g_cfg->cache.slab_size_bytes > 0 ? g_cfg->cache.slab_size_bytes : (64ULL * 1024 * 1024);
         /* disk slab: one shared path not split — per-worker RAM only */
-        const char *disk_path = g_cfg.cache.disk_cache_path[0] ? g_cfg.cache.disk_cache_path : NULL;
-        size_t disk_bytes = (size_t)g_cfg.cache.disk_slab_size_bytes;
+        const char *disk_path =
+            g_cfg->cache.disk_cache_path[0] ? g_cfg->cache.disk_cache_path : NULL;
+        size_t disk_bytes = (size_t)g_cfg->cache.disk_slab_size_bytes;
 
         uint32_t entries_per = total_entries / (uint32_t)num_workers;
         if (entries_per < 64) entries_per = 64;
@@ -572,9 +580,9 @@ int main(int argc, char *argv[])
         if (slab_per < 1024 * 1024) slab_per = 1024 * 1024;
 
         for (int i = 0; i < num_workers; i++) {
-            if (cache_init(&g_worker_caches[i], entries_per, slab_per, g_cfg.cache.use_hugepages,
-                           disk_path, disk_bytes, g_cfg.cache.etag_sha256,
-                           g_cfg.cache.verify_crc) == 0) {
+            if (cache_init(&g_worker_caches[i], entries_per, slab_per, g_cfg->cache.use_hugepages,
+                           disk_path, disk_bytes, g_cfg->cache.etag_sha256,
+                           g_cfg->cache.verify_crc) == 0) {
                 g_cache_initialized_count++;
                 /* Only the first worker gets the disk slab to avoid double-mapping */
                 disk_path = NULL;
@@ -588,22 +596,22 @@ int main(int argc, char *argv[])
 
 #ifdef VORTEX_PHASE_TLS
     /* TLS handshake thread pool — shared across all workers */
-    bool need_tls_pool = (tls_ptr != NULL) || config_uses_backend_tls(&g_cfg);
+    bool need_tls_pool = (tls_ptr != NULL) || config_uses_backend_tls(g_cfg);
     if (need_tls_pool) tls_pool_init();
 #endif
-    bool need_compress_pool = g_cfg.compress_pool_threads > 0;
+    bool need_compress_pool = g_cfg->compress_pool_threads > 0;
 
     /* Drop privileges now: listen sockets and BPF programs are loaded.
      * After this point we no longer need root. */
-    if (g_cfg.run_as_user[0] != '\0') {
-        struct passwd *pw = getpwnam(g_cfg.run_as_user);
+    if (g_cfg->run_as_user[0] != '\0') {
+        struct passwd *pw = getpwnam(g_cfg->run_as_user);
         if (!pw) {
-            log_error("main", "run_as_user '%s' not found", g_cfg.run_as_user);
+            log_error("main", "run_as_user '%s' not found", g_cfg->run_as_user);
             if (xdp_loaded) bpf_loader_detach();
             return 1;
         }
         if (setgroups(0, NULL) != 0 || setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0) {
-            log_error("main", "privilege drop to '%s' failed: %s", g_cfg.run_as_user,
+            log_error("main", "privilege drop to '%s' failed: %s", g_cfg->run_as_user,
                       strerror(errno));
             if (xdp_loaded) bpf_loader_detach();
             return 1;
@@ -623,23 +631,23 @@ int main(int argc, char *argv[])
     g_num_workers = num_workers;
     for (int i = 0; i < num_workers; i++) {
         int lfd =
-            worker_create_listener(g_cfg.bind_address, g_cfg.bind_port, 1024, g_cfg.ipv4_only);
+            worker_create_listener(g_cfg->bind_address, g_cfg->bind_port, 1024, g_cfg->ipv4_only);
         if (lfd < 0) {
-            log_error("main", "failed to create listener %d on %s:%d", i, g_cfg.bind_address,
-                      g_cfg.bind_port);
+            log_error("main", "failed to create listener %d on %s:%d", i, g_cfg->bind_address,
+                      g_cfg->bind_port);
             num_workers = i;
             break;
         }
         struct cache *wcache =
             (cache_enabled && i < g_cache_initialized_count) ? &g_worker_caches[i] : NULL;
-        if (worker_init(&g_workers[i], i, lfd, pool_cap, &g_cfg, tls_ptr, wcache) != 0) {
+        if (worker_init(&g_workers[i], i, lfd, pool_cap, g_cfg, tls_ptr, wcache) != 0) {
             log_error("main", "worker_init failed for worker %d", i);
             close(lfd);
             num_workers = i;
             break;
         }
         if (need_compress_pool)
-            compress_pool_init(&g_workers[i].compress_pool, g_cfg.compress_pool_threads);
+            compress_pool_init(&g_workers[i].compress_pool, g_cfg->compress_pool_threads);
         if (worker_start(&g_workers[i]) != 0) {
             log_error("main", "worker_start failed for worker %d", i);
             num_workers = i;
@@ -656,14 +664,14 @@ int main(int argc, char *argv[])
     struct worker *worker_ptrs[MAX_WORKERS];
     for (int i = 0; i < num_workers; i++)
         worker_ptrs[i] = &g_workers[i];
-    if (g_cfg.metrics.enabled) {
-        metrics_init(&g_metrics, g_cfg.metrics.bind_address, g_cfg.metrics.port, worker_ptrs,
+    if (g_cfg->metrics.enabled) {
+        metrics_init(&g_metrics, g_cfg->metrics.bind_address, g_cfg->metrics.port, worker_ptrs,
                      num_workers);
 #ifdef VORTEX_PHASE_TLS
         /* Populate cert expiry info for Prometheus */
         g_cert_info_count = 0;
-        for (int i = 0; i < g_cfg.route_count && i < VORTEX_MAX_ROUTES; i++) {
-            const struct route_config *r = &g_cfg.routes[i];
+        for (int i = 0; i < g_cfg->route_count && i < VORTEX_MAX_ROUTES; i++) {
+            const struct route_config *r = &g_cfg->routes[i];
             if (!r->cert_path[0]) continue;
             struct cert_result cr;
             memset(&cr, 0, sizeof(cr));
@@ -683,8 +691,8 @@ int main(int argc, char *argv[])
         metrics_start(&g_metrics);
     }
 
-    if (g_cfg.dashboard.enabled) {
-        if (dashboard_init(&g_dashboard, g_cfg.dashboard.bind_address, g_cfg.dashboard.port,
+    if (g_cfg->dashboard.enabled) {
+        if (dashboard_init(&g_dashboard, g_cfg->dashboard.bind_address, g_cfg->dashboard.port,
                            worker_ptrs, num_workers, &g_cfg) == 0) {
             if (dashboard_start(&g_dashboard) != 0) {
                 log_warn("main", "dashboard thread start failed");
@@ -702,8 +710,8 @@ int main(int argc, char *argv[])
 #ifdef VORTEX_QUIC
     /* Start QUIC/HTTP3 server (needs TLS to have been set up) */
     if (tls_ptr && tls_ptr->route_count > 0) {
-        if (quic_server_init(&g_quic, tls_ptr, NULL, &g_cfg, g_cfg.bind_address, g_cfg.bind_port) ==
-            0) {
+        if (quic_server_init(&g_quic, tls_ptr, NULL, &g_cfg, g_cfg->bind_address,
+                             g_cfg->bind_port) == 0) {
             if (quic_server_start(g_quic) != 0) {
                 log_warn("main", "QUIC thread start failed");
                 quic_server_destroy(g_quic);
@@ -718,17 +726,25 @@ int main(int argc, char *argv[])
 #endif
 
     log_info("vortex_running", "pid=%d workers=%d port=%d", (int)getpid(), num_workers,
-             g_cfg.bind_port);
+             g_cfg->bind_port);
 
     /* Main loop — monitor signals */
     while (g_running) {
         if (g_reload) {
             g_reload = 0;
             log_info("config_reload", "SIGHUP received, reloading %s", g_config_path);
-            if (config_reload(g_config_path, &g_cfg) == 0) {
-                config_resolve_backends(&g_cfg);
+            struct vortex_config *new_cfg = config_alloc();
+            if (new_cfg && config_reload(g_config_path, new_cfg) == 0) {
+                config_resolve_backends(new_cfg);
+                /* Atomic swap: workers see new_cfg on their next event loop iteration.
+                 * Grace period: 200 ms > any single request's read window. */
+                struct vortex_config *old_cfg =
+                    atomic_exchange_explicit(&g_live_cfg, new_cfg, memory_order_seq_cst);
+                g_cfg = new_cfg;
+                usleep(200000);
+                config_free(old_cfg);
                 if (xdp_loaded) {
-                    bpf_loader_apply_config(&g_cfg.xdp);
+                    bpf_loader_apply_config(&g_cfg->xdp);
                 }
 #ifdef VORTEX_PHASE_TLS
                 if (tls_ptr) {
@@ -736,6 +752,7 @@ int main(int argc, char *argv[])
                 }
 #endif
             } else {
+                config_free(new_cfg);
                 log_warn("config_reload", "reload rejected; keeping current configuration");
             }
         }
@@ -785,7 +802,7 @@ int main(int argc, char *argv[])
 #ifdef VORTEX_PHASE_TLS
     if (need_tls_pool) tls_pool_destroy();
 #endif
-    if (g_cfg.metrics.enabled) {
+    if (g_cfg->metrics.enabled) {
         metrics_stop(&g_metrics);
         metrics_join(&g_metrics);
     }
@@ -827,7 +844,7 @@ int main(int argc, char *argv[])
         bpf_loader_detach();
     }
 
-    if (g_pid_file_written) unlink(g_cfg.pid_file);
+    if (g_pid_file_written) unlink(g_cfg->pid_file);
     log_close();
     return 0;
 }

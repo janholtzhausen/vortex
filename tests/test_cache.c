@@ -1,10 +1,26 @@
 #include "cache.h"
+#include "conn.h"
 #include "log.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <stdbool.h>
+
+/* chunked_decode_append compiled from worker_cache.c — stub unreachable deps */
+bool chunked_decode_append(struct conn_cold *cold, const uint8_t *data, size_t len);
+/* Stubs for worker_cache.c symbols not needed by chunked_decode_append */
+void uring_submit(void *u)
+{
+    (void)u;
+}
+void conn_close(void *w, uint32_t cid, bool e)
+{
+    (void)w;
+    (void)cid;
+    (void)e;
+}
 
 static int g_passed = 0;
 static int g_failed = 0;
@@ -258,6 +274,69 @@ static void test_crc_verify_corruption(void)
     cache_destroy(&c);
 }
 
+/* M-3: chunked oversized chunk must not hang connection slot */
+static void test_chunked_oversized(void)
+{
+    struct conn_cold cold;
+    memset(&cold, 0, sizeof(cold));
+    cold.chunk_hdr_len = 0;
+
+    /* Craft a chunk-size line claiming 0xFFFFFFFF bytes */
+    const uint8_t oversized[] = "ffffffff\r\nXXX";
+    bool done = chunked_decode_append(&cold, oversized, sizeof(oversized) - 1);
+    CHECK(cold.chunk_remaining == 0, "oversized chunk_remaining capped to 0");
+    CHECK(!done, "oversized chunk does not signal terminal");
+    free(cold.chunk_buf);
+}
+
+/* M-3: normal chunked decode still works */
+static void test_chunked_normal(void)
+{
+    struct conn_cold cold;
+    memset(&cold, 0, sizeof(cold));
+    cold.chunk_hdr_len = 0;
+
+    const uint8_t data[] = "5\r\nhello\r\n0\r\n\r\n";
+    bool done = chunked_decode_append(&cold, data, sizeof(data) - 1);
+    CHECK(done, "terminal chunk detected");
+    CHECK(cold.chunk_body_len == 5, "body length = 5");
+    free(cold.chunk_buf);
+}
+
+/* M-5: CLOCK eviction removes exactly one entry */
+static void test_clock_eviction(void)
+{
+    struct cache c;
+    CHECK(cache_init(&c, 16, 64 * 1024, false, NULL, 0, false, false) == 0, "cache_init for evict");
+    for (int i = 0; i < 16; i++) {
+        char url[16];
+        snprintf(url, sizeof(url), "/item/%d", i);
+        cache_store(&c, url, strlen(url), 200, 300, NULL, 0, (const uint8_t *)"x", 1);
+    }
+    uint64_t before = c.evictions;
+    cache_evict_one(&c);
+    CHECK(c.evictions == before + 1, "evict_one increments evictions by 1");
+    cache_destroy(&c);
+}
+
+/* M-5: clock_hand advances — does not always evict slot 0 */
+static void test_clock_hand_advances(void)
+{
+    struct cache c;
+    CHECK(cache_init(&c, 16, 64 * 1024, false, NULL, 0, false, false) == 0,
+          "cache_init for clock test");
+    for (int i = 0; i < 16; i++) {
+        char url[16];
+        snprintf(url, sizeof(url), "/item/%d", i);
+        cache_store(&c, url, strlen(url), 200, 300, NULL, 0, (const uint8_t *)"x", 1);
+    }
+    cache_evict_one(&c);
+    size_t hand1 = c.clock_hand;
+    cache_evict_one(&c);
+    CHECK(c.clock_hand != hand1, "clock_hand advances between calls");
+    cache_destroy(&c);
+}
+
 int main(void)
 {
     log_init(LOG_ERROR, LOG_FMT_TEXT, NULL);
@@ -273,6 +352,10 @@ int main(void)
     test_slab_wrap();
     test_sha256_etag_toggle();
     test_crc_verify_corruption();
+    test_chunked_oversized();
+    test_chunked_normal();
+    test_clock_eviction();
+    test_clock_hand_advances();
 
     printf("cache tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed ? 1 : 0;

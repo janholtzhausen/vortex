@@ -49,14 +49,14 @@ struct worker {
 
     struct vortex_config *cfg; /* Shared, atomic ptr swap for reload */
 
-    /* Stats */
-    uint64_t accepted;
-    uint64_t completed;
-    uint64_t errors;
-    uint64_t pool_exhausted;
-    uint64_t tls12_count; /* TLS 1.2 handshakes */
-    uint64_t tls13_count; /* TLS 1.3 handshakes */
-    uint64_t ktls_count; /* connections using kTLS */
+    /* Stats — atomic so metrics thread can read without a lock */
+    _Atomic uint64_t accepted;
+    _Atomic uint64_t completed;
+    _Atomic uint64_t errors;
+    _Atomic uint64_t pool_exhausted;
+    _Atomic uint64_t tls12_count;
+    _Atomic uint64_t tls13_count;
+    _Atomic uint64_t ktls_count;
 
     struct cache *cache;
     struct compress_pool compress_pool;
@@ -70,7 +70,7 @@ struct worker {
     uint64_t tarpit_total; /* cumulative tarpit count */
 
     int urandom_fd; /* /dev/urandom for tarpit noise */
-    FILE *tarpit_log; /* /var/log/vortex/tarpit.log */
+    /* tarpit logging routed through log.c (thread-safe, no per-worker file) */
 
     /* Pipe for waking the worker when pool threads finish (1-byte signals only).
      * Actual result data is transferred via the MPSC rings below. */
@@ -91,20 +91,8 @@ struct worker {
     uint32_t blocked_tail;
     uint32_t blocked_count;
 
-    /* Circuit breaker per (route, backend). fail_count resets to 0 on first success.
-     * open_until_ns=0 means closed. Half-open: when timeout expires, ONE probe request
-     * is let through; if it succeeds, open_until_ns is cleared. */
-    struct {
-        uint32_t fail_count;
-        uint64_t open_until_ns;
-    } backend_cb[VORTEX_MAX_ROUTES][VORTEX_MAX_BACKENDS];
-
-    /* Token bucket rate limiter. tokens is in integer requests (not millirequests).
-     * last_ns is CLOCK_MONOTONIC_COARSE timestamp of last replenishment. */
-    struct {
-        uint32_t tokens;
-        uint64_t last_ns;
-    } route_rl[VORTEX_MAX_ROUTES];
+    /* Circuit breaker and rate limiting moved to global atomics in router.c/router.h.
+     * Per-worker state removed to ensure all workers share the same view. */
 
     _Atomic int stop; /* set by worker_stop() from another thread */
 };

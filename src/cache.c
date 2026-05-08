@@ -480,25 +480,21 @@ uint32_t cache_ttl_for_url(const char *url)
 
 int cache_evict_one(struct cache *c)
 {
-    uint32_t oldest_ts = UINT32_MAX;
-    size_t oldest_idx = SIZE_MAX;
-
-    /* Scan for least recently used — O(n) for MVP, acceptable for small tables */
-    for (size_t i = 0; i < c->index_capacity; i++) {
+    size_t cap = c->index_capacity;
+    /* CLOCK approximation: O(1) amortised. Each entry gets one second chance
+     * (hit_count > 0 → decrement and skip; hit_count == 0 → evict). */
+    for (size_t tries = 0; tries < cap * 2; tries++) {
+        size_t i = c->clock_hand % cap;
+        c->clock_hand++;
         struct cache_index_entry *e = &c->index[i];
         if (!(e->flags & CACHE_FLAG_VALID)) continue;
-
-        /* Frequency-boost: devalue frequently hit entries */
-        uint32_t score = e->last_accessed_ts + e->hit_count;
-        if (score < oldest_ts) {
-            oldest_ts = score;
-            oldest_idx = i;
+        if (e->hit_count > 0) {
+            e->hit_count--;
+            continue;
         }
+        e->flags = 0;
+        c->evictions++;
+        return 1;
     }
-
-    if (oldest_idx == SIZE_MAX) return 0;
-
-    c->index[oldest_idx].flags = 0;
-    c->evictions++;
-    return 1;
+    return 0;
 }

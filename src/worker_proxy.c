@@ -290,7 +290,7 @@ static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool
         if (!has_pending_data) {
             h->state = CONN_STATE_PROXYING;
             h->last_active_tsc = rdtsc();
-            w->accepted++;
+            atomic_fetch_add_explicit(&w->accepted, 1, memory_order_relaxed);
 
             if (h->flags & CONN_FLAG_TCP_TUNNEL) {
                 struct io_uring_sqe *sqe_c = io_uring_get_sqe(&w->uring.ring);
@@ -332,7 +332,7 @@ static int route_and_connect(struct worker *w, uint32_t cid, int route_idx, bool
     h->state = CONN_STATE_BACKEND_CONNECT;
     if (!has_pending_data) {
         h->last_active_tsc = rdtsc();
-        w->accepted++;
+        atomic_fetch_add_explicit(&w->accepted, 1, memory_order_relaxed);
     }
     return 0;
 }
@@ -974,13 +974,13 @@ static void process_tls_result(struct worker *w, const struct tls_handshake_resu
         return;
     }
     if (res->tls_version == PTLS_PROTOCOL_VERSION_TLS13)
-        w->tls13_count++;
+        atomic_fetch_add_explicit(&w->tls13_count, 1, memory_order_relaxed);
     else
-        w->tls12_count++;
+        atomic_fetch_add_explicit(&w->tls12_count, 1, memory_order_relaxed);
     if (res->ktls_tx && res->ktls_rx) {
         th->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
         th->ssl = NULL;
-        w->ktls_count++;
+        atomic_fetch_add_explicit(&w->ktls_count, 1, memory_order_relaxed);
     } else {
         th->ssl = res->ssl;
     }
@@ -990,7 +990,7 @@ static void process_tls_result(struct worker *w, const struct tls_handshake_resu
         th->state = CONN_STATE_PROXYING;
         th->route_idx = (uint16_t)(res->tls_route_idx >= 0 ? res->tls_route_idx : 0);
         th->last_active_tsc = rdtsc();
-        w->accepted++;
+        atomic_fetch_add_explicit(&w->accepted, 1, memory_order_relaxed);
         if (h2_session_init(w, hcid) != 0) {
             free(res->pending_data);
             close(res->client_fd);
@@ -1047,7 +1047,7 @@ static void process_tls_result(struct worker *w, const struct tls_handshake_resu
             memcpy(rbuf, res->pending_data, copy_len);
             th->send_buf_len = (uint32_t)copy_len;
             free(res->pending_data);
-            w->accepted++;
+            atomic_fetch_add_explicit(&w->accepted, 1, memory_order_relaxed);
             th->last_active_tsc = rdtsc();
             if (route_idx >= 0 && route_idx < w->cfg->route_count) {
                 if (route_and_connect(w, hcid, route_idx, true) < 0) return;
@@ -1122,7 +1122,7 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
         getpeername(client_fd, (struct sockaddr *)&cold->client_addr, &salen);
     }
     if (new_cid == CONN_INVALID) {
-        w->pool_exhausted++;
+        atomic_fetch_add_explicit(&w->pool_exhausted, 1, memory_order_relaxed);
         log_warn("accept", "pool exhausted - dropping connection (total=%llu)",
                  (unsigned long long)w->pool_exhausted);
         close(client_fd);
@@ -1188,12 +1188,12 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
             conn_free(&w->pool, new_cid);
             return;
         }
-        w->tls13_count++;
+        atomic_fetch_add_explicit(&w->tls13_count, 1, memory_order_relaxed);
         if (ktls_tx_fb && ktls_rx_fb) {
             nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
             tls_ssl_free(ssl_fb);
             nh->ssl = NULL;
-            w->ktls_count++;
+            atomic_fetch_add_explicit(&w->ktls_count, 1, memory_order_relaxed);
         } else {
             nh->ssl = ssl_fb;
         }
@@ -1414,61 +1414,34 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
      * threshold every route runs uncapped regardless of config. */
     {
         const struct route_config *rc = &w->cfg->routes[h->route_idx];
-        if (rc->rate_limit.enabled && rc->rate_limit.rps > 0 &&
-            (uint64_t)w->pool.active * 4 >= (uint64_t)w->pool.capacity * 3) {
-            int ri = h->route_idx;
-            uint32_t max_tokens = rc->rate_limit.burst ? rc->rate_limit.burst : rc->rate_limit.rps;
-            struct timespec _rl_ts;
-            clock_gettime(CLOCK_MONOTONIC_COARSE, &_rl_ts);
-            uint64_t now_ns = (uint64_t)_rl_ts.tv_sec * 1000000000ULL + _rl_ts.tv_nsec;
-
-            if (w->route_rl[ri].last_ns == 0) {
-                /* First request — fill to burst */
-                w->route_rl[ri].tokens = max_tokens;
-                w->route_rl[ri].last_ns = now_ns;
-            } else {
-                uint64_t elapsed_ns = now_ns - w->route_rl[ri].last_ns;
-                uint64_t ns_per_token = 1000000000ULL / rc->rate_limit.rps;
-                uint32_t new_tokens = (uint32_t)(elapsed_ns / ns_per_token);
-                if (new_tokens > max_tokens) new_tokens = max_tokens; /* cap before add */
-                if (new_tokens > 0) {
-                    w->route_rl[ri].tokens += new_tokens;
-                    if (w->route_rl[ri].tokens > max_tokens) w->route_rl[ri].tokens = max_tokens;
-                    /* Advance by whole intervals to preserve fractional remainder */
-                    w->route_rl[ri].last_ns += (uint64_t)new_tokens * ns_per_token;
-                }
-            }
-
-            if (w->route_rl[ri].tokens == 0) {
-                static const char r429[] =
-                    "HTTP/1.1 429 Too Many Requests\r\n"
-                    "Content-Length: 0\r\n"
-                    "Retry-After: 1\r\n"
-                    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
-                    "Connection: keep-alive\r\n\r\n";
-                struct io_uring_sqe *sqe429 = io_uring_get_sqe(&w->uring.ring);
-                struct io_uring_sqe *sqe429r = io_uring_get_sqe(&w->uring.ring);
-                if (!sqe429 || !sqe429r) {
-                    conn_close(w, cid, false);
-                    return;
-                }
-                uint8_t *sbuf = conn_send_buf(&w->pool, cid);
-                size_t r429_len = sizeof(r429) - 1;
-                memcpy(sbuf, r429, r429_len);
-                h->send_buf_off = 0;
-                h->send_buf_len = (uint32_t)r429_len;
-                h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
-                PREP_SEND(w, sqe429, h->client_fd, FIXED_FD_CLIENT(w, cid), sbuf, r429_len,
-                          MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
-                sqe429->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
-                sqe429->flags |= IOSQE_IO_LINK;
-                PREP_RECV(w, sqe429r, h->client_fd, FIXED_FD_CLIENT(w, cid),
-                          conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
-                sqe429r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
-                uring_submit(&w->uring);
+        if (!global_rate_limit_check(h->route_idx, &rc->rate_limit)) {
+            static const char r429[] =
+                "HTTP/1.1 429 Too Many Requests\r\n"
+                "Content-Length: 0\r\n"
+                "Retry-After: 1\r\n"
+                "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+                "Connection: keep-alive\r\n\r\n";
+            struct io_uring_sqe *sqe429 = io_uring_get_sqe(&w->uring.ring);
+            struct io_uring_sqe *sqe429r = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe429 || !sqe429r) {
+                conn_close(w, cid, false);
                 return;
             }
-            w->route_rl[ri].tokens--;
+            uint8_t *sbuf = conn_send_buf(&w->pool, cid);
+            size_t r429_len = sizeof(r429) - 1;
+            memcpy(sbuf, r429, r429_len);
+            h->send_buf_off = 0;
+            h->send_buf_len = (uint32_t)r429_len;
+            h->flags &= ~CONN_FLAG_STREAMING_BACKEND;
+            PREP_SEND(w, sqe429, h->client_fd, FIXED_FD_CLIENT(w, cid), sbuf, r429_len,
+                      MSG_NOSIGNAL, SEND_IDX_SEND(w, cid));
+            sqe429->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_CLIENT_LINKED, cid);
+            sqe429->flags |= IOSQE_IO_LINK;
+            PREP_RECV(w, sqe429r, h->client_fd, FIXED_FD_CLIENT(w, cid),
+                      conn_recv_buf(&w->pool, cid), h->recv_window, 0, cid);
+            sqe429r->user_data = URING_UD_ENCODE(VORTEX_OP_RECV_CLIENT, cid);
+            uring_submit(&w->uring);
+            return;
         }
     }
 
@@ -2259,10 +2232,10 @@ static void handle_connect(struct worker *w, struct io_uring_cqe *cqe, uint32_t 
         clock_gettime(CLOCK_MONOTONIC_COARSE, &_cb_ts);
         uint64_t _now = (uint64_t)_cb_ts.tv_sec * 1000000000ULL + _cb_ts.tv_nsec;
         if (cqe->res < 0) {
-            cb_record_failure(w, _ri, _bi, _now, w->cfg->routes[_ri].health.fail_threshold,
-                              w->cfg->routes[_ri].health.open_ms);
+            cb_record_failure_global(_ri, _bi, _now, w->cfg->routes[_ri].health.fail_threshold,
+                                     w->cfg->routes[_ri].health.open_ms);
         } else {
-            cb_record_success(w, _ri, _bi);
+            cb_record_success_global(_ri, _bi);
         }
     }
     if (cqe->res < 0) {

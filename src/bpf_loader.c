@@ -458,7 +458,14 @@ int bpf_blocklist_load_file(const char *path)
             log_warn("bpf_blocklist", "invalid IP in blocklist: '%s'", p);
             continue;
         }
-        if (bpf_blocklist_add_addr(&ip) == 0) count++;
+        int badd = bpf_blocklist_add_addr(&ip);
+        if (badd == 0) {
+            count++;
+        } else if (badd < 0 && errno == E2BIG) {
+            log_warn("bpf_blocklist",
+                     "blocklist full (max 10000 entries) — %s and subsequent entries not added", p);
+            break;
+        }
     }
     fclose(f);
     log_info("bpf_blocklist", "loaded %d IPs from %s", count, path);

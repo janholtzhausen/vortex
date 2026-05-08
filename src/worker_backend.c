@@ -184,38 +184,7 @@ int backend_tls_recv_some(struct worker *w, uint32_t cid, uint8_t *buf, size_t l
 #endif
 }
 
-/* ------------------------------------------------------------------ */
-/* Circuit breaker helpers                                             */
-/* ------------------------------------------------------------------ */
-
-bool cb_is_open(struct worker *w, int ri, int bi, uint64_t now_ns)
-{
-    uint64_t until = w->backend_cb[ri][bi].open_until_ns;
-    return until != 0 && now_ns < until;
-}
-
-void cb_record_failure(struct worker *w, int ri, int bi, uint64_t now_ns, uint32_t cfg_threshold,
-                       uint32_t cfg_open_ms)
-{
-    uint32_t threshold = cfg_threshold ? cfg_threshold : CB_DEFAULT_THRESHOLD;
-    uint64_t open_ms = cfg_open_ms ? cfg_open_ms : CB_DEFAULT_OPEN_MS;
-    uint32_t count = ++w->backend_cb[ri][bi].fail_count;
-    if (count >= threshold) {
-        w->backend_cb[ri][bi].open_until_ns = now_ns + open_ms * 1000000ULL;
-        log_warn("circuit_breaker",
-                 "route=%d backend=%d OPEN after %u consecutive failures (retry in %llums)", ri, bi,
-                 count, (unsigned long long)open_ms);
-    }
-}
-
-void cb_record_success(struct worker *w, int ri, int bi)
-{
-    if (w->backend_cb[ri][bi].fail_count > 0 || w->backend_cb[ri][bi].open_until_ns != 0) {
-        log_info("circuit_breaker", "route=%d backend=%d CLOSED (probe succeeded)", ri, bi);
-    }
-    w->backend_cb[ri][bi].fail_count = 0;
-    w->backend_cb[ri][bi].open_until_ns = 0;
-}
+/* Circuit breaker functions are now in router.c (global, shared across workers). */
 
 /*
  * Select an available (non-open-circuit) backend for the given route.
@@ -237,7 +206,7 @@ int select_available_backend(struct worker *w, int ri, uint32_t client_ip)
     int primary = router_select_backend(&w->router, ri, client_ip);
     for (int i = 0; i < n; i++) {
         int bi = (primary + i) % n;
-        if (!cb_is_open(w, ri, bi, now_ns)) return bi;
+        if (!cb_is_open_global(ri, bi, now_ns)) return bi;
     }
     return -1; /* all backends open — caller sends 503 */
 }
