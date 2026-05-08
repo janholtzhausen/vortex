@@ -77,14 +77,15 @@ static int inject_response_etag(struct worker *w, uint8_t *buf, int n)
     if (!hdr_end) return n;
 
     size_t hdr_len = (size_t)(hdr_end - buf) + 4;
-    if (memmem(buf, hdr_len, "\r\nETag:", 7) || memmem(buf, hdr_len, "\r\netag:", 7)) return n;
+    if (VX_MEMMEM(buf, hdr_len, "\r\nETag:", 7) || VX_MEMMEM(buf, hdr_len, "\r\netag:", 7))
+        return n;
 
-    bool is_chunked = memmem(buf, hdr_len, "\r\nTransfer-Encoding: chunked", 28) ||
-                      memmem(buf, hdr_len, "\r\ntransfer-encoding: chunked", 28);
+    bool is_chunked = VX_MEMMEM(buf, hdr_len, "\r\nTransfer-Encoding: chunked", 28) ||
+                      VX_MEMMEM(buf, hdr_len, "\r\ntransfer-encoding: chunked", 28);
     if (is_chunked) return n;
 
-    const char *clh = (const char *)memmem(buf, hdr_len, "\r\nContent-Length:", 17);
-    if (!clh) clh = (const char *)memmem(buf, hdr_len, "\r\ncontent-length:", 17);
+    const char *clh = (const char *)VX_MEMMEM(buf, hdr_len, "\r\nContent-Length:", 17);
+    if (!clh) clh = (const char *)VX_MEMMEM(buf, hdr_len, "\r\ncontent-length:", 17);
     if (!clh) return n;
 
     const char *cv = clh + 17;
@@ -117,8 +118,8 @@ static int rewrite_backend_connection_header(struct worker *w, uint32_t cid, str
     const char *conn_val = use_ka ? "keep-alive" : "close";
     size_t conn_val_len = use_ka ? 10 : 5;
 
-    uint8_t *ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
-    if (!ch) ch = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
+    uint8_t *ch = (uint8_t *)VX_MEMMEM(rbuf, (size_t)fwd_n, "\r\nConnection:", 13);
+    if (!ch) ch = (uint8_t *)VX_MEMMEM(rbuf, (size_t)fwd_n, "\r\nconnection:", 13);
     if (ch) {
         uint8_t *vs = ch + 13;
         while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t'))
@@ -183,7 +184,7 @@ int parse_http_request_line(const uint8_t *buf, int len, char *method_out, size_
     url_out[ulen] = '\0';
     p = sp + 1;
 
-    line_end = (const char *)memmem(p, (size_t)(end - p), "\r\n", 2);
+    line_end = (const char *)VX_MEMMEM(p, (size_t)(end - p), "\r\n", 2);
     if (!line_end || line_end == p) return -1;
 
     ver = p;
@@ -226,12 +227,12 @@ static bool request_has_ambiguous_framing(const uint8_t *buf, size_t len)
     const uint8_t *te;
     const uint8_t *cl;
 
-    te = (const uint8_t *)memmem(buf, len, "\r\nTransfer-Encoding:", 20);
-    if (!te) te = (const uint8_t *)memmem(buf, len, "\r\ntransfer-encoding:", 20);
+    te = (const uint8_t *)VX_MEMMEM(buf, len, "\r\nTransfer-Encoding:", 20);
+    if (!te) te = (const uint8_t *)VX_MEMMEM(buf, len, "\r\ntransfer-encoding:", 20);
     if (!te) return false;
 
-    cl = (const uint8_t *)memmem(buf, len, "\r\nContent-Length:", 17);
-    if (!cl) cl = (const uint8_t *)memmem(buf, len, "\r\ncontent-length:", 17);
+    cl = (const uint8_t *)VX_MEMMEM(buf, len, "\r\nContent-Length:", 17);
+    if (!cl) cl = (const uint8_t *)VX_MEMMEM(buf, len, "\r\ncontent-length:", 17);
     return cl != NULL;
 }
 
@@ -397,8 +398,10 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
             /* Parse Content-Length from the first response chunk */
             if (cold_main->backend_content_length == 0 && n > 12) {
                 const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
-                const char *clh = (const char *)memmem(sbuf2, (size_t)n, "\r\nContent-Length:", 17);
-                if (!clh) clh = (const char *)memmem(sbuf2, (size_t)n, "\r\ncontent-length:", 17);
+                const char *clh =
+                    (const char *)VX_MEMMEM(sbuf2, (size_t)n, "\r\nContent-Length:", 17);
+                if (!clh)
+                    clh = (const char *)VX_MEMMEM(sbuf2, (size_t)n, "\r\ncontent-length:", 17);
                 if (clh) {
                     const char *cv = clh + 17;
                     while (*cv == ' ')
@@ -733,16 +736,16 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                             size_t bl2 = (size_t)n - hl2;
 
                             bool is_chunked =
-                                memmem(resp2, hl2, "\r\nTransfer-Encoding: chunked", 28) ||
-                                memmem(resp2, hl2, "\r\ntransfer-encoding: chunked", 28);
+                                VX_MEMMEM(resp2, hl2, "\r\nTransfer-Encoding: chunked", 28) ||
+                                VX_MEMMEM(resp2, hl2, "\r\ntransfer-encoding: chunked", 28);
 
                             bool cl_ok = false;
                             if (!is_chunked) {
                                 const char *clh =
-                                    (const char *)memmem(resp2, hl2, "\r\nContent-Length:", 17);
+                                    (const char *)VX_MEMMEM(resp2, hl2, "\r\nContent-Length:", 17);
                                 if (!clh)
-                                    clh =
-                                        (const char *)memmem(resp2, hl2, "\r\ncontent-length:", 17);
+                                    clh = (const char *)VX_MEMMEM(resp2, hl2,
+                                                                  "\r\ncontent-length:", 17);
                                 if (clh) {
                                     const char *cv = clh + 17;
                                     while (*cv == ' ')
@@ -798,8 +801,9 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
         const uint8_t *hend_ct = (const uint8_t *)FIND_HDR_END(sbuf_ct, (size_t)n);
         size_t hdr_scan_len = hend_ct ? (size_t)(hend_ct - sbuf_ct) + 4 : (size_t)n;
         const uint8_t *cth2 =
-            (const uint8_t *)memmem(sbuf_ct, hdr_scan_len, "\r\nContent-Type:", 15);
-        if (!cth2) cth2 = (const uint8_t *)memmem(sbuf_ct, hdr_scan_len, "\r\ncontent-type:", 15);
+            (const uint8_t *)VX_MEMMEM(sbuf_ct, hdr_scan_len, "\r\nContent-Type:", 15);
+        if (!cth2)
+            cth2 = (const uint8_t *)VX_MEMMEM(sbuf_ct, hdr_scan_len, "\r\ncontent-type:", 15);
         if (cth2) {
             const uint8_t *ctv2 = cth2 + 15;
             while (*ctv2 == ' ')
@@ -822,10 +826,10 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
             bool cl_match = false;
             if (body_len >= COMPRESS_MIN_BODY) {
                 const char *clh2 =
-                    (const char *)memmem(sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
+                    (const char *)VX_MEMMEM(sbuf_gz, hdr_end_off + 4, "\r\nContent-Length:", 17);
                 if (!clh2)
-                    clh2 =
-                        (const char *)memmem(sbuf_gz, hdr_end_off + 4, "\r\ncontent-length:", 17);
+                    clh2 = (const char *)VX_MEMMEM(sbuf_gz, hdr_end_off + 4,
+                                                   "\r\ncontent-length:", 17);
                 if (clh2) {
                     const char *cv2 = clh2 + 17;
                     while (*cv2 == ' ')
@@ -836,13 +840,13 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
 
             if (cl_match) {
                 const uint8_t *cth =
-                    (const uint8_t *)memmem(sbuf_gz, hdr_end_off + 4, "\r\nContent-Type:", 15);
+                    (const uint8_t *)VX_MEMMEM(sbuf_gz, hdr_end_off + 4, "\r\nContent-Type:", 15);
                 if (!cth)
-                    cth =
-                        (const uint8_t *)memmem(sbuf_gz, hdr_end_off + 4, "\r\ncontent-type:", 15);
+                    cth = (const uint8_t *)VX_MEMMEM(sbuf_gz, hdr_end_off + 4,
+                                                     "\r\ncontent-type:", 15);
                 bool already_encoded =
-                    memmem(sbuf_gz, hdr_end_off + 4, "\r\nContent-Encoding:", 19) ||
-                    memmem(sbuf_gz, hdr_end_off + 4, "\r\ncontent-encoding:", 19);
+                    VX_MEMMEM(sbuf_gz, hdr_end_off + 4, "\r\nContent-Encoding:", 19) ||
+                    VX_MEMMEM(sbuf_gz, hdr_end_off + 4, "\r\ncontent-encoding:", 19);
 
                 if (cth && !already_encoded) {
                     const uint8_t *ct_val = cth + 15;
@@ -1387,7 +1391,7 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
         uint32_t hdr_limit = w->cfg->max_request_header_bytes;
         if (hdr_limit > 0 && (size_t)n >= (size_t)hdr_limit) {
             const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-            if (memmem(rbuf, (size_t)n, "\r\n\r\n", 4) == NULL) {
+            if (VX_MEMMEM(rbuf, (size_t)n, "\r\n\r\n", 4) == NULL) {
                 log_warn("bad_request", "conn=%u header block exceeds %u bytes", cid, hdr_limit);
                 send_bad_request_and_close(w, cid);
                 return;
@@ -1518,8 +1522,8 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
     /* Detect WebSocket upgrade request */
     {
         const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-        if (memmem(rbuf, (size_t)n, "Upgrade: websocket", 18) != NULL ||
-            memmem(rbuf, (size_t)n, "upgrade: websocket", 18) != NULL) {
+        if (VX_MEMMEM(rbuf, (size_t)n, "Upgrade: websocket", 18) != NULL ||
+            VX_MEMMEM(rbuf, (size_t)n, "upgrade: websocket", 18) != NULL) {
             h->flags |= CONN_FLAG_WEBSOCKET_ACTIVE;
             if (w->cfg->routes[h->route_idx].backends[h->backend_idx].tls) {
                 send_bad_gateway_and_close(w, cid);
@@ -1533,15 +1537,15 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
     h->flags &= ~(CONN_FLAG_CLIENT_GZIP | CONN_FLAG_CLIENT_BR);
     {
         const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
-        const uint8_t *ae = (const uint8_t *)memmem(rbuf, (size_t)n, "Accept-Encoding:", 16);
-        if (!ae) ae = (const uint8_t *)memmem(rbuf, (size_t)n, "accept-encoding:", 16);
+        const uint8_t *ae = (const uint8_t *)VX_MEMMEM(rbuf, (size_t)n, "Accept-Encoding:", 16);
+        if (!ae) ae = (const uint8_t *)VX_MEMMEM(rbuf, (size_t)n, "accept-encoding:", 16);
         if (ae) {
             const uint8_t *eol =
                 (const uint8_t *)FIND_CRLF(ae + 16, (size_t)n - (size_t)(ae + 16 - rbuf));
             if (eol) {
                 size_t ae_val_len = (size_t)(eol - ae - 16);
-                if (memmem(ae + 16, ae_val_len, "br", 2)) h->flags |= CONN_FLAG_CLIENT_BR;
-                if (memmem(ae + 16, ae_val_len, "gzip", 4)) h->flags |= CONN_FLAG_CLIENT_GZIP;
+                if (VX_MEMMEM(ae + 16, ae_val_len, "br", 2)) h->flags |= CONN_FLAG_CLIENT_BR;
+                if (VX_MEMMEM(ae + 16, ae_val_len, "gzip", 4)) h->flags |= CONN_FLAG_CLIENT_GZIP;
             }
         }
     }
@@ -1560,8 +1564,9 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
                 /* Check If-None-Match for conditional GET */
                 char req_etag[64] = {0};
                 const uint8_t *inm =
-                    (const uint8_t *)memmem(rbuf, (size_t)n, "\r\nIf-None-Match:", 16);
-                if (!inm) inm = (const uint8_t *)memmem(rbuf, (size_t)n, "\r\nif-none-match:", 16);
+                    (const uint8_t *)VX_MEMMEM(rbuf, (size_t)n, "\r\nIf-None-Match:", 16);
+                if (!inm)
+                    inm = (const uint8_t *)VX_MEMMEM(rbuf, (size_t)n, "\r\nif-none-match:", 16);
                 if (inm) {
                     const uint8_t *vs = inm + 16;
                     while (vs < rbuf + n && (*vs == ' ' || *vs == '\t'))
@@ -1664,8 +1669,8 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
          * Rewrite to "identity" so the backend sends uncompressed responses. */
         bool ae_present = false;
         {
-            uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
-            if (!ae) ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
+            uint8_t *ae = (uint8_t *)VX_MEMMEM(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
+            if (!ae) ae = (uint8_t *)VX_MEMMEM(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
             if (ae) {
                 ae_present = true;
                 /* Replace the header value in-place with "identity" */
@@ -2110,8 +2115,8 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
         /* Rewrite Accept-Encoding → identity */
         bool ae_present = false;
         {
-            uint8_t *ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
-            if (!ae) ae = (uint8_t *)memmem(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
+            uint8_t *ae = (uint8_t *)VX_MEMMEM(rbuf, (size_t)fwd_n, "\r\nAccept-Encoding:", 18);
+            if (!ae) ae = (uint8_t *)VX_MEMMEM(rbuf, (size_t)fwd_n, "\r\naccept-encoding:", 18);
             if (ae) {
                 ae_present = true;
                 uint8_t *vs = ae + 18;

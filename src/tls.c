@@ -665,7 +665,10 @@ ptls_t *tls_accept(struct tls_ctx *tls, int fd, int *route_idx_out, char *sni_ou
                                  (unsigned long long)rx_seq);
                         fcntl(fd, F_SETFL, flags);
                         ptls_free(ptls);
-                        return NULL; /* kTLS took over, no ptls_t needed */
+                        /* SUCCESS with kTLS: return NULL (no ptls_t needed; kernel handles
+                         * crypto). Caller distinguishes success from failure via *ktls_tx_out.
+                         * See tls.h: "NULL if kTLS took over, i.e. *ktls_tx_out = true". */
+                        return NULL;
                     }
                     log_warn("tls_accept", "fd=%d kTLS setsockopt failed: %s", fd, strerror(errno));
                 } else {
@@ -989,7 +992,9 @@ ptls_t *tls_backend_connect(ptls_context_t *ctx, int fd, const char *server_name
         goto fail;
     }
 
-    /* Restore blocking mode */
+    /* Restore original flags. Socket was created SOCK_NONBLOCK by begin_async_connect,
+     * so flags already has O_NONBLOCK — this keep the socket non-blocking, which is
+     * required by backend_tls_send_all/recv_some (they poll on EAGAIN). */
     fcntl(fd, F_SETFL, flags);
 
     *ptls_get_data_ptr(ptls) = NULL;

@@ -9,6 +9,7 @@
 #include "worker_internal.h"
 
 #ifdef VORTEX_PHASE_TLS
+#include <poll.h>
 #include <picotls.h>
 #include <stdlib.h>
 
@@ -104,17 +105,29 @@ int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, siz
         return -1;
     }
 
-    /* Blocking write — backend socket is in blocking mode */
+    /* Backend socket is non-blocking (created with SOCK_NONBLOCK, not changed after
+     * handshake). Poll on EAGAIN, bounded by the backend deadline already armed. */
+    uint32_t tmo_ms = backend_timeout_ms_for(w, cid);
     size_t off = 0;
     while (off < wbuf.off) {
         ssize_t n = write(h->backend_fd, wbuf.base + off, wbuf.off - off);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            ptls_buffer_dispose(&wbuf);
-            log_warn("backend_tls_send", "conn=%u write failed: %s", cid, strerror(errno));
-            return -1;
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
         }
-        off += (size_t)n;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = {.fd = h->backend_fd, .events = POLLOUT};
+            if (poll(&pfd, 1, (int)tmo_ms) <= 0) {
+                ptls_buffer_dispose(&wbuf);
+                log_warn("backend_tls_send", "conn=%u send timeout", cid);
+                return -1;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        ptls_buffer_dispose(&wbuf);
+        log_warn("backend_tls_send", "conn=%u write failed: %s", cid, strerror(errno));
+        return -1;
     }
     ptls_buffer_dispose(&wbuf);
     return (int)len;

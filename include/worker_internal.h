@@ -49,8 +49,8 @@
 #include <picotls.h>
 #endif
 
-/* Route all memmem calls through the AVX2-accelerated vx_memmem */
-#define memmem(h, hl, n, nl) vx_memmem((h), (hl), (n), (nl))
+/* AVX2-accelerated search — use VX_MEMMEM() explicitly; does NOT shadow stdlib memmem */
+#define VX_MEMMEM(h, hl, n, nl) vx_memmem((h), (hl), (n), (nl))
 /* Specialized finders — faster than memmem for the two hottest patterns */
 #define FIND_CRLF(buf, len) vx_find_crlf((const uint8_t *)(buf), (size_t)(len))
 #define FIND_HDR_END(buf, len) vx_find_hdr_end((const uint8_t *)(buf), (size_t)(len))

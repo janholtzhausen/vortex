@@ -230,7 +230,8 @@ static __always_inline int conntrack_tcp_v4(struct vortex_metrics *m, __be32 src
     }
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
-    int f_syn = (tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK);
+    int f_syn = (tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK) &&
+                !(tcp_flags & TCP_FLAG_RST); /* SYN+RST and SYN+FIN are invalid */
     int f_rst = (tcp_flags & TCP_FLAG_RST) != 0;
     int f_fin = (tcp_flags & TCP_FLAG_FIN) != 0;
     int f_ack = (tcp_flags & TCP_FLAG_ACK) != 0;
@@ -264,7 +265,7 @@ static __always_inline int conntrack_tcp_v4(struct vortex_metrics *m, __be32 src
                 if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT) cs_exist->last_seen_ns = now;
             }
         }
-        // Pass SYN packets (tracked if port 80/443, untracked otherwise)
+        // Pass SYN packets (tracked if protected port, untracked otherwise)
         return XDP_PASS;
     }
 
@@ -281,18 +282,34 @@ static __always_inline int conntrack_tcp_v4(struct vortex_metrics *m, __be32 src
         return XDP_DROP;
     }
 
-    __u64 timeout = (cs->tcp_state == CT_ESTABLISHED) ? CT_TIMEOUT_EST_NS : CT_TIMEOUT_SYN_NS;
+    __u64 timeout;
+    if (cs->tcp_state == CT_ESTABLISHED)
+        timeout = CT_TIMEOUT_EST_NS;
+    else if (cs->tcp_state == CT_FIN_WAIT || cs->tcp_state == CT_CLOSING)
+        timeout = CT_TIMEOUT_FIN_NS;
+    else
+        timeout = CT_TIMEOUT_SYN_NS;
+
     if (now - cs->last_seen_ns > timeout) {
         bpf_map_delete_elem(&conn_track_map, &key);
         if (m) m->dropped_conntrack++;
         return XDP_DROP;
     }
 
-    if (f_fin)
-        cs->tcp_state = (cs->tcp_state == CT_FIN_WAIT) ? CT_CLOSING : CT_FIN_WAIT;
-    else if (f_ack && cs->tcp_state == CT_SYN_SENT)
+    if (f_fin) {
+        if (cs->tcp_state == CT_FIN_WAIT) {
+            /* Both sides closed — remove entry; LRU map would evict it eventually anyway */
+            bpf_map_delete_elem(&conn_track_map, &key);
+        } else {
+            cs->tcp_state = CT_FIN_WAIT;
+            cs->last_seen_ns = now;
+        }
+    } else if (f_ack && cs->tcp_state == CT_SYN_SENT) {
         cs->tcp_state = CT_ESTABLISHED;
-    cs->last_seen_ns = now;
+        cs->last_seen_ns = now;
+    } else {
+        cs->last_seen_ns = now;
+    }
     return XDP_PASS;
 }
 
@@ -311,7 +328,8 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m, const stru
     }
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
-    int f_syn = (tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK);
+    int f_syn =
+        (tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK) && !(tcp_flags & TCP_FLAG_RST);
     int f_rst = (tcp_flags & TCP_FLAG_RST) != 0;
     int f_fin = (tcp_flags & TCP_FLAG_FIN) != 0;
     int f_ack = (tcp_flags & TCP_FLAG_ACK) != 0;
@@ -342,7 +360,7 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m, const stru
                 if (cs_exist && cs_exist->tcp_state == CT_SYN_SENT) cs_exist->last_seen_ns = now;
             }
         }
-        // Pass SYN packets (tracked if port 80/443, untracked otherwise)
+        // Pass SYN packets (tracked if protected port, untracked otherwise)
         return XDP_PASS;
     }
 
@@ -359,18 +377,33 @@ static __always_inline int conntrack_tcp_v6(struct vortex_metrics *m, const stru
         return XDP_DROP;
     }
 
-    __u64 timeout = (cs->tcp_state == CT_ESTABLISHED) ? CT_TIMEOUT_EST_NS : CT_TIMEOUT_SYN_NS;
+    __u64 timeout;
+    if (cs->tcp_state == CT_ESTABLISHED)
+        timeout = CT_TIMEOUT_EST_NS;
+    else if (cs->tcp_state == CT_FIN_WAIT || cs->tcp_state == CT_CLOSING)
+        timeout = CT_TIMEOUT_FIN_NS;
+    else
+        timeout = CT_TIMEOUT_SYN_NS;
+
     if (now - cs->last_seen_ns > timeout) {
         bpf_map_delete_elem(&conn_track_map_v6, &key);
         if (m) m->dropped_conntrack++;
         return XDP_DROP;
     }
 
-    if (f_fin)
-        cs->tcp_state = (cs->tcp_state == CT_FIN_WAIT) ? CT_CLOSING : CT_FIN_WAIT;
-    else if (f_ack && cs->tcp_state == CT_SYN_SENT)
+    if (f_fin) {
+        if (cs->tcp_state == CT_FIN_WAIT) {
+            bpf_map_delete_elem(&conn_track_map_v6, &key);
+        } else {
+            cs->tcp_state = CT_FIN_WAIT;
+            cs->last_seen_ns = now;
+        }
+    } else if (f_ack && cs->tcp_state == CT_SYN_SENT) {
         cs->tcp_state = CT_ESTABLISHED;
-    cs->last_seen_ns = now;
+        cs->last_seen_ns = now;
+    } else {
+        cs->last_seen_ns = now;
+    }
     return XDP_PASS;
 }
 

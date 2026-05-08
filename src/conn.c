@@ -167,8 +167,16 @@ void conn_free(struct conn_pool *pool, uint32_t id)
     cold->chunk_body_len = 0;
     cold->chunk_remaining = 0;
     cold->chunk_skip_crlf = false;
-    cold->h2 = NULL; /* h2_session_free must have been called by conn_close before conn_free */
-    cold->backend_ssl = NULL;
+    /* Both h2 and backend_ssl must have been freed by conn_close before conn_free.
+     * Log and leak rather than double-free or dereference a stale pointer. */
+    if (cold->h2) {
+        log_warn("conn_free", "id=%u h2 session not freed before conn_free — leak", id);
+        cold->h2 = NULL;
+    }
+    if (cold->backend_ssl) {
+        log_warn("conn_free", "id=%u backend_ssl not freed before conn_free — leak", id);
+        cold->backend_ssl = NULL;
+    }
 
     pool->free_list[pool->free_top++] = id;
     if (pool->active > 0) pool->active--;

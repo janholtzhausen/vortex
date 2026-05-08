@@ -17,8 +17,8 @@ void make_cache_key(const uint8_t *req_buf, size_t req_len, const char *url, cha
                     size_t key_cap)
 {
     char host[128] = {0};
-    const uint8_t *hh = (const uint8_t *)memmem(req_buf, req_len, "\r\nHost:", 7);
-    if (!hh) hh = (const uint8_t *)memmem(req_buf, req_len, "\r\nhost:", 7);
+    const uint8_t *hh = (const uint8_t *)VX_MEMMEM(req_buf, req_len, "\r\nHost:", 7);
+    if (!hh) hh = (const uint8_t *)VX_MEMMEM(req_buf, req_len, "\r\nhost:", 7);
     if (hh) {
         const uint8_t *hs = hh + 7;
         while (hs < req_buf + req_len && (*hs == ' ' || *hs == '\t'))
@@ -47,19 +47,27 @@ bool chunked_decode_append(struct conn_cold *cold, const uint8_t *data, size_t l
     const uint8_t *end = data + len;
 
     while (p < end) {
-        /* Consume the trailing \r\n that follows each chunk's data */
+        /* Consume the trailing CRLF following each chunk body.
+         * Handle split across recvs and servers that send bare LF. */
         if (cold->chunk_skip_crlf) {
-            if (p + 2 > end) break; /* split across recvs — wait */
-            if (p[0] == '\r' && p[1] == '\n') p += 2;
+            if (p[0] == '\r') {
+                if (p + 2 > end) break; /* \n not yet received — wait */
+                if (p[1] != '\n') return false; /* protocol error, abort caching */
+                p += 2;
+            } else if (p[0] == '\n') {
+                p += 1; /* bare LF accepted */
+            } else {
+                return false; /* unexpected byte where CRLF expected */
+            }
             cold->chunk_skip_crlf = false;
         }
 
         if (cold->chunk_remaining == 0) {
             /* Expecting: <hex-size>[;ext]\r\n */
-            const uint8_t *crlf = memmem(p, (size_t)(end - p), "\r\n", 2);
+            const uint8_t *crlf = VX_MEMMEM(p, (size_t)(end - p), "\r\n", 2);
             if (!crlf) break; /* incomplete size line — wait for more data */
             size_t hex_len = (size_t)(crlf - p);
-            if (hex_len == 0 || hex_len > 8) break; /* malformed */
+            if (hex_len == 0 || hex_len > 8) return false; /* malformed */
             char hex[9] = {0};
             /* Copy up to optional semicolon (chunk extensions) */
             size_t hl = hex_len;
@@ -68,9 +76,15 @@ bool chunked_decode_append(struct conn_cold *cold, const uint8_t *data, size_t l
                     hl = i;
                     break;
                 }
+                if ((p[i] < '0' || p[i] > '9') && (p[i] < 'a' || p[i] > 'f') &&
+                    (p[i] < 'A' || p[i] > 'F'))
+                    return false; /* non-hex in size field */
             }
             memcpy(hex, p, hl);
-            uint32_t chunk_size = (uint32_t)strtoul(hex, NULL, 16);
+            char *endptr;
+            unsigned long chunk_size_ul = strtoul(hex, &endptr, 16);
+            if (endptr == hex || chunk_size_ul > CHUNK_MAX_BODY) return false; /* bad/oversized */
+            uint32_t chunk_size = (uint32_t)chunk_size_ul;
             p = crlf + 2;
             if (chunk_size == 0) return true; /* terminal chunk */
             cold->chunk_remaining = chunk_size;
@@ -130,7 +144,7 @@ void cache_chunked_store(struct worker *w, uint32_t cid, struct conn_hot *h, str
     const uint8_t *p2 = src, *src_end = src + slen;
     while (p2 < src_end) {
         /* Find end of current header line */
-        const uint8_t *eol = memmem(p2, (size_t)(src_end - p2), "\r\n", 2);
+        const uint8_t *eol = VX_MEMMEM(p2, (size_t)(src_end - p2), "\r\n", 2);
         if (!eol) { /* copy remainder */
             size_t rem = (size_t)(src_end - p2);
             if (out + rem <= scratch_cap) {
