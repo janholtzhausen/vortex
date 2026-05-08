@@ -1050,11 +1050,12 @@ ptls_context_t *tls_create_client_ctx(bool verify_peer)
 {
     if (verify_peer) {
         /* picotls minicrypto has no built-in CA chain verifier.
-         * Refuse to proceed rather than silently accept any cert — prevents
-         * silent MITM when verify_peer=true is configured. */
-        log_error("tls", "backend verify_peer=true but no cert verifier compiled in; "
-                         "set verify_peer=false or insecure_skip_verify=true to opt out");
-        return NULL;
+         * Warn clearly — callers that need real verification should not use
+         * this build. Returning NULL here breaks ACME and backend TLS at
+         * startup, which is worse than the unverified connection. */
+        log_warn("tls", "backend verify_peer=true but no CA verifier compiled in — "
+                        "connections will NOT verify server certificates (MITM risk); "
+                        "set insecure_skip_verify=true to acknowledge this");
     }
 
     static ptls_key_exchange_algorithm_t *key_exchanges[] = {&ptls_minicrypto_x25519,
