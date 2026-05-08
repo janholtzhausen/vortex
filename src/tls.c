@@ -1110,7 +1110,19 @@ static int backend_verify_cert_cb(ptls_verify_certificate_t *self, ptls_t *tls,
     return 0;
 }
 
-static ptls_verify_certificate_t g_backend_verify_cert = {backend_verify_cert_cb, NULL};
+/* Signature algorithms advertised in ClientHello when using our verify callback.
+ * Mirrors picotls's internal default_algos list. Must be UINT16_MAX-terminated. */
+static const uint16_t g_backend_verify_algos[] = {
+    PTLS_SIGNATURE_RSA_PSS_RSAE_SHA384,
+    PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
+    PTLS_SIGNATURE_ECDSA_SECP384R1_SHA384,
+    PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256,
+    PTLS_SIGNATURE_RSA_PKCS1_SHA256,
+    PTLS_SIGNATURE_RSA_PKCS1_SHA1,
+    UINT16_MAX,
+};
+static ptls_verify_certificate_t g_backend_verify_cert = {backend_verify_cert_cb,
+                                                          g_backend_verify_algos};
 
 ptls_context_t *tls_create_client_ctx(bool verify_peer)
 {
