@@ -435,20 +435,17 @@ int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg)
     g_on_client_hello.super.cb = on_client_hello_cb;
     g_on_client_hello.tls_ctx = tls;
 
-    /* Probe kTLS availability by attempting to install the TLS ULP on a
-     * throwaway socket.  Only a return value of 0 means kTLS is present;
-     * ENOPROTOOPT/ENOTSUP/EOPNOTSUPP all mean the kernel does NOT support it
-     * and must not be treated as "available". */
+    /* Probe kTLS availability: /proc/net/tls_stat is written by the kernel
+     * tls module and is the most reliable indicator that the ULP is present.
+     * ENOPROTOOPT/ENOTSUP/EOPNOTSUPP on a raw setsockopt all mean "not
+     * supported" and must never be treated as "available". */
     {
-        int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (probe_fd >= 0) {
-#ifdef SOL_TCP
-            int r = setsockopt(probe_fd, SOL_TCP, TCP_ULP, "tls", strlen("tls"));
-            tls->ktls_available = (r == 0);
-#else
+        int f = open("/proc/net/tls_stat", O_RDONLY | O_CLOEXEC);
+        if (f >= 0) {
+            tls->ktls_available = true;
+            close(f);
+        } else {
             tls->ktls_available = false;
-#endif
-            close(probe_fd);
         }
     }
     log_info("tls_init", "kTLS kernel support: %s", tls->ktls_available ? "yes" : "no");
