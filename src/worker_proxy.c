@@ -24,8 +24,7 @@ static void try_backend_pool_return(struct worker *w, uint32_t cid, struct conn_
     if (ps <= 0) return;
 
     struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
-    if (cold->backend_content_length == 0 || cold->backend_body_recv < cold->backend_content_length)
-        return;
+    if (!cold->backend_body_complete) return;
 
     if (h->backend_fd >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_BACKEND(w, cid));
@@ -40,6 +39,8 @@ static void try_backend_pool_return(struct worker *w, uint32_t cid, struct conn_
     h->flags &= ~(CONN_FLAG_STREAMING_BACKEND | CONN_FLAG_BACKEND_POOLED | CONN_FLAG_BACKEND_TLS);
     cold->backend_content_length = 0;
     cold->backend_body_recv = 0;
+    cold->backend_is_chunked = false;
+    cold->backend_body_complete = false;
     log_debug("backend_pool_return", "conn=%u route=%d backend=%d", cid, ri, bi);
 }
 
@@ -68,6 +69,33 @@ static void submit_client_response_send(struct worker *w, uint32_t cid, struct c
 
 /* Forward declaration — defined near strip_named_header below. */
 static uint8_t *find_header_ci(const uint8_t *buf, size_t n, const char *name, size_t nlen);
+
+/* ---- header rewrite helpers ---- */
+
+/* Replace the bytes [value_start, value_end) with new_val in buf[0..*len].
+ * buf has capacity cap.  Updates *len.  Returns 0 on success, -1 if no room. */
+static int hdr_replace_value(uint8_t *buf, int *len, int cap, uint8_t *value_start,
+                             uint8_t *value_end, const char *new_val, size_t new_len)
+{
+    int delta = (int)new_len - (int)(value_end - value_start);
+    if (*len + delta > cap || *len + delta <= 0) return -1;
+    memmove(value_start + new_len, value_end, (size_t)(buf + *len - value_end));
+    memcpy(value_start, new_val, new_len);
+    *len += delta;
+    return 0;
+}
+
+/* Insert text of length text_len at position pos in buf[0..*len].
+ * buf has capacity cap.  Updates *len.  Returns 0 on success, -1 if no room. */
+static int hdr_insert_after(uint8_t *buf, int *len, int cap, uint8_t *pos, const char *text,
+                            size_t text_len)
+{
+    if (*len + (int)text_len > cap) return -1;
+    memmove(pos + text_len, pos, (size_t)(buf + *len - pos));
+    memcpy(pos, text, text_len);
+    *len += (int)text_len;
+    return 0;
+}
 
 static int inject_response_etag(struct worker *w, uint8_t *buf, int n)
 {
@@ -100,12 +128,9 @@ static int inject_response_etag(struct worker *w, uint8_t *buf, int n)
     char etag_hdr[40];
     int etag_len =
         snprintf(etag_hdr, sizeof(etag_hdr), "\r\nETag: \"%016llx\"", (unsigned long long)etag);
-    if (etag_len <= 0 || n + etag_len > (int)w->pool.buf_size) return n;
-
-    size_t hle = (size_t)(hdr_end - buf);
-    memmove(buf + hle + etag_len, buf + hle, (size_t)(n - (int)hle));
-    memcpy(buf + hle, etag_hdr, (size_t)etag_len);
-    return n + etag_len;
+    if (etag_len <= 0) return n;
+    hdr_insert_after(buf, &n, (int)w->pool.buf_size, hdr_end, etag_hdr, (size_t)etag_len);
+    return n;
 }
 
 static int rewrite_backend_connection_header(struct worker *w, uint32_t cid, struct conn_hot *h,
@@ -125,24 +150,15 @@ static int rewrite_backend_connection_header(struct worker *w, uint32_t cid, str
         while (vs < rbuf + fwd_n && (*vs == ' ' || *vs == '\t'))
             vs++;
         uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(rbuf + fwd_n - vs));
-        if (ve && ve > vs) {
-            size_t old_len = (size_t)(ve - vs);
-            int delta = (int)conn_val_len - (int)old_len;
-            if (fwd_n + delta <= (int)w->pool.buf_size && fwd_n + delta > 0) {
-                memmove(vs + conn_val_len, ve, (size_t)(rbuf + fwd_n - ve));
-                memcpy(vs, conn_val, conn_val_len);
-                fwd_n += delta;
-            }
-        }
+        if (ve && ve > vs)
+            hdr_replace_value(rbuf, &fwd_n, (int)w->pool.buf_size, vs, ve, conn_val, conn_val_len);
     } else {
         const char *eol0 = (const char *)FIND_CRLF(rbuf, (size_t)fwd_n);
-        char inj0[32];
-        int il0 = snprintf(inj0, sizeof(inj0), "Connection: %s\r\n", conn_val);
-        if (eol0 && fwd_n + il0 <= (int)w->pool.buf_size) {
-            size_t le = (size_t)(eol0 - (const char *)rbuf) + 2;
-            memmove(rbuf + le + il0, rbuf + le, (size_t)fwd_n - le);
-            memcpy(rbuf + le, inj0, (size_t)il0);
-            fwd_n += il0;
+        if (eol0) {
+            char inj0[32];
+            int il0 = snprintf(inj0, sizeof(inj0), "Connection: %s\r\n", conn_val);
+            uint8_t *after_line1 = rbuf + (size_t)(eol0 - (const char *)rbuf) + 2;
+            hdr_insert_after(rbuf, &fwd_n, (int)w->pool.buf_size, after_line1, inj0, (size_t)il0);
         }
     }
 
@@ -150,6 +166,8 @@ static int rewrite_backend_connection_header(struct worker *w, uint32_t cid, str
         struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
         cold->backend_content_length = 0;
         cold->backend_body_recv = 0;
+        cold->backend_is_chunked = false;
+        cold->backend_body_complete = false;
     }
 
     return fwd_n;
@@ -222,18 +240,39 @@ static void send_bad_request_and_close(struct worker *w, uint32_t cid)
     conn_close(w, cid, false);
 }
 
+/* Scan for HTTP header by name using case-insensitive comparison.
+ * Returns count of occurrences (each \r\n<name>: in the buffer). */
+static int count_header(const uint8_t *buf, size_t len, const char *name, size_t name_len)
+{
+    int count = 0;
+    const uint8_t *p = buf;
+    const uint8_t *end = (len >= 2) ? buf + len - 2 : buf;
+    while (p < end) {
+        if (p[0] != '\r' || p[1] != '\n') {
+            p++;
+            continue;
+        }
+        p += 2;
+        if ((size_t)(end - p) < name_len + 1) break;
+        if (strncasecmp((const char *)p, name, name_len) == 0 && p[name_len] == ':') count++;
+        /* advance past this line */
+        const uint8_t *eol = (const uint8_t *)memchr(p, '\n', (size_t)(buf + len - p));
+        p = eol ? eol + 1 : buf + len;
+    }
+    return count;
+}
+
+/* Detect HTTP/1.1 request smuggling framing ambiguity (RFC 7230 §3.3.3):
+ *   - Both Transfer-Encoding and Content-Length present, OR
+ *   - Multiple Content-Length headers (even with identical values).
+ * Header names are matched case-insensitively; the colon need not be
+ * preceded by a space (handles `Transfer-Encoding:chunked`). */
 static bool request_has_ambiguous_framing(const uint8_t *buf, size_t len)
 {
-    const uint8_t *te;
-    const uint8_t *cl;
-
-    te = (const uint8_t *)VX_MEMMEM(buf, len, "\r\nTransfer-Encoding:", 20);
-    if (!te) te = (const uint8_t *)VX_MEMMEM(buf, len, "\r\ntransfer-encoding:", 20);
-    if (!te) return false;
-
-    cl = (const uint8_t *)VX_MEMMEM(buf, len, "\r\nContent-Length:", 17);
-    if (!cl) cl = (const uint8_t *)VX_MEMMEM(buf, len, "\r\ncontent-length:", 17);
-    return cl != NULL;
+    int cl_count = count_header(buf, len, "content-length", 14);
+    if (cl_count > 1) return true; /* multiple CL = ambiguous regardless of TE */
+    if (cl_count == 0) return false;
+    return count_header(buf, len, "transfer-encoding", 17) > 0;
 }
 
 static void conn_backend_count_assign(struct conn_hot *h, int route_idx, int backend_idx)
@@ -390,31 +429,44 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
     h->flags |= CONN_FLAG_STREAMING_BACKEND;
     h->bytes_out += (uint32_t)n;
 
-    /* Track body bytes for keep-alive pool return */
+    /* Track response framing for keep-alive pool return.
+     * Supports both Content-Length and Transfer-Encoding: chunked. */
     {
         int _ri = h->route_idx, _bi = h->backend_idx;
         int _ps = w->cfg->routes[_ri].backends[_bi].pool_size;
-        if (_ps > 0) {
-            /* Parse Content-Length from the first response chunk */
-            if (cold_main->backend_content_length == 0 && n > 12) {
-                const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
-                const char *clh =
-                    (const char *)VX_MEMMEM(sbuf2, (size_t)n, "\r\nContent-Length:", 17);
-                if (!clh)
-                    clh = (const char *)VX_MEMMEM(sbuf2, (size_t)n, "\r\ncontent-length:", 17);
-                if (clh) {
-                    const char *cv = clh + 17;
-                    while (*cv == ' ')
-                        cv++;
-                    char *endp;
-                    unsigned long cl = strtoul(cv, &endp, 10);
-                    if (cl > UINT32_MAX) cl = UINT32_MAX;
-                    cold_main->backend_content_length = (uint32_t)cl;
+        if (_ps > 0 && !cold_main->backend_body_complete) {
+            const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
+            /* On first chunk: parse response framing headers */
+            if (!cold_main->backend_is_chunked && cold_main->backend_content_length == 0 &&
+                n > 12) {
+                /* Detect chunked encoding */
+                if (VX_MEMMEM(sbuf2, (size_t)n, "\r\nTransfer-Encoding: chunked", 28) ||
+                    VX_MEMMEM(sbuf2, (size_t)n, "\r\ntransfer-encoding: chunked", 28)) {
+                    cold_main->backend_is_chunked = true;
+                } else {
+                    /* Parse Content-Length */
+                    const char *clh =
+                        (const char *)VX_MEMMEM(sbuf2, (size_t)n, "\r\nContent-Length:", 17);
+                    if (!clh)
+                        clh = (const char *)VX_MEMMEM(sbuf2, (size_t)n, "\r\ncontent-length:", 17);
+                    if (clh) {
+                        const char *cv = clh + 17;
+                        while (*cv == ' ')
+                            cv++;
+                        char *endp;
+                        unsigned long cl = strtoul(cv, &endp, 10);
+                        if (cl > UINT32_MAX) cl = UINT32_MAX;
+                        cold_main->backend_content_length = (uint32_t)cl;
+                    }
                 }
             }
-            /* Count body bytes (after \r\n\r\n header terminator) */
-            if (cold_main->backend_content_length > 0) {
-                const uint8_t *sbuf2 = conn_send_buf(&w->pool, cid);
+
+            if (cold_main->backend_is_chunked) {
+                /* Chunked: look for the final-chunk terminator "0\r\n\r\n" */
+                if (VX_MEMMEM(sbuf2, (size_t)n, "0\r\n\r\n", 5))
+                    cold_main->backend_body_complete = true;
+            } else if (cold_main->backend_content_length > 0) {
+                /* Content-Length: accumulate body bytes received */
                 const char *hend = (const char *)FIND_HDR_END(sbuf2, (size_t)n);
                 if (hend && (hend + 4 <= (const char *)sbuf2 + n)) {
                     size_t body_in_chunk = (size_t)n - (size_t)(hend + 4 - (const char *)sbuf2);
@@ -422,6 +474,8 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                 } else if (!hend) {
                     cold_main->backend_body_recv += (uint32_t)n;
                 }
+                if (cold_main->backend_body_recv >= cold_main->backend_content_length)
+                    cold_main->backend_body_complete = true;
             }
         }
     }

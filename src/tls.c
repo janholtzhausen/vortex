@@ -435,19 +435,16 @@ int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg)
     g_on_client_hello.super.cb = on_client_hello_cb;
     g_on_client_hello.tls_ctx = tls;
 
-    /* Probe kTLS availability */
+    /* Probe kTLS availability by attempting to install the TLS ULP on a
+     * throwaway socket.  Only a return value of 0 means kTLS is present;
+     * ENOPROTOOPT/ENOTSUP/EOPNOTSUPP all mean the kernel does NOT support it
+     * and must not be treated as "available". */
     {
         int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (probe_fd >= 0) {
-#ifdef SOL_TLS
-            int r = setsockopt(probe_fd, SOL_TLS, 0, NULL, 0);
-            tls->ktls_available = (r == 0 || errno == ENOPROTOOPT || errno == ENOTSUP ||
-                                   errno == EOPNOTSUPP || errno == EINVAL);
-            int f = open("/proc/net/tls_stat", O_RDONLY);
-            if (f >= 0) {
-                tls->ktls_available = true;
-                close(f);
-            }
+#ifdef SOL_TCP
+            int r = setsockopt(probe_fd, SOL_TCP, TCP_ULP, "tls", strlen("tls"));
+            tls->ktls_available = (r == 0);
 #else
             tls->ktls_available = false;
 #endif
@@ -531,17 +528,25 @@ void tls_destroy(struct tls_ctx *tls)
 /* tls_accept: blocking TLS 1.3 handshake with kTLS installation       */
 /* ------------------------------------------------------------------ */
 
-/* Write all bytes in buf to fd (blocking) */
+/* Write all bytes to fd.  Used only inside pool threads (never in the worker
+ * event loop), so blocking is acceptable — but we poll rather than spin so
+ * that we release the CPU while waiting for the socket to be writable. */
 static int write_all(int fd, const uint8_t *buf, size_t len)
 {
     size_t off = 0;
     while (off < len) {
         ssize_t n = write(fd, buf + off, len - off);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            return -1;
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
         }
-        off += (size_t)n;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+            if (poll(&pfd, 1, 5000) <= 0) return -1;
+            continue;
+        }
+        return -1;
     }
     return 0;
 }

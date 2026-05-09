@@ -86,9 +86,11 @@ struct conn_cold {
     char last_error_str[128];
 
     /* Backend keep-alive / connection pool tracking */
-    uint32_t backend_content_length; /* expected response body bytes (0 = unknown) */
+    uint32_t backend_content_length; /* expected response body bytes; 0 = unknown/chunked */
     uint32_t backend_body_recv; /* body bytes received so far */
     uint8_t backend_pooled; /* 1 = this backend fd came from the pool */
+    bool backend_is_chunked; /* response uses Transfer-Encoding: chunked */
+    bool backend_body_complete; /* full response body received; safe to pool fd */
 
     /* Backend response deadline — ns (CLOCK_MONOTONIC_COARSE).
      * Set when RECV_BACKEND is armed; cleared on first response byte or close.
