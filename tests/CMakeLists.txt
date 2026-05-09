@@ -165,6 +165,7 @@ if(VORTEX_KTLS_TESTS)
             WORKING_DIRECTORY ${KTLS_TEST_DIR})
         set_tests_properties(${t} PROPERTIES
             SKIP_RETURN_CODE 77
+            LABELS ktls_shell
             ENVIRONMENT "VORTEX_BIN=$<TARGET_FILE:vortex>;VORTEX_CFG=/tmp/${t}.yaml")
     endforeach()
 endif()
