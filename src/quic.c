@@ -1072,17 +1072,28 @@ static void conn_free(struct quic_server *qs, struct quic_conn *c)
         ptls_free(c->ptls);
         c->ptls = NULL;
     }
-    for (int i = 0; i < QUIC_MAX_CONNS; i++) {
+    /* Remove from the hash table using a tombstone (CONN_DELETED), not NULL.
+     * Writing NULL would punch a hole in the probe chain and make any
+     * connection inserted past this slot unreachable via conn_find. */
+    int del_start = conn_slot((const struct sockaddr *)&c->peer_addr, c->peer_addrlen);
+    for (int probe = 0; probe < QUIC_MAX_CONNS; probe++) {
+        int i = (del_start + probe) % QUIC_MAX_CONNS;
         if (qs->conns[i] == c) {
-            qs->conns[i] = NULL;
+            qs->conns[i] = CONN_DELETED;
             qs->conn_count--;
             break;
         }
+        if (!qs->conns[i]) break; /* shouldn't happen — conn not in table */
     }
     free(c);
 }
 
-/* Simple hash of peer address for O(1) amortised lookup — FNV-1a over addr bytes. */
+/* Tombstone sentinel — marks a slot that held a connection which was freed.
+ * NULL = never inserted here (probe chain ends).
+ * CONN_DELETED = was here, now gone (probe chain continues through this slot). */
+#define CONN_DELETED ((struct quic_conn *)(uintptr_t)1)
+
+/* FNV-1a hash of peer address → starting slot for linear probe */
 static int conn_slot(const struct sockaddr *peer, socklen_t peer_len)
 {
     const uint8_t *p = (const uint8_t *)peer;
@@ -1096,11 +1107,11 @@ static struct quic_conn *conn_find(struct quic_server *qs, const struct sockaddr
                                    socklen_t peer_len)
 {
     int start = conn_slot(peer, peer_len);
-    /* Linear probing for collision resolution */
     for (int probe = 0; probe < QUIC_MAX_CONNS; probe++) {
         int i = (start + probe) % QUIC_MAX_CONNS;
         struct quic_conn *c = qs->conns[i];
-        if (!c) break; /* empty slot — not found */
+        if (!c) break; /* NULL = end of probe chain */
+        if (c == CONN_DELETED) continue; /* tombstone — keep probing */
         if (c->peer_addrlen == peer_len && memcmp(&c->peer_addr, peer, peer_len) == 0) return c;
     }
     return NULL;
@@ -1122,12 +1133,25 @@ static void dispatch_packet(struct quic_server *qs, const struct sockaddr *peer,
             conn_free(qs, c);
             return;
         }
-        for (int i = 0; i < QUIC_MAX_CONNS; i++) {
-            if (!qs->conns[i]) {
+        /* Insert at the hash-derived slot so conn_find can locate it via
+         * the same linear probe sequence.  Sequential insertion would place
+         * connections at arbitrary slots that the hash-based lookup can't
+         * reach without traversing unrelated slots or hitting a false NULL. */
+        int ins_start = conn_slot(peer, peer_len);
+        bool inserted = false;
+        for (int probe = 0; probe < QUIC_MAX_CONNS; probe++) {
+            int i = (ins_start + probe) % QUIC_MAX_CONNS;
+            if (!qs->conns[i] || qs->conns[i] == CONN_DELETED) {
                 qs->conns[i] = c;
                 qs->conn_count++;
+                inserted = true;
                 break;
             }
+        }
+        if (!inserted) {
+            /* Table full despite conn_count check — shouldn't happen */
+            conn_free(qs, c);
+            return;
         }
     }
 
@@ -1216,7 +1240,7 @@ static void *quic_thread(void *arg)
         ngtcp2_tstamp ts = now_ns();
         for (int i = 0; i < QUIC_MAX_CONNS; i++) {
             struct quic_conn *c = qs->conns[i];
-            if (!c) continue;
+            if (!c || c == CONN_DELETED) continue;
             if (ts - c->last_active > 60ULL * NGTCP2_SECONDS) {
                 conn_free(qs, c);
                 continue;
@@ -1274,7 +1298,7 @@ static void *quic_thread(void *arg)
     }
 
     for (int i = 0; i < QUIC_MAX_CONNS; i++) {
-        if (qs->conns[i]) conn_free(qs, qs->conns[i]);
+        if (qs->conns[i] && qs->conns[i] != CONN_DELETED) conn_free(qs, qs->conns[i]);
     }
     return NULL;
 }

@@ -1110,11 +1110,26 @@ fail:
     return NULL;
 }
 
-/* Minimal verify_certificate callback: checks cert expiry only.
- * No CA chain verification (no CA store in minicrypto), no SAN/CN hostname check.
- * Prevents accepting certs that are obviously expired.
- * Sets verify_sign=NULL — the TLS Finished still cryptographically binds the
- * cert's public key to the handshake transcript via the server's CertificateVerify. */
+/*
+ * Backend certificate callback — SECURITY WARNING: unauthenticated TLS.
+ *
+ * Setting *verify_sign = NULL tells picotls to skip CertificateVerify
+ * verification.  The server therefore never proves it holds the private key
+ * corresponding to the certificate it presented.  Combined with no CA chain
+ * verification (minicrypto has no CA store), this means:
+ *
+ *   - Any certificate is accepted (expired, self-signed, wrong hostname).
+ *   - Any MITM can present any certificate and complete the handshake.
+ *   - Traffic IS encrypted via ECDHE, but the peer is completely unauthenticated.
+ *
+ * The TLS Finished message does NOT substitute for CertificateVerify — it
+ * authenticates the transcript, not the server's identity.
+ *
+ * This is the best we can do without a CA bundle in minicrypto builds.
+ * Users who need real backend authentication must configure a CA-verifying
+ * TLS terminator (nginx/haproxy) in front of vortex's backend connection,
+ * or build with OpenSSL and provide `backend_ca_file`.
+ */
 static int backend_verify_cert_cb(ptls_verify_certificate_t *self, ptls_t *tls,
                                   const char *server_name,
                                   int (**verify_sign)(void *, uint16_t, ptls_iovec_t, ptls_iovec_t),
@@ -1122,19 +1137,18 @@ static int backend_verify_cert_cb(ptls_verify_certificate_t *self, ptls_t *tls,
 {
     (void)self;
     (void)tls;
-    *verify_sign = NULL;
+    *verify_sign = NULL; /* skips CertificateVerify — server identity NOT proven */
     *verify_data = NULL;
 
     if (num_certs == 0) {
-        log_warn("tls_verify", "backend %s: no certificates presented",
+        log_warn("tls_verify", "backend %s: no certificate presented",
                  server_name ? server_name : "?");
         return PTLS_ALERT_CERTIFICATE_REQUIRED;
     }
-    /* Chain and hostname are NOT verified — no CA store available.
-     * The TLS Finished still cryptographically binds the cert's public key
-     * to the handshake transcript via CertificateVerify. */
-    log_debug("tls_verify", "backend %s: cert presented (chain unverified — no CA store)",
-              server_name ? server_name : "?");
+    log_warn("tls_verify",
+             "backend %s: certificate accepted WITHOUT chain or CertificateVerify "
+             "verification — connection is MITM-vulnerable (no CA store in minicrypto)",
+             server_name ? server_name : "?");
     return 0;
 }
 
@@ -1155,8 +1169,10 @@ static ptls_verify_certificate_t g_backend_verify_cert = {backend_verify_cert_cb
 ptls_context_t *tls_create_client_ctx(bool verify_peer)
 {
     if (verify_peer) {
-        log_warn("tls", "backend verify_peer=true — expiry checked, chain/hostname NOT verified "
-                        "(no CA store in minicrypto); set insecure_skip_verify=true to suppress");
+        log_warn("tls", "backend verify_peer=true — certificate is NOT authenticated: "
+                        "no CA chain, no hostname check, CertificateVerify skipped (no CA store in "
+                        "minicrypto). Connection is MITM-vulnerable. "
+                        "Set insecure_skip_verify=true to suppress this warning.");
     }
 
     static ptls_key_exchange_algorithm_t *key_exchanges[] = {&ptls_minicrypto_x25519,

@@ -55,19 +55,16 @@ bool cb_is_open_global(int ri, int bi, uint64_t now_ns)
 {
     uint64_t until =
         atomic_load_explicit(&g_backend_cb[ri][bi].open_until_ns, memory_order_acquire);
-    if (until == 0 || now_ns >= until) return false; /* closed or timeout elapsed */
+    if (until == 0) return false; /* closed: no failures recorded */
+    if (now_ns < until) return true; /* still within open penalty window */
 
-    /* Half-open: timeout elapsed but circuit hasn't been reset yet.
-     * Allow exactly ONE worker to probe by CAS-claiming the probing slot.
-     * All other workers see the circuit as still open until the probe result. */
-    if (now_ns >= until) {
-        uint8_t expected = 0;
-        if (atomic_compare_exchange_strong_explicit(&g_backend_cb[ri][bi].probing, &expected, 1,
-                                                    memory_order_acq_rel, memory_order_relaxed))
-            return false; /* this worker won the probe slot — let it through */
-        return true; /* another worker already probing — keep open */
-    }
-    return true; /* still within open window */
+    /* Half-open: penalty expired. Allow exactly ONE worker to probe via CAS;
+     * all others see the circuit as still open until the probe resolves. */
+    uint8_t expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&g_backend_cb[ri][bi].probing, &expected, 1,
+                                                memory_order_acq_rel, memory_order_relaxed))
+        return false; /* won probe slot — let this request through */
+    return true; /* another worker is already probing — keep blocking */
 }
 
 void cb_record_failure_global(int ri, int bi, uint64_t now_ns, uint32_t threshold, uint32_t open_ms)
