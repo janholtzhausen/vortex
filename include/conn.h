@@ -85,6 +85,12 @@ struct conn_cold {
     int last_error;
     char last_error_str[128];
 
+    /* Access log fields — set on first request, emitted in conn_close */
+    char req_method[16]; /* e.g. "GET", "POST" */
+    char req_url[256]; /* request path+query, truncated */
+    uint16_t resp_status; /* HTTP status from backend (0 = not yet set) */
+    uint64_t req_start_ns; /* CLOCK_MONOTONIC_COARSE ns when request recv'd */
+
     /* Backend keep-alive / connection pool tracking */
     uint32_t backend_content_length; /* expected response body bytes; 0 = unknown/chunked */
     uint32_t backend_body_recv; /* body bytes received so far */

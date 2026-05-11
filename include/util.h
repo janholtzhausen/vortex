@@ -83,6 +83,12 @@ static inline uint64_t rdtsc(void)
     return ((uint64_t)hi << 32) | lo;
 }
 
+/* TSC frequency (Hz) — set once at startup via tsc_hz_init(), then read-only.
+ * Default is 3 GHz which is wrong on anything other than an exact 3 GHz part;
+ * always call tsc_hz_init() in main() before spawning workers. */
+extern uint64_t g_tsc_hz;
+void tsc_hz_init(void);
+
 /* xxHash64 — fast non-crypto hash */
 static inline uint64_t xxhash64(const void *data, size_t len)
 {

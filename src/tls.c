@@ -34,6 +34,7 @@
 #include <netinet/tcp.h>
 #include <linux/tls.h>
 #include <stdatomic.h>
+#include <netdb.h>
 
 /* ------------------------------------------------------------------ */
 /* kTLS install counters                                                */
@@ -336,6 +337,40 @@ typedef struct {
     ptls_minicrypto_secp256r1sha256_sign_certificate_t sc;
 } vortex_sign_certificate_t;
 
+/* Per-route emit_certificate callback — serves OCSP staple when a cached
+ * response is available.  Mirrors the default_emit_certificate_cb in picotls
+ * but passes the OCSP iovec to ptls_build_certificate_message. */
+typedef struct {
+    ptls_emit_certificate_t base;
+    struct tls_route_ctx *route;
+} vortex_emit_certificate_t;
+
+static int vortex_emit_certificate_cb(ptls_emit_certificate_t *self, ptls_t *tls,
+                                      ptls_message_emitter_t *emitter,
+                                      ptls_key_schedule_t *key_sched, ptls_iovec_t context,
+                                      int push_status_request, const uint16_t *compress_algos,
+                                      size_t num_compress_algos)
+{
+    (void)compress_algos;
+    (void)num_compress_algos;
+    vortex_emit_certificate_t *ec = (vortex_emit_certificate_t *)self;
+    ptls_context_t *ctx = ptls_get_context(tls);
+    ptls_iovec_t ocsp = ptls_iovec_init(NULL, 0);
+    if (push_status_request && ec->route->ocsp_resp_der) {
+        ocsp.base = (uint8_t *)ec->route->ocsp_resp_der;
+        ocsp.len = (size_t)ec->route->ocsp_resp_der_len;
+    }
+    int ret;
+    ptls_push_message(emitter, key_sched, PTLS_HANDSHAKE_TYPE_CERTIFICATE, {
+        if ((ret = ptls_build_certificate_message(emitter->buf, context, ctx->certificates.list,
+                                                  ctx->certificates.count, ocsp)) != 0)
+            goto Exit;
+    });
+    ret = 0;
+Exit:
+    return ret;
+}
+
 /*
  * Create a fully configured ptls_context_t for a TLS server route.
  * cert_pem_file: path to PEM cert chain file.
@@ -349,14 +384,18 @@ static ptls_context_t *build_route_context(struct tls_ctx *tls_ctx, const char *
     static ptls_cipher_suite_t *cipher_suites[] = {&ptls_minicrypto_aes256gcmsha384,
                                                    &ptls_minicrypto_chacha20poly1305sha256, NULL};
 
-    /* Allocate context + sign_certificate together */
+    /* Allocate context + sign_certificate + emit_certificate together */
     ptls_context_t *ctx = calloc(1, sizeof(*ctx));
     vortex_sign_certificate_t *sc = calloc(1, sizeof(*sc));
-    if (!ctx || !sc) {
+    vortex_emit_certificate_t *ec = calloc(1, sizeof(*ec));
+    if (!ctx || !sc || !ec) {
         free(ctx);
         free(sc);
+        free(ec);
         return NULL;
     }
+    ec->base.cb = vortex_emit_certificate_cb;
+    /* ec->route is set by the caller after build_route_context returns */
 
     ctx->random_bytes = ptls_minicrypto_random_bytes;
     ctx->get_time = &ptls_get_time;
@@ -366,8 +405,8 @@ static ptls_context_t *build_route_context(struct tls_ctx *tls_ctx, const char *
     ctx->ticket_lifetime = tls_ctx->session_timeout ? tls_ctx->session_timeout : 3600;
     ctx->server_cipher_preference = 1;
 
-    /* Store sign_certificate pointer as app_data for cleanup */
     ctx->sign_certificate = &sc->sc.super;
+    ctx->emit_certificate = &ec->base;
 
     /* Load certificates */
     if (ptls_load_certificates(ctx, cert_pem_file) != 0) {
@@ -408,6 +447,733 @@ static ptls_context_t *build_route_context(struct tls_ctx *tls_ctx, const char *
 
     log_info("tls_cert_loaded", "cert=%s", cert_pem_file);
     return ctx;
+}
+
+/* ------------------------------------------------------------------ */
+/* OCSP stapling                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ocsp_url_from_cert: extract the OCSP responder URL from the AIA extension
+ * in a DER-encoded X.509 certificate.
+ *
+ * Strategy: scan the DER blob for the id-ad-ocsp OID
+ *   { 1.3.6.1.5.5.7.48.1 } = 2b 06 01 05 05 07 30 01
+ * then read the following uniformResourceIdentifier [6] IMPLICIT IA5String.
+ * Returns a heap-allocated NUL-terminated URL, or NULL if not found.
+ */
+static char *ocsp_url_from_cert(const uint8_t *der, size_t len)
+{
+    /* id-ad-ocsp OID value bytes (without tag 0x06 and length) */
+    static const uint8_t ocsp_oid_val[] = {0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01};
+    /* Full TLV: 06 08 <oid_val> */
+    static const uint8_t ocsp_oid_tlv[] = {0x06, 0x08, 0x2b, 0x06, 0x01,
+                                           0x05, 0x05, 0x07, 0x30, 0x01};
+    (void)ocsp_oid_val;
+
+    if (len < sizeof(ocsp_oid_tlv)) return NULL;
+    const uint8_t *end = der + len;
+    const uint8_t *p = der;
+
+    while (p + sizeof(ocsp_oid_tlv) + 2 < end) {
+        /* Find the OCSP OID TLV */
+        if (memcmp(p, ocsp_oid_tlv, sizeof(ocsp_oid_tlv)) != 0) {
+            p++;
+            continue;
+        }
+        /* OID found at p; the GeneralName follows immediately.
+         * uniformResourceIdentifier: CHOICE [6] IMPLICIT IA5String → tag 0x86 */
+        const uint8_t *q = p + sizeof(ocsp_oid_tlv);
+        if (q + 2 > end) break;
+        if (q[0] != 0x86) {
+            p++;
+            continue;
+        } /* wrong GeneralName type */
+        uint8_t url_len = q[1]; /* assume length fits in one byte */
+        q += 2;
+        if (q + url_len > end) break;
+        if (url_len < 7 || memcmp(q, "http://", 7) != 0) {
+            p++;
+            continue;
+        }
+        char *url = malloc((size_t)url_len + 1);
+        if (!url) return NULL;
+        memcpy(url, q, url_len);
+        url[url_len] = '\0';
+        return url;
+    }
+    return NULL;
+}
+
+/*
+ * SHA-1 implementation for OCSP CertID construction.
+ * RFC 3110 / FIPS 180-4.  Public domain.
+ */
+#define SHA1_DIGEST_SIZE 20
+
+typedef struct {
+    uint32_t h[5];
+    uint64_t count;
+    uint8_t buf[64];
+    uint8_t buflen;
+} sha1_ctx_t;
+
+static void sha1_init(sha1_ctx_t *c)
+{
+    c->h[0] = 0x67452301u;
+    c->h[1] = 0xEFCDAB89u;
+    c->h[2] = 0x98BADCFEu;
+    c->h[3] = 0x10325476u;
+    c->h[4] = 0xC3D2E1F0u;
+    c->count = 0;
+    c->buflen = 0;
+}
+
+#define SHA1_ROL(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
+static void sha1_compress(sha1_ctx_t *c, const uint8_t blk[64])
+{
+    uint32_t w[80], a, b, d, e, f, k, tmp;
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)blk[i * 4] << 24) | ((uint32_t)blk[i * 4 + 1] << 16) |
+               ((uint32_t)blk[i * 4 + 2] << 8) | blk[i * 4 + 3];
+    for (int i = 16; i < 80; i++)
+        w[i] = SHA1_ROL(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    a = c->h[0];
+    b = c->h[1];
+    uint32_t cc = c->h[2];
+    d = c->h[3];
+    e = c->h[4];
+    for (int i = 0; i < 80; i++) {
+        if (i < 20) {
+            f = (b & cc) | (~b & d);
+            k = 0x5A827999u;
+        } else if (i < 40) {
+            f = b ^ cc ^ d;
+            k = 0x6ED9EBA1u;
+        } else if (i < 60) {
+            f = (b & cc) | (b & d) | (cc & d);
+            k = 0x8F1BBCDCu;
+        } else {
+            f = b ^ cc ^ d;
+            k = 0xCA62C1D6u;
+        }
+        tmp = SHA1_ROL(a, 5) + f + e + k + w[i];
+        e = d;
+        d = cc;
+        cc = SHA1_ROL(b, 30);
+        b = a;
+        a = tmp;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+}
+
+static void sha1_update(sha1_ctx_t *c, const uint8_t *data, size_t len)
+{
+    c->count += len;
+    while (len > 0) {
+        size_t copy = 64 - c->buflen;
+        if (copy > len) copy = len;
+        memcpy(c->buf + c->buflen, data, copy);
+        c->buflen = (uint8_t)(c->buflen + copy);
+        data += copy;
+        len -= copy;
+        if (c->buflen == 64) {
+            sha1_compress(c, c->buf);
+            c->buflen = 0;
+        }
+    }
+}
+
+static void sha1_final(sha1_ctx_t *c, uint8_t out[SHA1_DIGEST_SIZE])
+{
+    uint64_t bits = c->count * 8;
+    uint8_t pad = 0x80;
+    sha1_update(c, &pad, 1);
+    pad = 0;
+    while (c->buflen != 56)
+        sha1_update(c, &pad, 1);
+    uint8_t len_be[8];
+    for (int i = 7; i >= 0; i--) {
+        len_be[i] = (uint8_t)(bits & 0xff);
+        bits >>= 8;
+    }
+    sha1_update(c, len_be, 8);
+    for (int i = 0; i < 5; i++) {
+        out[i * 4] = (uint8_t)(c->h[i] >> 24);
+        out[i * 4 + 1] = (uint8_t)(c->h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(c->h[i] >> 8);
+        out[i * 4 + 3] = (uint8_t)(c->h[i]);
+    }
+}
+#undef SHA1_ROL
+
+static void sha1(const uint8_t *data, size_t len, uint8_t out[SHA1_DIGEST_SIZE])
+{
+    sha1_ctx_t c;
+    sha1_init(&c);
+    sha1_update(&c, data, len);
+    sha1_final(&c, out);
+}
+
+/*
+ * Simple DER builder for the OCSP CertID and OCSPRequest.
+ * Returns heap-allocated DER and sets *out_len, or NULL on failure.
+ *
+ * OCSPRequest structure (RFC 6960):
+ *   OCSPRequest    ::= SEQUENCE { tbsRequest TBSRequest }
+ *   TBSRequest     ::= SEQUENCE { requestList SEQUENCE OF Request }
+ *   Request        ::= SEQUENCE { reqCert CertID }
+ *   CertID         ::= SEQUENCE {
+ *       hashAlgorithm  AlgorithmIdentifier,  -- SHA-1
+ *       issuerNameHash OCTET STRING,
+ *       issuerKeyHash  OCTET STRING,
+ *       serialNumber   INTEGER
+ *   }
+ *
+ * We only support the leaf cert (certificates.list[0]) and issuer
+ * (certificates.list[1]).  Both must be present.
+ */
+static uint8_t *build_ocsp_request(ptls_context_t *ctx, size_t *out_len)
+{
+    if (ctx->certificates.count < 2) return NULL;
+
+    const uint8_t *leaf = ctx->certificates.list[0].base;
+    size_t leaf_len = ctx->certificates.list[0].len;
+    const uint8_t *issuer = ctx->certificates.list[1].base;
+    size_t issuer_len = ctx->certificates.list[1].len;
+
+    /* --- Extract issuer subject DN from issuer cert ---
+     * In a DER X.509, the subject DN is the 5th element inside the
+     * TBSCertificate (version[0], serialNumber, signature, issuer, validity,
+     * subject).  We use a simple approach: search for the issuer's subjectDN
+     * by looking at the issuer cert's structure.
+     *
+     * Actually: issuerNameHash = SHA1(issuer cert subject DN DER).
+     * The subject DN is a SEQUENCE that starts after:
+     *   SEQUENCE (TBSCertificate) → version → serialNumber → signature →
+     *   issuer (= what we want as the issuer of the leaf's issuer) → validity → subject.
+     *
+     * For simplicity we use a fixed-offset approach that works for DER certs
+     * from standard CAs (Let's Encrypt). We scan for the 5th SEQUENCE tag
+     * inside the outer SEQUENCE. This is fragile for unusual cert layouts.
+     *
+     * Better: use the issuer field of the LEAF cert as issuerNameHash.
+     * The issuer field in the leaf cert IS the subject of the issuer cert.
+     */
+
+    /* Walk leaf DER to find the issuer field (element 3 of TBSCertificate) */
+    const uint8_t *p = leaf;
+    const uint8_t *lend = leaf + leaf_len;
+
+    /* Skip outer SEQUENCE tag+len */
+    if (p >= lend || *p != 0x30) return NULL;
+    p++; /* skip tag */
+    if (p >= lend) return NULL;
+    if (*p & 0x80) {
+        uint8_t lbytes = *p & 0x7f;
+        p += 1 + lbytes;
+    } else
+        p++;
+
+    /* Skip TBSCertificate outer SEQUENCE tag+len */
+    if (p >= lend || *p != 0x30) return NULL;
+    p++;
+    if (p >= lend) return NULL;
+    if (*p & 0x80) {
+        uint8_t lbytes = *p & 0x7f;
+        p += 1 + lbytes;
+    } else
+        p++;
+
+    /* Optionally skip version [0] EXPLICIT */
+    if (p < lend && *p == 0xa0) {
+        p++;
+        if (p < lend) {
+            uint8_t vlen = *p++;
+            p += vlen;
+        }
+    }
+
+    /* Skip serialNumber INTEGER */
+    if (p >= lend || *p != 0x02) return NULL;
+    p++;
+    if (p >= lend) return NULL;
+    {
+        size_t snlen;
+        if (*p & 0x80) {
+            uint8_t lb = *p & 0x7f;
+            p++;
+            snlen = 0;
+            for (uint8_t i = 0; i < lb && p < lend; i++)
+                snlen = (snlen << 8) | *p++;
+        } else {
+            snlen = *p++;
+        }
+        p += snlen;
+    }
+
+    /* Skip signature AlgorithmIdentifier SEQUENCE */
+    if (p >= lend || *p != 0x30) return NULL;
+    p++;
+    if (p >= lend) return NULL;
+    {
+        uint8_t alen = *p++;
+        p += alen;
+    }
+
+    /* NOW p points at the issuer SEQUENCE (element 3 of TBSCertificate) */
+    const uint8_t *issuer_dn_start = p;
+    if (p >= lend || *p != 0x30) return NULL;
+    p++;
+    if (p >= lend) return NULL;
+    size_t issuer_dn_len;
+    if (*p & 0x80) {
+        uint8_t lb = *p & 0x7f;
+        p++;
+        issuer_dn_len = 0;
+        for (uint8_t i = 0; i < lb && p < lend; i++)
+            issuer_dn_len = (issuer_dn_len << 8) | *p++;
+    } else {
+        issuer_dn_len = *p++;
+    }
+    p += issuer_dn_len;
+    size_t issuer_dn_total = (size_t)(p - issuer_dn_start);
+
+    /* Skip validity SEQUENCE */
+    if (p >= lend || *p != 0x30) return NULL;
+    p++;
+    if (p >= lend) return NULL;
+    {
+        uint8_t vlen = *p++;
+        (void)vlen;
+        p += vlen;
+    }
+
+    /* Compute issuerNameHash = SHA1(issuer DN from leaf cert) */
+    uint8_t issuer_name_hash[SHA1_DIGEST_SIZE];
+    sha1(issuer_dn_start, issuer_dn_total, issuer_name_hash);
+
+    /* Compute issuerKeyHash = SHA1(BIT STRING value of SubjectPublicKey from issuer cert)
+     * Scan the issuer cert for the SubjectPublicKeyInfo SEQUENCE, then extract the
+     * BIT STRING's value (skip the unused-bits byte). */
+    uint8_t issuer_key_hash[SHA1_DIGEST_SIZE];
+    {
+        /* Search for BIT STRING (0x03) containing a SEQUENCE (0x30) inside issuer cert.
+         * The SubjectPublicKeyInfo structure: SEQUENCE { AlgId, BIT STRING { SEQUENCE ... } }
+         * The BIT STRING tag inside SubjectPublicKeyInfo has the public key bytes. */
+        const uint8_t *ip = issuer;
+        const uint8_t *iend = issuer + issuer_len;
+        const uint8_t *key_bytes = NULL;
+        size_t key_bytes_len = 0;
+        while (ip + 4 < iend) {
+            if (ip[0] == 0x03) { /* BIT STRING */
+                size_t bslen;
+                const uint8_t *bp = ip + 1;
+                if (*bp & 0x80) {
+                    uint8_t lb = *bp & 0x7f;
+                    bp++;
+                    bslen = 0;
+                    for (uint8_t i = 0; i < lb && bp < iend; i++)
+                        bslen = (bslen << 8) | *bp++;
+                } else {
+                    bslen = *bp++;
+                }
+                if (bp + bslen <= iend && bslen > 1 && bp[0] == 0x00) {
+                    /* unused bits = 0; the key bytes follow */
+                    key_bytes = bp + 1;
+                    key_bytes_len = bslen - 1;
+                    /* Validate: key_bytes should start with a SEQUENCE */
+                    if (key_bytes_len > 0 && key_bytes[0] == 0x30) break;
+                    key_bytes = NULL;
+                }
+            }
+            ip++;
+        }
+        if (!key_bytes) return NULL;
+        sha1(key_bytes, key_bytes_len, issuer_key_hash);
+    }
+
+    /* Extract serialNumber from leaf cert */
+    const uint8_t *serial_start = NULL;
+    size_t serial_len = 0;
+    {
+        const uint8_t *sp = leaf;
+        /* Skip outer SEQUENCE */
+        if (sp >= lend || *sp != 0x30) return NULL;
+        sp++;
+        if (*sp & 0x80) {
+            uint8_t lb = *sp & 0x7f;
+            sp += 1 + lb;
+        } else
+            sp++;
+        /* Skip TBSCertificate SEQUENCE */
+        if (sp >= lend || *sp != 0x30) return NULL;
+        sp++;
+        if (*sp & 0x80) {
+            uint8_t lb = *sp & 0x7f;
+            sp += 1 + lb;
+        } else
+            sp++;
+        /* Skip optional version [0] */
+        if (sp < lend && *sp == 0xa0) {
+            sp++;
+            uint8_t vl = *sp++;
+            sp += vl;
+        }
+        /* Read serialNumber INTEGER */
+        if (sp >= lend || *sp != 0x02) return NULL;
+        serial_start = sp;
+        sp++;
+        if (*sp & 0x80) {
+            uint8_t lb = *sp & 0x7f;
+            sp++;
+            serial_len = 0;
+            for (uint8_t i = 0; i < lb && sp < lend; i++)
+                serial_len = (serial_len << 8) | *sp++;
+        } else {
+            serial_len = *sp++;
+        }
+        (void)issuer_len;
+        serial_start = sp;
+    }
+    if (!serial_start || serial_len == 0) return NULL;
+
+    /* Build CertID DER:
+     *   SEQUENCE {
+     *     SEQUENCE { OID sha1WithRSAEncryption; NULL }  -- SHA-1 AlgId
+     *     OCTET STRING issuerNameHash
+     *     OCTET STRING issuerKeyHash
+     *     INTEGER serialNumber
+     *   }
+     */
+    /* SHA-1 AlgorithmIdentifier: SEQUENCE { OID 1.3.14.3.2.26; NULL }
+     *   30 09 06 05 2b 0e 03 02 1a 05 00   (11 bytes) */
+    static const uint8_t sha1_algid[] = {0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
+                                         0x03, 0x02, 0x1a, 0x05, 0x00};
+
+    /* Assemble CertID contents */
+    uint8_t certid[256];
+    size_t ci = 0;
+    /* SHA-1 AlgId */
+    memcpy(certid + ci, sha1_algid, sizeof(sha1_algid));
+    ci += sizeof(sha1_algid);
+    /* issuerNameHash OCTET STRING */
+    certid[ci++] = 0x04;
+    certid[ci++] = SHA1_DIGEST_SIZE;
+    memcpy(certid + ci, issuer_name_hash, SHA1_DIGEST_SIZE);
+    ci += SHA1_DIGEST_SIZE;
+    /* issuerKeyHash OCTET STRING */
+    certid[ci++] = 0x04;
+    certid[ci++] = SHA1_DIGEST_SIZE;
+    memcpy(certid + ci, issuer_key_hash, SHA1_DIGEST_SIZE);
+    ci += SHA1_DIGEST_SIZE;
+    /* serialNumber INTEGER */
+    certid[ci++] = 0x02;
+    certid[ci++] = (uint8_t)serial_len;
+    memcpy(certid + ci, serial_start, serial_len);
+    ci += serial_len;
+
+    /* Wrap in SEQUENCE for CertID */
+    uint8_t certid_seq[280];
+    size_t cs = 0;
+    certid_seq[cs++] = 0x30;
+    certid_seq[cs++] = (uint8_t)ci;
+    memcpy(certid_seq + cs, certid, ci);
+    cs += ci;
+
+    /* Build OCSPRequest:
+     *   SEQUENCE {                        -- OCSPRequest
+     *     SEQUENCE {                      -- tbsRequest
+     *       SEQUENCE {                    -- requestList
+     *         SEQUENCE { reqCert }        -- Request
+     *       }
+     *     }
+     *   }
+     * Three nested SEQUENCE wrappers around certid_seq.
+     */
+    size_t total = cs;
+    uint8_t *req = malloc(total + 12); /* +12 for up to 3 SEQUENCE wrappers */
+    if (!req) return NULL;
+    /* Request ::= SEQUENCE { reqCert } */
+    uint8_t *o = req;
+    *o++ = 0x30;
+    *o++ = (uint8_t)cs;
+    memcpy(o, certid_seq, cs);
+    o += cs;
+    size_t req_len = (size_t)(o - req);
+    /* requestList SEQUENCE */
+    uint8_t *tmp2 = malloc(req_len + 4);
+    if (!tmp2) {
+        free(req);
+        return NULL;
+    }
+    tmp2[0] = 0x30;
+    tmp2[1] = (uint8_t)req_len;
+    memcpy(tmp2 + 2, req, req_len);
+    free(req);
+    size_t rl2 = req_len + 2;
+    /* tbsRequest SEQUENCE */
+    uint8_t *tmp3 = malloc(rl2 + 4);
+    if (!tmp3) {
+        free(tmp2);
+        return NULL;
+    }
+    tmp3[0] = 0x30;
+    tmp3[1] = (uint8_t)rl2;
+    memcpy(tmp3 + 2, tmp2, rl2);
+    free(tmp2);
+    size_t rl3 = rl2 + 2;
+    /* OCSPRequest outer SEQUENCE */
+    uint8_t *out = malloc(rl3 + 4);
+    if (!out) {
+        free(tmp3);
+        return NULL;
+    }
+    out[0] = 0x30;
+    out[1] = (uint8_t)rl3;
+    memcpy(out + 2, tmp3, rl3);
+    free(tmp3);
+    *out_len = rl3 + 2;
+    return out;
+}
+
+/* Base64url-encode src into dst (must be >= (src_len+2)/3*4 + 1 bytes). */
+static size_t base64url_encode(const uint8_t *src, size_t src_len, char *dst)
+{
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t i = 0, j = 0;
+    for (; i + 3 <= src_len; i += 3) {
+        uint32_t v = ((uint32_t)src[i] << 16) | ((uint32_t)src[i + 1] << 8) | src[i + 2];
+        dst[j++] = b64[(v >> 18) & 63];
+        dst[j++] = b64[(v >> 12) & 63];
+        dst[j++] = b64[(v >> 6) & 63];
+        dst[j++] = b64[v & 63];
+    }
+    if (i < src_len) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        if (i + 1 < src_len) v |= (uint32_t)src[i + 1] << 8;
+        dst[j++] = b64[(v >> 18) & 63];
+        dst[j++] = b64[(v >> 12) & 63];
+        if (i + 1 < src_len) dst[j++] = b64[(v >> 6) & 63];
+    }
+    dst[j] = '\0';
+    return j;
+}
+
+/*
+ * Fetch an OCSP response via HTTP GET using the pre-built OCSPRequest.
+ * Returns heap-allocated DER bytes and sets *resp_len, or NULL on failure.
+ * The caller must free() the result.
+ */
+static uint8_t *ocsp_fetch(const char *responder_url, const uint8_t *req_der, size_t req_len,
+                           size_t *resp_len)
+{
+    /* Build GET URL: {responder_url}/{base64url(req_der)} */
+    size_t b64_max = (req_len + 2) / 3 * 4 + 1;
+    char *b64 = malloc(b64_max);
+    if (!b64) return NULL;
+    size_t b64_len = base64url_encode(req_der, req_len, b64);
+
+    size_t url_base_len = strlen(responder_url);
+    /* Ensure no trailing slash on base, add '/' separator */
+    size_t full_len = url_base_len + 1 + b64_len + 1;
+    char *full_url = malloc(full_len);
+    if (!full_url) {
+        free(b64);
+        return NULL;
+    }
+    size_t trailing_slash = (url_base_len > 0 && responder_url[url_base_len - 1] == '/') ? 1 : 0;
+    if (trailing_slash)
+        snprintf(full_url, full_len, "%s%s", responder_url, b64);
+    else
+        snprintf(full_url, full_len, "%s/%s", responder_url, b64);
+    free(b64);
+
+    /* Parse URL into host, port, path for TCP connection */
+    /* Only plain HTTP OCSP (http://) is supported — OCSP over HTTPS is unusual */
+    if (strncmp(full_url, "http://", 7) != 0) {
+        log_debug("ocsp", "skipping non-HTTP OCSP URL: %s", full_url);
+        free(full_url);
+        return NULL;
+    }
+    char host[256];
+    char path[1024];
+    int port = 80;
+    {
+        const char *h = full_url + 7;
+        const char *slash = strchr(h, '/');
+        const char *colon = strchr(h, ':');
+        size_t hlen;
+        if (colon && (!slash || colon < slash)) {
+            hlen = (size_t)(colon - h);
+            port = atoi(colon + 1);
+        } else {
+            hlen = slash ? (size_t)(slash - h) : strlen(h);
+        }
+        if (hlen >= sizeof(host)) {
+            free(full_url);
+            return NULL;
+        }
+        memcpy(host, h, hlen);
+        host[hlen] = '\0';
+        if (slash)
+            snprintf(path, sizeof(path), "%s", slash);
+        else
+            path[0] = '/';
+        path[1] = '\0';
+    }
+
+    /* TCP connect */
+    struct addrinfo hints, *res0;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[8];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &res0) != 0) {
+        log_debug("ocsp", "getaddrinfo(%s) failed", host);
+        free(full_url);
+        return NULL;
+    }
+    int fd = -1;
+    for (struct addrinfo *r = res0; r; r = r->ai_next) {
+        fd = socket(r->ai_family, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        /* 5-second connect timeout via SO_SNDTIMEO */
+        struct timeval tv = {5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (connect(fd, r->ai_addr, r->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res0);
+    free(full_url);
+    if (fd < 0) {
+        log_debug("ocsp", "connect to %s:%d failed", host, port);
+        return NULL;
+    }
+
+    /* HTTP/1.0 GET */
+    char req_hdr[1024];
+    int hdr_len = snprintf(req_hdr, sizeof(req_hdr),
+                           "GET %s HTTP/1.0\r\n"
+                           "Host: %s\r\n"
+                           "Accept: application/ocsp-response\r\n"
+                           "Connection: close\r\n\r\n",
+                           path, host);
+    if (write(fd, req_hdr, (size_t)hdr_len) < hdr_len) {
+        close(fd);
+        return NULL;
+    }
+
+    /* Read response */
+    size_t cap = 16384, total = 0;
+    uint8_t *rbuf = malloc(cap);
+    if (!rbuf) {
+        close(fd);
+        return NULL;
+    }
+    for (;;) {
+        if (total + 1 >= cap) {
+            cap *= 2;
+            uint8_t *tmp = realloc(rbuf, cap);
+            if (!tmp) {
+                free(rbuf);
+                close(fd);
+                return NULL;
+            }
+            rbuf = tmp;
+        }
+        ssize_t nr = recv(fd, rbuf + total, cap - total - 1, 0);
+        if (nr <= 0) break;
+        total += (size_t)nr;
+    }
+    close(fd);
+    rbuf[total] = '\0';
+
+    /* Split headers / body */
+    uint8_t *body = (uint8_t *)strstr((char *)rbuf, "\r\n\r\n");
+    if (!body) {
+        free(rbuf);
+        return NULL;
+    }
+    body += 4;
+    size_t body_len = total - (size_t)(body - rbuf);
+
+    /* Minimal response validation: check HTTP 200 and Content-Type */
+    if (memcmp(rbuf, "HTTP/1", 6) != 0 || !strstr((char *)rbuf, " 200 ")) {
+        log_debug("ocsp", "OCSP server returned non-200");
+        free(rbuf);
+        return NULL;
+    }
+    if (!strstr((char *)rbuf, "application/ocsp-response") && !strstr((char *)rbuf, "ocsp")) {
+        log_debug("ocsp", "unexpected OCSP Content-Type");
+        free(rbuf);
+        return NULL;
+    }
+    if (body_len == 0 || body[0] != 0x30) { /* DER must start with SEQUENCE */
+        free(rbuf);
+        return NULL;
+    }
+
+    uint8_t *result = malloc(body_len);
+    if (!result) {
+        free(rbuf);
+        return NULL;
+    }
+    memcpy(result, body, body_len);
+    free(rbuf);
+    *resp_len = body_len;
+    return result;
+}
+
+/*
+ * Fetch and store an OCSP staple for the given route context.
+ * Called once per route during tls_init.  Failures are non-fatal —
+ * the handshake proceeds without stapling, just with an extra OCSP RTT.
+ */
+static void tls_ocsp_staple_route(struct tls_route_ctx *rc, ptls_context_t *ctx)
+{
+    if (!ctx || !ctx->certificates.list || ctx->certificates.count < 2) return;
+
+    /* Extract OCSP URL from leaf cert AIA extension */
+    char *ocsp_url =
+        ocsp_url_from_cert(ctx->certificates.list[0].base, ctx->certificates.list[0].len);
+    if (!ocsp_url) {
+        log_debug("ocsp", "route %s: no OCSP URL in cert AIA", rc->hostname ? rc->hostname : "?");
+        return;
+    }
+
+    /* Build OCSPRequest DER */
+    size_t req_len = 0;
+    uint8_t *req_der = build_ocsp_request(ctx, &req_len);
+    if (!req_der) {
+        log_debug("ocsp", "route %s: failed to build OCSP request",
+                  rc->hostname ? rc->hostname : "?");
+        free(ocsp_url);
+        return;
+    }
+
+    /* Fetch OCSP response */
+    size_t resp_len = 0;
+    uint8_t *resp = ocsp_fetch(ocsp_url, req_der, req_len, &resp_len);
+    free(req_der);
+    free(ocsp_url);
+
+    if (!resp) {
+        log_debug("ocsp", "route %s: OCSP fetch failed", rc->hostname ? rc->hostname : "?");
+        return;
+    }
+
+    rc->ocsp_resp_der = (unsigned char *)resp;
+    rc->ocsp_resp_der_len = (int)resp_len;
+    log_info("ocsp", "route %s: OCSP staple fetched (%zu bytes)", rc->hostname ? rc->hostname : "?",
+             resp_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -467,21 +1233,22 @@ int tls_init(struct tls_ctx *tls, const struct vortex_config *cfg)
             log_warn("tls_init", "route %d: TLS context failed (will reject TLS)", i);
             continue;
         }
-        /* Attach the shared on_client_hello to every route context */
         ctx->on_client_hello = &g_on_client_hello.super;
+        /* Wire the emit_certificate callback to this route so it can access
+         * the OCSP staple after tls_ocsp_staple_route populates it. */
+        ((vortex_emit_certificate_t *)ctx->emit_certificate)->route = &tls->routes[i];
 
         tls->routes[i].ctx = ctx;
     }
 
     log_info("tls_init", "TLS subsystem ready, routes=%d", cfg->route_count);
-    /* OCSP stapling is not yet implemented — ocsp_resp_der stays NULL.
-     * Browsers and clients make extra round-trips to OCSP responders on each
-     * TLS handshake. Implement by fetching the OCSP response from the cert's
-     * AIA extension and calling ptls_set_staple() in on_client_hello_cb. */
+
+    /* Fetch OCSP staples for all routes that have a cert chain with ≥2 certs.
+     * Failures are non-fatal — connections proceed without OCSP stapling. */
     for (int i = 0; i < cfg->route_count; i++) {
-        if (tls->routes[i].ctx && !tls->routes[i].ocsp_resp_der)
-            log_debug("tls_init",
-                      "route %s: OCSP stapling not configured (extra RTT per handshake)",
+        if (tls->routes[i].ctx) tls_ocsp_staple_route(&tls->routes[i], tls->routes[i].ctx);
+        if (!tls->routes[i].ocsp_resp_der && tls->routes[i].ctx)
+            log_debug("tls_init", "route %s: no OCSP staple (clients will do OCSP round-trip)",
                       cfg->routes[i].hostname);
     }
     return 0;
@@ -503,8 +1270,8 @@ static void free_route_ctx(struct tls_route_ctx *rc)
             free(ctx->certificates.list[i].base);
         free(ctx->certificates.list);
     }
-    /* Free sign_certificate (the private key holder) */
     free(ctx->sign_certificate);
+    free(ctx->emit_certificate);
     free(ctx);
 
     if (rc->ocsp_resp_der) {

@@ -1,0 +1,4 @@
+DELETE /v1/resource/123?foo=bar&baz=qux HTTP/1.1
+Host: localhost
+Authorization: Bearer token123
+

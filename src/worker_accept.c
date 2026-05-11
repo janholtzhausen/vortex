@@ -232,8 +232,20 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
                       sizeof(client_ip));
         const char *route =
             (h->route_idx < w->cfg->route_count) ? w->cfg->routes[h->route_idx].hostname : "-";
-        log_info("access", "client=%s route=%s bytes_in=%u bytes_out=%u %s", client_ip, route,
-                 h->bytes_in, h->bytes_out, is_error ? "error" : "ok");
+        const char *method = cc->req_method[0] ? cc->req_method : "-";
+        const char *url = cc->req_url[0] ? cc->req_url : "-";
+        uint16_t status = cc->resp_status;
+        uint64_t duration_ms = 0;
+        if (cc->req_start_ns > 0) {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &_ts);
+            uint64_t now_ns = (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
+            if (now_ns > cc->req_start_ns) duration_ms = (now_ns - cc->req_start_ns) / 1000000ULL;
+        }
+        log_info("access",
+                 "client=%s route=%s \"%s %s\" status=%u bytes_in=%u bytes_out=%u ms=%llu %s",
+                 client_ip, route, method, url, (unsigned)status, h->bytes_in, h->bytes_out,
+                 (unsigned long long)duration_ms, is_error ? "error" : "ok");
     }
     conn_free(&w->pool, cid);
     if (is_error)

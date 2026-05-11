@@ -132,13 +132,12 @@ static void *worker_thread(void *arg)
             }
             /* Periodic: reap idle keep-alive connections (no backend request in flight).
              * Uses last_active_tsc — set on every RECV_CLIENT and SEND_CLIENT completion.
-             * TSC frequency approximated at 3 GHz; over-estimates idle time on slower
-             * CPUs, which just means slightly more aggressive reaping (safe). */
+             * g_tsc_hz is calibrated at startup — see src/tsc_cal.c. */
             {
-                uint64_t tsc_now = __builtin_ia32_rdtsc();
+                uint64_t tsc_now = rdtsc();
                 uint32_t idle_s =
                     w->cfg->client_idle_timeout_s ? w->cfg->client_idle_timeout_s : 60;
-                uint64_t idle_tsc = (uint64_t)idle_s * 3000000000ULL;
+                uint64_t idle_tsc = (uint64_t)idle_s * g_tsc_hz;
                 for (uint32_t _i = 0; _i < w->pool.capacity; _i++) {
                     struct conn_hot *_h = &w->pool.hot[_i];
                     if (_h->state != CONN_STATE_PROXYING) continue;

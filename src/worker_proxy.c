@@ -429,6 +429,18 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
     h->flags |= CONN_FLAG_STREAMING_BACKEND;
     h->bytes_out += (uint32_t)n;
 
+    /* Parse HTTP status code for access log ("HTTP/1.x NNN ...") */
+    if (cold_main->resp_status == 0 && n > 12) {
+        const uint8_t *sbuf_s = conn_send_buf(&w->pool, cid);
+        if (memcmp(sbuf_s, "HTTP/1.", 7) == 0) {
+            uint16_t st = 0;
+            const char *sp = (const char *)sbuf_s + 9;
+            for (int _si = 0; _si < 3 && sp[_si] >= '0' && sp[_si] <= '9'; _si++)
+                st = (uint16_t)(st * 10 + (sp[_si] - '0'));
+            if (st >= 100 && st <= 999) cold_main->resp_status = st;
+        }
+    }
+
     /* Track response framing for keep-alive pool return.
      * Supports both Content-Length and Transfer-Encoding: chunked. */
     {
@@ -1500,10 +1512,20 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
     {
         const struct route_config *rc = &w->cfg->routes[h->route_idx];
         const uint8_t *rbuf = conn_recv_buf(&w->pool, cid);
+        struct conn_cold *acold = conn_cold_ptr(&w->pool, cid);
         if (parse_http_request_line(rbuf, n, (char[16]){0}, 16, (char[512]){0}, 512) != 0) {
             send_bad_request_and_close(w, cid);
             return;
         }
+        /* Capture method, URL, and request timestamp for access log */
+        if (acold->req_start_ns == 0) {
+            struct timespec _ats;
+            clock_gettime(CLOCK_MONOTONIC_COARSE, &_ats);
+            acold->req_start_ns = (uint64_t)_ats.tv_sec * 1000000000ULL + (uint64_t)_ats.tv_nsec;
+        }
+        parse_http_request_line(rbuf, n, acold->req_method, sizeof(acold->req_method),
+                                acold->req_url, sizeof(acold->req_url));
+        acold->resp_status = 0;
         if (request_has_ambiguous_framing(rbuf, (size_t)n)) {
             log_warn("bad_request", "conn=%u ambiguous Content-Length/Transfer-Encoding", cid);
             send_bad_request_and_close(w, cid);

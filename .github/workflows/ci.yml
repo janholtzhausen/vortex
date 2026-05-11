@@ -161,17 +161,22 @@ jobs:
             -DVORTEX_FUZZ=ON
 
       - name: Build fuzz targets
-        run: cmake --build build-fuzz --target fuzz_http_parser --parallel "$(nproc)"
-
-      - name: Run HTTP parser fuzzer (30 seconds)
         run: |
-          mkdir -p fuzz-corpus
-          cp fuzz/corpus_seeds.txt fuzz-corpus/seed0 2>/dev/null || true
-          build-fuzz/fuzz/fuzz_http_parser \
-            -max_total_time=30 \
-            -max_len=8192 \
-            fuzz-corpus/
-        timeout-minutes: 2
+          cmake --build build-fuzz \
+            --target fuzz_http_parser fuzz_smuggling fuzz_chunked \
+            --parallel "$(nproc)"
+
+      - name: Run fuzz targets (30 seconds each)
+        run: |
+          corpus=build-fuzz/fuzz/corpus
+          for target in fuzz_http_parser fuzz_smuggling fuzz_chunked; do
+            echo "=== $target ==="
+            build-fuzz/fuzz/$target \
+              -max_total_time=30 \
+              -max_len=8192 \
+              "$corpus"/
+          done
+        timeout-minutes: 5
 
   # ── Job 4: Static analysis (cppcheck + clang-tidy) ──
   lint:
