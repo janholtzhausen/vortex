@@ -42,7 +42,8 @@ typedef enum {
 #define CONN_FLAG_COMPRESS_PENDING                                                                 \
     (1 << 16) /* response compression is running in compress_pool                                  \
                */
-#define CONN_FLAG_TCP_TUNNEL (1 << 17) /* raw TCP tunnel: skip HTTP, bidirectional raw forward */
+#define CONN_FLAG_TCP_TUNNEL (1 << 17) /* raw TCP tunnel */
+#define CONN_FLAG_BACKEND_TLS_SEND_PENDING (1 << 18) /* encrypted bytes queued; POLLOUT armed */
 
 /* Hot connection data — 2 cache lines (128 bytes), accessed per-packet */
 struct __attribute__((aligned(64))) conn_hot {
@@ -97,6 +98,19 @@ struct conn_cold {
     uint8_t backend_pooled; /* 1 = this backend fd came from the pool */
     bool backend_is_chunked; /* response uses Transfer-Encoding: chunked */
     bool backend_body_complete; /* full response body received; safe to pool fd */
+
+    /* Chunked response framing state machine — persists across recv() calls.
+     * Values correspond to backend_chunk_state_t in worker_proxy.c.
+     * 0 == BCHUNK_SIZE (initial/reset state). */
+    uint8_t backend_chunk_state; /* current SM state */
+    uint32_t backend_chunk_remaining; /* bytes left in current DATA segment */
+
+    /* Queued async backend TLS send: encrypted bytes that hit EAGAIN.
+     * Non-NULL while CONN_FLAG_BACKEND_TLS_SEND_PENDING is set and a
+     * VORTEX_OP_BACKEND_TLS_DRAIN POLLOUT is armed on backend_fd. */
+    uint8_t *backend_tls_pending;
+    uint32_t backend_tls_pending_len;
+    uint32_t backend_tls_pending_off;
 
     /* Backend response deadline — ns (CLOCK_MONOTONIC_COARSE).
      * Set when RECV_BACKEND is armed; cleared on first response byte or close.

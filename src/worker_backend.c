@@ -10,6 +10,7 @@
 
 #ifdef VORTEX_PHASE_TLS
 #include <picotls.h>
+#include <poll.h>
 #include <stdlib.h>
 
 static uint32_t backend_timeout_ms_for(struct worker *w, uint32_t cid)
@@ -104,12 +105,11 @@ int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, siz
         return -1;
     }
 
-    /* Backend fd is non-blocking.  Do NOT poll() here — this function is called
-     * from the worker's io_uring event loop; any blocking call stalls all
-     * connections on this worker.  A single write attempt is made; EAGAIN means
-     * the kernel send buffer is full and the connection is closed.
-     * Partial writes are retried without sleeping to drain the kernel buffer
-     * in one call, but we never wait for writability. */
+    /* Backend fd is non-blocking.  Never poll() here — this runs in the worker
+     * io_uring event loop.  On EAGAIN, queue remaining encrypted bytes and arm a
+     * VORTEX_OP_BACKEND_TLS_DRAIN POLLOUT so the event loop resumes when writable.
+     * Returns: (int)len = fully sent; 0 = queued (POLLOUT armed, do NOT arm
+     * RECV_BACKEND yet); -1 = fatal error (close connection). */
     size_t off = 0;
     while (off < wbuf.off) {
         ssize_t n = write(h->backend_fd, wbuf.base + off, wbuf.off - off);
@@ -118,11 +118,37 @@ int backend_tls_send_all(struct worker *w, uint32_t cid, const uint8_t *buf, siz
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            size_t rem = wbuf.off - off;
+            uint8_t *saved = malloc(rem);
+            if (!saved) {
+                ptls_buffer_dispose(&wbuf);
+                log_warn("backend_tls_send", "conn=%u OOM queueing %zu pending bytes", cid, rem);
+                return -1;
+            }
+            memcpy(saved, wbuf.base + off, rem);
+            ptls_buffer_dispose(&wbuf);
+            free(cold->backend_tls_pending);
+            cold->backend_tls_pending = saved;
+            cold->backend_tls_pending_len = (uint32_t)rem;
+            cold->backend_tls_pending_off = 0;
+            h->flags |= CONN_FLAG_BACKEND_TLS_SEND_PENDING;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) {
+                free(cold->backend_tls_pending);
+                cold->backend_tls_pending = NULL;
+                h->flags &= ~CONN_FLAG_BACKEND_TLS_SEND_PENDING;
+                return -1;
+            }
+            io_uring_prep_poll_add(sqe, h->backend_fd, POLLOUT);
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_BACKEND_TLS_DRAIN, cid);
+            uring_submit(&w->uring);
+            log_debug("backend_tls_send", "conn=%u EAGAIN — queued %zu bytes, POLLOUT armed", cid,
+                      rem);
+            return 0;
+        }
         ptls_buffer_dispose(&wbuf);
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            log_warn("backend_tls_send", "conn=%u EAGAIN — backend send buffer full, closing", cid);
-        else
-            log_warn("backend_tls_send", "conn=%u write failed: %s", cid, strerror(errno));
+        log_warn("backend_tls_send", "conn=%u write failed: %s", cid, strerror(errno));
         return -1;
     }
     ptls_buffer_dispose(&wbuf);

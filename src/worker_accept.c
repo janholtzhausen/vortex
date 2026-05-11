@@ -176,6 +176,11 @@ void conn_close(struct worker *w, uint32_t cid, bool is_error)
         ptls_free((ptls_t *)h->ssl);
         h->ssl = NULL;
     }
+    if (cc->backend_tls_pending) {
+        free(cc->backend_tls_pending);
+        cc->backend_tls_pending = NULL;
+        h->flags &= ~CONN_FLAG_BACKEND_TLS_SEND_PENDING;
+    }
 #endif
     if (h->client_fd >= 0) {
         uring_remove_fd(&w->uring, (unsigned)FIXED_FD_CLIENT(w, cid));

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <poll.h> /* POLLOUT for VORTEX_OP_BACKEND_TLS_DRAIN */
 /*
  * worker_proxy.c — HTTP request line parser and the main io_uring completion
  * dispatcher (handle_proxy_data) for the vortex worker event loop.
@@ -14,6 +15,93 @@
 #endif
 
 static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn_hot *h);
+
+/* ------------------------------------------------------------------ */
+/* Chunked Transfer-Encoding framing state machine                      */
+/* ------------------------------------------------------------------ */
+/* Persists across recv() calls in conn_cold.backend_chunk_state/remaining.
+ * Returns true when the final chunk + empty trailer CRLF have been seen.
+ *
+ * State values (stored as uint8_t in conn_cold):
+ *   0 = BCHUNK_SIZE      — reading hex chunk-size digits
+ *   1 = BCHUNK_SIZE_EXT  — reading chunk extensions after ';'
+ *   2 = BCHUNK_SIZE_CR   — saw \r at end of size line, expect \n
+ *   3 = BCHUNK_DATA      — consuming body bytes (remaining counts down)
+ *   4 = BCHUNK_DATA_CR   — saw \r after data, expect \n
+ *   5 = BCHUNK_DATA_LF   — saw \n after data, restart with SIZE
+ *   6 = BCHUNK_TRAILER   — reading trailers after last-chunk, looking for \r
+ *   7 = BCHUNK_TRAIL_CR  — saw \r, next \n means empty-trailer end-of-body
+ *   8 = BCHUNK_DONE      — complete
+ */
+static bool backend_chunk_sm_feed(struct conn_cold *cold, const uint8_t *data, size_t len)
+{
+    static const uint8_t BCHUNK_SIZE = 0;
+    static const uint8_t BCHUNK_SIZE_EXT = 1;
+    static const uint8_t BCHUNK_SIZE_CR = 2;
+    static const uint8_t BCHUNK_DATA = 3;
+    static const uint8_t BCHUNK_DATA_CR = 4;
+    static const uint8_t BCHUNK_DATA_LF = 5;
+    static const uint8_t BCHUNK_TRAILER = 6;
+    static const uint8_t BCHUNK_TRAIL_CR = 7;
+    static const uint8_t BCHUNK_DONE = 8;
+
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = data[i];
+        uint8_t s = cold->backend_chunk_state;
+
+        if (s == BCHUNK_DONE) return true;
+
+        if (s == BCHUNK_SIZE) {
+            if (c >= '0' && c <= '9') {
+                cold->backend_chunk_remaining =
+                    cold->backend_chunk_remaining * 16u + (uint32_t)(c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                cold->backend_chunk_remaining =
+                    cold->backend_chunk_remaining * 16u + (uint32_t)(c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                cold->backend_chunk_remaining =
+                    cold->backend_chunk_remaining * 16u + (uint32_t)(c - 'A' + 10);
+            } else if (c == ';' || c == ' ' || c == '\t') {
+                cold->backend_chunk_state = BCHUNK_SIZE_EXT;
+            } else if (c == '\r') {
+                cold->backend_chunk_state = BCHUNK_SIZE_CR;
+            } else if (c == '\n') {
+                /* bare \n — accept loosely */
+                cold->backend_chunk_state =
+                    (cold->backend_chunk_remaining == 0) ? BCHUNK_TRAILER : BCHUNK_DATA;
+            }
+        } else if (s == BCHUNK_SIZE_EXT) {
+            if (c == '\r') cold->backend_chunk_state = BCHUNK_SIZE_CR;
+        } else if (s == BCHUNK_SIZE_CR) {
+            /* consumed the \n — decide next state based on chunk size */
+            cold->backend_chunk_state =
+                (cold->backend_chunk_remaining == 0) ? BCHUNK_TRAILER : BCHUNK_DATA;
+        } else if (s == BCHUNK_DATA) {
+            if (cold->backend_chunk_remaining > 0) cold->backend_chunk_remaining--;
+            if (cold->backend_chunk_remaining == 0) cold->backend_chunk_state = BCHUNK_DATA_CR;
+        } else if (s == BCHUNK_DATA_CR) {
+            /* expect '\r', next char is '\n' */
+            cold->backend_chunk_state = BCHUNK_DATA_LF;
+        } else if (s == BCHUNK_DATA_LF) {
+            /* consumed '\n' — back to reading next chunk size */
+            cold->backend_chunk_remaining = 0;
+            cold->backend_chunk_state = BCHUNK_SIZE;
+        } else if (s == BCHUNK_TRAILER) {
+            if (c == '\r') cold->backend_chunk_state = BCHUNK_TRAIL_CR;
+            /* else: reading a non-empty trailer header line, ignore chars */
+        } else if (s == BCHUNK_TRAIL_CR) {
+            if (c == '\n') {
+                /* empty line = end of trailers = body complete */
+                cold->backend_chunk_state = BCHUNK_DONE;
+                cold->backend_body_complete = true;
+                return true;
+            }
+            /* non-empty trailer: not an empty-line, continue reading trailer */
+            cold->backend_chunk_state = BCHUNK_TRAILER;
+        }
+    }
+    return cold->backend_chunk_state == BCHUNK_DONE;
+}
 
 static void try_backend_pool_return(struct worker *w, uint32_t cid, struct conn_hot *h)
 {
@@ -95,6 +183,20 @@ static int hdr_insert_after(uint8_t *buf, int *len, int cap, uint8_t *pos, const
     memcpy(pos, text, text_len);
     *len += (int)text_len;
     return 0;
+}
+
+/* Remove the bytes occupied by a header field.
+ * field_start: pointer to the '\r' of the CRLF *before* the field name.
+ * field_end: pointer to the '\r' of the field's own trailing CRLF.
+ * Removes everything from field_start+2 through field_end+2 (inclusive). */
+static void hdr_strip_line(uint8_t *buf, int *len, uint8_t *field_start, uint8_t *field_end)
+{
+    uint8_t *del_begin = field_start + 2;
+    uint8_t *del_end = field_end + 2; /* past the trailing \r\n */
+    if (del_end > buf + *len || del_begin > del_end) return;
+    size_t remove = (size_t)(del_end - del_begin);
+    memmove(del_begin, del_end, (size_t)(buf + *len - del_end));
+    *len -= (int)remove;
 }
 
 static int inject_response_etag(struct worker *w, uint8_t *buf, int n)
@@ -254,7 +356,14 @@ static int count_header(const uint8_t *buf, size_t len, const char *name, size_t
         }
         p += 2;
         if ((size_t)(end - p) < name_len + 1) break;
-        if (strncasecmp((const char *)p, name, name_len) == 0 && p[name_len] == ':') count++;
+        if (strncasecmp((const char *)p, name, name_len) == 0) {
+            /* RFC 7230 §3.2.4: no whitespace before colon in valid requests, but
+             * detect OWS anyway — "Transfer-Encoding :" is a smuggling vector. */
+            const uint8_t *q = p + name_len;
+            while (q < buf + len && (*q == ' ' || *q == '\t'))
+                q++;
+            if (q < buf + len && *q == ':') count++;
+        }
         /* advance past this line */
         const uint8_t *eol = (const uint8_t *)memchr(p, '\n', (size_t)(buf + len - p));
         p = eol ? eol + 1 : buf + len;
@@ -455,6 +564,8 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                 if (VX_MEMMEM(sbuf2, (size_t)n, "\r\nTransfer-Encoding: chunked", 28) ||
                     VX_MEMMEM(sbuf2, (size_t)n, "\r\ntransfer-encoding: chunked", 28)) {
                     cold_main->backend_is_chunked = true;
+                    cold_main->backend_chunk_state = 0; /* BCHUNK_SIZE */
+                    cold_main->backend_chunk_remaining = 0;
                 } else {
                     /* Parse Content-Length */
                     const char *clh =
@@ -474,9 +585,10 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
             }
 
             if (cold_main->backend_is_chunked) {
-                /* Chunked: look for the final-chunk terminator "0\r\n\r\n" */
-                if (VX_MEMMEM(sbuf2, (size_t)n, "0\r\n\r\n", 5))
-                    cold_main->backend_body_complete = true;
+                /* Feed received bytes into the chunked framing SM so we detect
+                 * completion even when the terminator spans multiple recv()s or
+                 * the byte sequence "0\r\n\r\n" appears inside body data. */
+                backend_chunk_sm_feed(cold_main, sbuf2, (size_t)n);
             } else if (cold_main->backend_content_length > 0) {
                 /* Content-Length: accumulate body bytes received */
                 const char *hend = (const char *)FIND_HDR_END(sbuf2, (size_t)n);
@@ -558,26 +670,16 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                 while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t'))
                     vs++;
                 uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(sbuf + hdr_len - vs));
-                if (ve) {
-                    size_t old_len = (size_t)(ve - vs);
-                    int delta = (int)new_srv_len - (int)old_len;
-                    if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
-                        memmove(vs + new_srv_len, ve, (size_t)(sbuf + n - ve));
-                        memcpy(vs, new_srv, new_srv_len);
-                        n += delta;
-                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                    }
+                if (ve && hdr_replace_value(sbuf, &n, (int)w->pool.buf_size, vs, ve, new_srv,
+                                            new_srv_len) == 0) {
+                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                 }
             } else if (hdr_end) {
-                /* No Server header — inject one */
                 char inj_srv[80];
                 int inj_srv_len = snprintf(inj_srv, sizeof(inj_srv), "\r\nServer: %s", new_srv);
-                if (n + inj_srv_len <= (int)w->pool.buf_size) {
-                    size_t hle = (size_t)(hdr_end - sbuf);
-                    memmove(sbuf + hle + inj_srv_len, sbuf + hle, (size_t)(n - (int)hle));
-                    memcpy(sbuf + hle, inj_srv, (size_t)inj_srv_len);
-                    n += inj_srv_len;
+                if (hdr_insert_after(sbuf, &n, (int)w->pool.buf_size, hdr_end, inj_srv,
+                                     (size_t)inj_srv_len) == 0) {
                     hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                     hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                 }
@@ -607,47 +709,34 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
 
                 uint8_t *cch = find_header_ci(sbuf, hdr_len, "Cache-Control", 13);
 
+                size_t cc_val_len = strlen(cc_val);
                 if (cch && ttl >= 3600) {
                     uint8_t *vs = cch + 16;
                     while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t'))
                         vs++;
                     uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(sbuf + hdr_len - vs));
-                    if (ve) {
-                        size_t old_len = (size_t)(ve - vs);
-                        int delta = (int)strlen(cc_val) - (int)old_len;
-                        if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
-                            memmove(vs + strlen(cc_val), ve, (size_t)(sbuf + n - ve));
-                            memcpy(vs, cc_val, strlen(cc_val));
-                            n += delta;
-                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                        }
+                    if (ve && hdr_replace_value(sbuf, &n, (int)w->pool.buf_size, vs, ve, cc_val,
+                                                cc_val_len) == 0) {
+                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                     }
                 } else if (!cch) {
-                    /* No Cache-Control present — inject one */
                     char cc_hdr[80];
                     int cc_len = snprintf(cc_hdr, sizeof(cc_hdr), "\r\nCache-Control: %s", cc_val);
-                    if (n + cc_len <= (int)w->pool.buf_size) {
-                        size_t hle = (size_t)(hdr_end - sbuf);
-                        memmove(sbuf + hle + cc_len, sbuf + hle, (size_t)(n - (int)hle));
-                        memcpy(sbuf + hle, cc_hdr, (size_t)cc_len);
-                        n += cc_len;
+                    if (hdr_insert_after(sbuf, &n, (int)w->pool.buf_size, hdr_end, cc_hdr,
+                                         (size_t)cc_len) == 0) {
                         hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                         hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                     }
                 }
 
-                /* For static assets: also strip Pragma header (no-cache from Kestrel) */
+                /* Strip Pragma: no-cache from static assets */
                 if (ttl >= 3600 && hdr_end) {
                     uint8_t *ph = find_header_ci(sbuf, hdr_len, "Pragma", 6);
                     if (ph) {
                         uint8_t *pe = (uint8_t *)FIND_CRLF(ph + 2, (size_t)(sbuf + n - ph - 2));
                         if (pe) {
-                            pe += 2; /* point past the line's \r\n */
-                            size_t remove = (size_t)(pe - (ph + 2));
-                            memmove(ph + 2, ph + 2 + remove,
-                                    (size_t)(sbuf + n - (ph + 2 + remove)));
-                            n -= (int)remove;
+                            hdr_strip_line(sbuf, &n, ph, pe);
                             hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                             hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
@@ -657,32 +746,21 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
         }
 
         /* ---- Inject HSTS on HTTPS responses when absent ---- */
-        if (hdr_end) {
-            bool has_hsts = find_header_ci(sbuf, hdr_len, "Strict-Transport-Security", 25) != NULL;
-            if (!has_hsts) {
-                const char *hsts =
-                    "\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains";
-                int hsts_len = (int)strlen(hsts);
-                if (n + hsts_len <= (int)w->pool.buf_size) {
-                    size_t hle = (size_t)(hdr_end - sbuf);
-                    memmove(sbuf + hle + hsts_len, sbuf + hle, (size_t)(n - (int)hle));
-                    memcpy(sbuf + hle, hsts, (size_t)hsts_len);
-                    n += hsts_len;
-                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                }
+        if (hdr_end && !find_header_ci(sbuf, hdr_len, "Strict-Transport-Security", 25)) {
+            static const char hsts[] =
+                "\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains";
+            if (hdr_insert_after(sbuf, &n, (int)w->pool.buf_size, hdr_end, hsts,
+                                 sizeof(hsts) - 1) == 0) {
+                hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
             }
         }
 
 #ifdef VORTEX_QUIC
         if (hdr_end) {
-            const char *altsvc = "\r\nAlt-Svc: h3=\":443\"; ma=86400";
-            int as_len = 30;
-            if (n + as_len <= (int)w->pool.buf_size) {
-                size_t hle = (size_t)(hdr_end - sbuf);
-                memmove(sbuf + hle + as_len, sbuf + hle, (size_t)(n - (int)hle));
-                memcpy(sbuf + hle, altsvc, (size_t)as_len);
-                n += as_len;
+            static const char altsvc[] = "\r\nAlt-Svc: h3=\":443\"; ma=86400";
+            if (hdr_insert_after(sbuf, &n, (int)w->pool.buf_size, hdr_end, altsvc,
+                                 sizeof(altsvc) - 1) == 0) {
                 hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                 hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
             }
@@ -696,26 +774,16 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                 while (vs < sbuf + hdr_len && (*vs == ' ' || *vs == '\t'))
                     vs++;
                 uint8_t *ve = (uint8_t *)FIND_CRLF(vs, (size_t)(sbuf + hdr_len - vs));
-                if (ve && ve > vs) {
-                    const char *kl = "keep-alive";
-                    size_t kl_len = 10;
-                    size_t old_len = (size_t)(ve - vs);
-                    int delta = (int)kl_len - (int)old_len;
-                    if (n + delta <= (int)w->pool.buf_size && n + delta > 0) {
-                        memmove(vs + kl_len, ve, (size_t)(sbuf + n - ve));
-                        memcpy(vs, kl, kl_len);
-                        n += delta;
-                        hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                        hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                    }
+                if (ve && ve > vs &&
+                    hdr_replace_value(sbuf, &n, (int)w->pool.buf_size, vs, ve, "keep-alive", 10) ==
+                        0) {
+                    hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                    hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                 }
             } else if (hdr_end) {
-                const int ka_len = 24;
-                if (n + ka_len <= (int)w->pool.buf_size) {
-                    size_t hle = (size_t)(hdr_end - sbuf);
-                    memmove(sbuf + hle + ka_len, sbuf + hle, (size_t)(n - (int)hle));
-                    memcpy(sbuf + hle, "\r\nConnection: keep-alive", (size_t)ka_len);
-                    n += ka_len;
+                static const char ka[] = "\r\nConnection: keep-alive";
+                if (hdr_insert_after(sbuf, &n, (int)w->pool.buf_size, hdr_end, ka,
+                                     sizeof(ka) - 1) == 0) {
                     hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                     hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                 }
@@ -734,10 +802,7 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                     if (_ph) {
                         uint8_t *_pe = (uint8_t *)FIND_CRLF(_ph + 2, (size_t)(sbuf + n - _ph - 2));
                         if (_pe) {
-                            _pe += 2;
-                            size_t _rm = (size_t)(_pe - (_ph + 2));
-                            memmove(_ph + 2, _ph + 2 + _rm, (size_t)(sbuf + n - (_ph + 2 + _rm)));
-                            n -= (int)_rm;
+                            hdr_strip_line(sbuf, &n, _ph, _pe);
                             hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                             hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
@@ -750,25 +815,18 @@ static void handle_backend_read_result(struct worker *w, uint32_t cid, int n)
                         while (_vs < sbuf + hdr_len && (*_vs == ' ' || *_vs == '\t'))
                             _vs++;
                         uint8_t *_ve = (uint8_t *)FIND_CRLF(_vs, (size_t)(sbuf + hdr_len - _vs));
-                        if (_ve) {
-                            int _delta = (int)_hval_len - (int)(_ve - _vs);
-                            if (n + _delta <= (int)w->pool.buf_size && n + _delta > 0) {
-                                memmove(_vs + _hval_len, _ve, (size_t)(sbuf + n - _ve));
-                                memcpy(_vs, _hval, _hval_len);
-                                n += _delta;
-                                hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
-                                hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
-                            }
+                        if (_ve && hdr_replace_value(sbuf, &n, (int)w->pool.buf_size, _vs, _ve,
+                                                     _hval, _hval_len) == 0) {
+                            hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
+                            hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
                     } else {
                         char _inj[VORTEX_MAX_BACKEND_HEADER_NAME + VORTEX_MAX_BACKEND_HEADER_VALUE +
                                   8];
                         int _inj_len = snprintf(_inj, sizeof(_inj), "\r\n%s: %s", hr->name, _hval);
-                        if (_inj_len > 0 && n + _inj_len <= (int)w->pool.buf_size) {
-                            size_t _hle = (size_t)(hdr_end - sbuf);
-                            memmove(sbuf + _hle + _inj_len, sbuf + _hle, (size_t)(n - (int)_hle));
-                            memcpy(sbuf + _hle, _inj, (size_t)_inj_len);
-                            n += _inj_len;
+                        if (_inj_len > 0 &&
+                            hdr_insert_after(sbuf, &n, (int)w->pool.buf_size, hdr_end, _inj,
+                                             (size_t)_inj_len) == 0) {
                             hdr_end = (uint8_t *)FIND_HDR_END(sbuf, (size_t)n);
                             hdr_len = hdr_end ? (size_t)(hdr_end - sbuf) + 4 : (size_t)n;
                         }
@@ -1244,24 +1302,16 @@ static void handle_accept(struct worker *w, struct io_uring_cqe *cqe)
             /* Return: VORTEX_OP_TLS_DONE will continue this connection */
             return;
         }
-        /* Fallback (no pipe): blocking path — should not normally happen */
-        struct tls_accept_result ar_fb = tls_accept(w->tls, client_fd);
-        if (ar_fb.status == TLS_ACCEPT_FAIL) {
-            free(ar_fb.pending_data);
-            close(client_fd);
-            conn_free(&w->pool, new_cid);
-            return;
-        }
-        tls_route_idx = ar_fb.route_idx;
-        atomic_fetch_add_explicit(&w->tls13_count, 1, memory_order_relaxed);
-        if (ar_fb.status == TLS_ACCEPT_KTLS_FULL) {
-            nh->flags |= CONN_FLAG_KTLS_TX | CONN_FLAG_KTLS_RX;
-            nh->ssl = NULL;
-            atomic_fetch_add_explicit(&w->ktls_count, 1, memory_order_relaxed);
-        } else {
-            nh->ssl = ar_fb.ptls;
-        }
-        free(ar_fb.pending_data);
+        /* Pipe creation failed — refuse TLS connections rather than blocking
+         * the worker event loop for up to 5 s per handshake.  pipe2() failing
+         * is a hard system error (ulimit -n or kernel OOM); log it prominently. */
+        log_error("accept",
+                  "TLS pool pipe unavailable (pipe2 failed at worker init) — "
+                  "rejecting TLS connection fd=%d; check ulimit -n",
+                  client_fd);
+        close(client_fd);
+        conn_free(&w->pool, new_cid);
+        return;
     }
 #endif
 
@@ -1843,9 +1893,13 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
             send_bad_gateway_and_close(w, cid);
             return;
         }
-        if (backend_tls_send_all(w, cid, conn_recv_buf(&w->pool, cid), (size_t)fwd_n) < 0) {
-            send_bad_gateway_and_close(w, cid);
-            return;
+        {
+            int tls_rc = backend_tls_send_all(w, cid, conn_recv_buf(&w->pool, cid), (size_t)fwd_n);
+            if (tls_rc < 0) {
+                send_bad_gateway_and_close(w, cid);
+                return;
+            }
+            if (tls_rc == 0) return; /* pending: DRAIN handler will arm RECV_BACKEND */
         }
         backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
         {
@@ -1869,6 +1923,65 @@ static void handle_recv_client(struct worker *w, struct io_uring_cqe *cqe, uint3
               MSG_NOSIGNAL, SEND_IDX_RECV(w, cid));
     sqe->user_data = URING_UD_ENCODE(VORTEX_OP_SEND_BACKEND, cid);
     uring_submit(&w->uring);
+}
+
+/* Drain queued encrypted bytes after POLLOUT fires on a backend TLS socket.
+ * Called from VORTEX_OP_BACKEND_TLS_DRAIN CQE.  On completion, arms the
+ * backend deadline and reads the first response bytes inline (same as the
+ * normal TLS send path). */
+static void handle_backend_tls_drain(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid,
+                                     struct conn_hot *h)
+{
+    struct conn_cold *cold = conn_cold_ptr(&w->pool, cid);
+    (void)cqe; /* poll result: we just attempt the write */
+
+    if (!(h->flags & CONN_FLAG_BACKEND_TLS_SEND_PENDING) || !cold->backend_tls_pending) {
+        return; /* stale CQE */
+    }
+
+    while (cold->backend_tls_pending_off < cold->backend_tls_pending_len) {
+        ssize_t n = write(h->backend_fd, cold->backend_tls_pending + cold->backend_tls_pending_off,
+                          cold->backend_tls_pending_len - cold->backend_tls_pending_off);
+        if (n > 0) {
+            cold->backend_tls_pending_off += (uint32_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* still blocked — re-arm POLLOUT */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&w->uring.ring);
+            if (!sqe) {
+                send_bad_gateway_and_close(w, cid);
+                return;
+            }
+            io_uring_prep_poll_add(sqe, h->backend_fd, POLLOUT);
+            sqe->user_data = URING_UD_ENCODE(VORTEX_OP_BACKEND_TLS_DRAIN, cid);
+            uring_submit(&w->uring);
+            return;
+        }
+        /* write error */
+        free(cold->backend_tls_pending);
+        cold->backend_tls_pending = NULL;
+        h->flags &= ~CONN_FLAG_BACKEND_TLS_SEND_PENDING;
+        send_bad_gateway_and_close(w, cid);
+        return;
+    }
+
+    /* All bytes sent — clean up */
+    free(cold->backend_tls_pending);
+    cold->backend_tls_pending = NULL;
+    cold->backend_tls_pending_len = 0;
+    cold->backend_tls_pending_off = 0;
+    h->flags &= ~CONN_FLAG_BACKEND_TLS_SEND_PENDING;
+
+    /* Resume the normal TLS receive path */
+    backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
+    int rn = backend_tls_recv_some(w, cid, conn_send_buf(&w->pool, cid), h->recv_window);
+    if (rn < 0) {
+        send_bad_gateway_and_close(w, cid);
+        return;
+    }
+    handle_backend_read_result(w, cid, rn);
 }
 
 static void handle_send_backend(struct worker *w, struct io_uring_cqe *cqe, uint32_t cid,
@@ -2234,9 +2347,13 @@ static void resume_connected_backend(struct worker *w, uint32_t cid, struct conn
         }
 
         if (backend_uses_tls(w, cid)) {
-            if (backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n) < 0) {
-                send_bad_gateway_and_close(w, cid);
-                return;
+            {
+                int tls_rc = backend_tls_send_all(w, cid, rbuf, (size_t)fwd_n);
+                if (tls_rc < 0) {
+                    send_bad_gateway_and_close(w, cid);
+                    return;
+                }
+                if (tls_rc == 0) return; /* pending: DRAIN handler will arm RECV_BACKEND */
             }
             backend_deadline_set(w, cid, w->cfg->routes[h->route_idx].backend_timeout_ms);
             {
@@ -2598,6 +2715,9 @@ void handle_proxy_data(struct worker *w, struct io_uring_cqe *cqe)
         break;
     case VORTEX_OP_SEND_BACKEND:
         handle_send_backend(w, cqe, cid, h);
+        break;
+    case VORTEX_OP_BACKEND_TLS_DRAIN:
+        handle_backend_tls_drain(w, cqe, cid, h);
         break;
     case VORTEX_OP_RECV_BACKEND:
         handle_recv_backend(w, cqe, cid, h);
