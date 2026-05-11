@@ -1576,6 +1576,7 @@ void tls_context_free(ptls_context_t *ctx)
         free(ctx->certificates.list);
     }
     free(ctx->sign_certificate);
+    free(ctx->emit_certificate); /* allocated by build_route_context; NULL for client contexts */
     free(ctx);
 }
 
@@ -1589,6 +1590,22 @@ int tls_rotate_cert(struct tls_ctx *tls, int route_idx, const char *cert_pem, co
     ptls_context_t *new_ctx = tls_create_ctx_from_pem(tls, cert_pem, key_pem, hostname);
     if (!new_ctx) return -1;
 
+    /* Wire the emit_certificate callback to this route.
+     * build_route_context allocates a vortex_emit_certificate_t with ec->route = NULL;
+     * tls_create_ctx_from_pem does not set it, so we must do it here before the new
+     * context goes live.  Without this, any client sending the status_request TLS
+     * extension triggers ec->route->ocsp_resp_der (NULL dereference → SEGV). */
+    ((vortex_emit_certificate_t *)new_ctx->emit_certificate)->route = rc;
+
+    /* Fetch a fresh OCSP staple for the new certificate before making it live.
+     * Clear the old (now-stale) staple first so a client sees either a valid new
+     * staple or no staple — never a staple for the previous certificate. */
+    unsigned char *old_ocsp = rc->ocsp_resp_der;
+    int old_ocsp_len = rc->ocsp_resp_der_len;
+    rc->ocsp_resp_der = NULL;
+    rc->ocsp_resp_der_len = 0;
+    tls_ocsp_staple_route(rc, new_ctx); /* best-effort; failures are non-fatal */
+
     /* Atomic swap: workers see either old or new context.
      * Grace period: TLS handshakes complete in < 100 ms under normal load.
      * 500 ms guarantees no in-flight handshake still references old_ctx.
@@ -1599,8 +1616,13 @@ int tls_rotate_cert(struct tls_ctx *tls, int route_idx, const char *cert_pem, co
         nanosleep(&grace, NULL);
         tls_context_free(old_ctx);
     }
+    /* free_route_ctx would have freed this; replicate the cleanup here since
+     * tls_rotate_cert bypasses that path. */
+    (void)old_ocsp_len;
+    free(old_ocsp);
 
-    log_info("tls_rotate_cert", "route=%d cert rotated", route_idx);
+    log_info("tls_rotate_cert", "route=%d cert rotated, OCSP staple %s", route_idx,
+             rc->ocsp_resp_der ? "refreshed" : "unavailable");
     return 0;
 }
 

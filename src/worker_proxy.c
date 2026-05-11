@@ -53,12 +53,29 @@ static bool backend_chunk_sm_feed(struct conn_cold *cold, const uint8_t *data, s
 
         if (s == BCHUNK_SIZE) {
             if (c >= '0' && c <= '9') {
+                /* Guard against uint32_t overflow: > 0x0FFFFFFF * 16 wraps around.
+                 * 268 MB is not a legitimate chunk size — treat as protocol error. */
+                if (cold->backend_chunk_remaining > 0x0FFFFFFFu) {
+                    cold->backend_chunk_state = BCHUNK_DONE;
+                    cold->backend_body_complete = false;
+                    return false;
+                }
                 cold->backend_chunk_remaining =
                     cold->backend_chunk_remaining * 16u + (uint32_t)(c - '0');
             } else if (c >= 'a' && c <= 'f') {
+                if (cold->backend_chunk_remaining > 0x0FFFFFFFu) {
+                    cold->backend_chunk_state = BCHUNK_DONE;
+                    cold->backend_body_complete = false;
+                    return false;
+                }
                 cold->backend_chunk_remaining =
                     cold->backend_chunk_remaining * 16u + (uint32_t)(c - 'a' + 10);
             } else if (c >= 'A' && c <= 'F') {
+                if (cold->backend_chunk_remaining > 0x0FFFFFFFu) {
+                    cold->backend_chunk_state = BCHUNK_DONE;
+                    cold->backend_body_complete = false;
+                    return false;
+                }
                 cold->backend_chunk_remaining =
                     cold->backend_chunk_remaining * 16u + (uint32_t)(c - 'A' + 10);
             } else if (c == ';' || c == ' ' || c == '\t') {
